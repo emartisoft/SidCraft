@@ -16,6 +16,8 @@ The application does two things at once:
    
 ![SidCraft Home](docs/screenshots/01-home.png)
 
+![SidCraft Home](screenshots/light.png)
+
 ## Documentation
 
 See [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for what SidCraft does, the
