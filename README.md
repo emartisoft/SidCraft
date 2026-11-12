@@ -1,4 +1,5 @@
-# ![SidCraft](icon/sidcraft-header.png) SidCraft 
+# ![SidCraft](icon/sidcraft-header.png) SidCraft
+![SidCraft Home](docs/screenshots/01-home.png)
 
 ## Documentation
 
