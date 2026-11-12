@@ -1,4 +1,19 @@
 # ![SidCraft](icon/sidcraft-header.png) SidCraft
+**SidCraft** is a desktop player for Commodore 64 SID music files — both PSID
+and RSID formats — that works fully offline. At the same time it doubles as a
+browser for the [High Voltage SID Collection (HVSC)](https://hvsc.brona.dk/)
+archive.
+
+The application does two things at once:
+
+1. **It plays.** The SID file is executed through a cycle-accurate 6502
+   emulator; the audio is produced by [residfp](https://github.com/mlund/residfp)
+   with its physics-based filter model. Up to three SID chips (1SID / 2SID /
+   3SID) are supported.
+2. **It shows.** It visualises what is happening inside the tune: an FFT
+   spectrum, an oscilloscope, a piano roll, the ADSR envelope, the filter
+   response and three more views.
+   
 ![SidCraft Home](docs/screenshots/01-home.png)
 
 ## Documentation
