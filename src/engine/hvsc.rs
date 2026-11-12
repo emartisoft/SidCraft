@@ -1,0 +1,616 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2026 Emarti
+//
+// Portions derived from crabsid by Mikael Lund,
+// Copyright (c) 2026 Mikael Lund, licensed under the MIT License.
+// See licenses/MIT-crabsid.txt for the original license text.
+
+//! HVSC (High Voltage SID Collection) browser with STIL metadata support.
+
+use crate::engine::sid_file::SidFile;
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
+/// Fetches bytes from a URL (http/https) or local path (file://).
+fn fetch_bytes(url: &str) -> io::Result<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        std::fs::read(Path::new(path))
+    } else {
+        let response = ureq::get(url)
+            .call()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut bytes = Vec::new();
+        response.into_body().into_reader().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Latin-1 maps directly to Unicode code points (each byte == codepoint).
+fn decode_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Fetches text from a URL or local path, treating bytes as Latin-1.
+fn fetch_latin1_text(url: &str) -> io::Result<String> {
+    Ok(decode_latin1(&fetch_bytes(url)?))
+}
+
+/// Fetches text from a URL or local path as UTF-8.
+fn fetch_text(url: &str) -> io::Result<String> {
+    let bytes = fetch_bytes(url)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Default HVSC mirror URL.
+pub const DEFAULT_HVSC_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music";
+
+/// Returns the cache directory for crabsid, creating it if needed.
+fn cache_dir() -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("crabsid");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Clears the HVSC cache files.
+#[allow(dead_code)] // kept for the remote-driven browser API
+pub fn clear_cache() {
+    let Some(dir) = cache_dir() else { return };
+    for name in [StilDatabase::CACHE_NAME, SonglengthsDatabase::CACHE_NAME] {
+        let _ = fs::remove_file(dir.join(name));
+    }
+}
+
+/// Reads a file as Latin-1 or UTF-8.
+fn read_file(path: &Path, latin1: bool) -> io::Result<String> {
+    if latin1 {
+        Ok(decode_latin1(&fs::read(path)?))
+    } else {
+        fs::read_to_string(path)
+    }
+}
+
+/// Reads cached file if present, otherwise fetches from URL and caches result.
+fn fetch_with_cache(url: &str, cache_name: &str, latin1: bool) -> io::Result<String> {
+    let cache_path = cache_dir().map(|d| d.join(cache_name));
+
+    if let Some(ref path) = cache_path {
+        match read_file(path, latin1) {
+            Ok(content) => return Ok(content),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+
+    let content = if latin1 {
+        fetch_latin1_text(url)?
+    } else {
+        fetch_text(url)?
+    };
+
+    if let Some(path) = cache_path {
+        let _ = fs::write(&path, &content);
+    }
+
+    Ok(content)
+}
+
+/// Metadata for a SID file from STIL.
+#[derive(Debug, Clone, Default)]
+pub struct StilEntry {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// Parsed STIL database mapping paths to metadata.
+#[derive(Debug, Default, Clone)]
+pub struct StilDatabase {
+    entries: HashMap<String, StilEntry>,
+    // Precomputed lowercase haystack per entry; HVSC has ~50k entries and rebuilding
+    // these per keystroke produces hundreds of thousands of allocations.
+    search_index: Vec<(String, String)>,
+}
+
+impl StilDatabase {
+    pub const CACHE_NAME: &'static str = "STIL.txt";
+
+    /// Fetches and parses the STIL file from HVSC, using cache if available.
+    pub fn fetch(base_url: &str) -> io::Result<Self> {
+        let url = format!("{base_url}/DOCUMENTS/{}", Self::CACHE_NAME);
+        let content = fetch_with_cache(&url, Self::CACHE_NAME, true)?;
+        Ok(Self::parse(&content))
+    }
+
+    fn parse(content: &str) -> Self {
+        let mut entries = HashMap::new();
+        let mut current_path: Option<String> = None;
+        let mut current_entry = StilEntry::default();
+
+        for line in content.lines() {
+            if line.starts_with('/') && line.ends_with(".sid") {
+                if let Some(path) = current_path.take() {
+                    entries.insert(path, current_entry);
+                }
+                current_path = Some(line.to_string());
+                current_entry = StilEntry::default();
+                continue;
+            }
+
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("TITLE:") {
+                current_entry.title = Some(rest.trim().to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("ARTIST:") {
+                current_entry.artist = Some(rest.trim().to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("COMMENT:") {
+                current_entry.comment = Some(rest.trim().to_string());
+            }
+        }
+
+        if let Some(path) = current_path {
+            entries.insert(path, current_entry);
+        }
+
+        let search_index = build_search_index(&entries);
+        Self {
+            entries,
+            search_index,
+        }
+    }
+
+    /// Returns the number of entries in the database.
+    #[allow(dead_code)] // kept for the STIL index API
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the database is empty.
+    #[allow(dead_code)] // Required by clippy for len() method
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Looks up STIL info for a given HVSC path.
+    pub fn get(&self, path: &str) -> Option<&StilEntry> {
+        self.entries.get(path)
+    }
+
+    /// Searches paths, titles, and artists for entries containing the query (case-insensitive).
+    #[allow(dead_code)] // kept for the local STIL index API
+    pub fn search(&self, query: &str) -> Vec<&str> {
+        let query_lower = query.to_lowercase();
+        self.search_index
+            .iter()
+            .filter(|(_, haystack)| haystack.contains(&query_lower))
+            .map(|(path, _)| path.as_str())
+            .collect()
+    }
+}
+
+fn build_search_index(entries: &HashMap<String, StilEntry>) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|(path, entry)| {
+            let mut haystack = path.to_lowercase();
+            if let Some(t) = &entry.title {
+                haystack.push('\n');
+                haystack.push_str(&t.to_lowercase());
+            }
+            if let Some(a) = &entry.artist {
+                haystack.push('\n');
+                haystack.push_str(&a.to_lowercase());
+            }
+            (path.clone(), haystack)
+        })
+        .collect()
+}
+
+/// Song lengths database mapping MD5 hashes to per-subsong durations.
+#[derive(Debug, Default, Clone)]
+pub struct SonglengthsDatabase {
+    entries: HashMap<String, Vec<std::time::Duration>>,
+}
+
+impl SonglengthsDatabase {
+    pub const CACHE_NAME: &'static str = "Songlengths.md5";
+
+    /// Fetches and parses the Songlengths.md5 file from HVSC, using cache if available.
+    pub fn fetch(base_url: &str) -> io::Result<Self> {
+        let url = format!("{base_url}/DOCUMENTS/{}", Self::CACHE_NAME);
+        let content = fetch_with_cache(&url, Self::CACHE_NAME, false)?;
+        Ok(Self::parse(&content))
+    }
+
+    fn parse(content: &str) -> Self {
+        let mut entries = HashMap::new();
+        for line in content.lines() {
+            if line.starts_with(';') || line.starts_with('[') || line.trim().is_empty() {
+                continue;
+            }
+            // Format: <md5>=<time1> <time2> ...
+            if let Some((hash, times)) = line.split_once('=') {
+                let durations: Vec<std::time::Duration> = times
+                    .split_whitespace()
+                    .filter_map(parse_duration)
+                    .collect();
+                if !durations.is_empty() {
+                    entries.insert(hash.to_lowercase(), durations);
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    /// Looks up song durations by MD5 hash. Expects lowercase hex (matches `SidFile::md5`).
+    pub fn get(&self, md5: &str) -> Option<&[std::time::Duration]> {
+        self.entries.get(md5).map(|v| v.as_slice())
+    }
+
+    /// Returns the number of entries in the database.
+    #[allow(dead_code)] // May be useful for status display
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Parses duration string "mm:ss" or "mm:ss.mmm" into Duration.
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    // Strip trailing attributes such as "(G)" or "(M)" that HVSC appends to durations.
+    let s = s.split('(').next()?.trim();
+    let (mins, rest) = s.split_once(':')?;
+    let mins: u64 = mins.parse().ok()?;
+
+    let (secs, millis) = if let Some((s, ms)) = rest.split_once('.') {
+        let secs: u64 = s.parse().ok()?;
+        let millis: u64 = ms.parse().ok()?;
+        (secs, millis)
+    } else {
+        (rest.parse().ok()?, 0)
+    };
+
+    Some(std::time::Duration::from_millis(
+        mins * 60_000 + secs * 1000 + millis,
+    ))
+}
+
+/// An entry in the HVSC browser (directory or file).
+#[derive(Debug, Clone)]
+pub struct HvscEntry {
+    /// Display name
+    pub name: String,
+    /// Full HVSC path (e.g., "/MUSICIANS/H/Hubbard_Rob/")
+    pub path: String,
+    /// True if this is a directory
+    pub is_dir: bool,
+}
+
+#[allow(dead_code)] // kept as the entry-level HVSC API
+impl HvscEntry {
+    /// Returns the full URL for this entry.
+    pub fn url(&self, base_url: &str) -> String {
+        format!("{base_url}{}", self.path)
+    }
+
+    /// Loads this entry as a SID file (only valid for files).
+    pub fn load(&self, base_url: &str) -> io::Result<SidFile> {
+        if self.is_dir {
+            return Err(io::Error::other("Cannot load directory as SID file"));
+        }
+        let bytes = fetch_bytes(&self.url(base_url))?;
+        SidFile::parse(&bytes)
+    }
+}
+
+/// HVSC directory browser state.
+#[derive(Clone)]
+pub struct HvscBrowser {
+    /// Base URL for HVSC mirror
+    pub base_url: String,
+    /// Current directory path
+    pub current_path: String,
+    /// Entries in current directory
+    pub entries: Vec<HvscEntry>,
+    /// Selected index
+    pub selected: usize,
+    /// STIL database for metadata
+    pub stil: Option<StilDatabase>,
+    /// STIL loading error (persists across navigation)
+    pub stil_error: Option<String>,
+    /// Songlengths database for durations
+    pub songlengths: Option<SonglengthsDatabase>,
+    /// Loading state
+    pub loading: bool,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+/// Top-level HVSC categories shown when the browser is at "/".
+fn root_entries() -> Vec<HvscEntry> {
+    ["MUSICIANS", "GAMES", "DEMOS"]
+        .into_iter()
+        .map(|name| HvscEntry {
+            name: name.to_string(),
+            path: format!("/{name}/"),
+            is_dir: true,
+        })
+        .collect()
+}
+
+impl HvscBrowser {
+    /// Creates a new browser at the root level.
+    pub fn new(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            current_path: "/".to_string(),
+            entries: root_entries(),
+            selected: 0,
+            stil: None,
+            stil_error: None,
+            songlengths: None,
+            loading: false,
+            error: None,
+        }
+    }
+
+    /// Fetches the STIL and Songlengths databases (from cache if available).
+    pub fn load_stil(&mut self) {
+        // First-run fetch downloads ~10MB across two URLs; run in parallel to halve the hang.
+        let base_url = self.base_url.as_str();
+        let (stil_result, songlengths_result) = std::thread::scope(|s| {
+            let stil = s.spawn(|| StilDatabase::fetch(base_url));
+            let songlengths = s.spawn(|| SonglengthsDatabase::fetch(base_url));
+            (
+                stil.join().expect("STIL thread"),
+                songlengths.join().expect("Songlengths thread"),
+            )
+        });
+
+        match stil_result {
+            Ok(db) => self.stil = Some(db),
+            Err(e) => self.stil_error = Some(e.to_string()),
+        }
+        // Songlengths errors are silently ignored - we just fall back to playtime
+        if let Ok(db) = songlengths_result {
+            self.songlengths = Some(db);
+        }
+    }
+
+    /// Clears the HVSC cache and reloads STIL and Songlengths databases.
+    #[allow(dead_code)] // kept for a future "refresh cache" command
+    pub fn refresh_cache(&mut self) {
+        clear_cache();
+        self.stil = None;
+        self.stil_error = None;
+        self.songlengths = None;
+        self.load_stil();
+    }
+
+    /// Returns STIL info for the selected entry if available.
+    #[allow(dead_code)]
+    pub fn selected_stil_info(&self) -> Option<&StilEntry> {
+        let entry = self.entries.get(self.selected)?;
+        if entry.is_dir {
+            return None;
+        }
+        self.stil.as_ref()?.get(&entry.path)
+    }
+
+    /// Returns song duration for given MD5 and subsong (1-indexed), if available.
+    pub fn song_duration(&self, md5: &str, subsong: u16) -> Option<std::time::Duration> {
+        let durations = self.songlengths.as_ref()?.get(md5)?;
+        // Subsongs are 1-indexed, array is 0-indexed
+        durations.get(subsong.saturating_sub(1) as usize).copied()
+    }
+
+    /// Returns true if we can navigate up.
+    pub fn can_go_up(&self) -> bool {
+        self.current_path != "/"
+    }
+
+    /// Searches the STIL database for matching paths, titles, or artists.
+    pub fn search(&self, query: &str) -> io::Result<Vec<String>> {
+        let q = query.to_lowercase();
+        let Some(stil) = &self.stil else {
+            return Ok(Vec::new());
+        };
+        let results = stil
+            .search_index
+            .iter()
+            .filter(|(_, haystack)| haystack.contains(&q))
+            .map(|(path, _)| path.clone())
+            .take(100)
+            .collect();
+        Ok(results)
+    }
+
+    /// Fetches a specific entry as a SID file from HVSC.
+    pub fn fetch_entry(&self, path: &str) -> io::Result<SidFile> {
+        let url = format!("{}{}", self.base_url, path);
+        let bytes = fetch_bytes(&url)?;
+        SidFile::parse(&bytes)
+    }
+
+    /// Lists entries in the current path.
+    pub fn list(&self) -> io::Result<Vec<HvscEntry>> {
+        fetch_directory(&self.base_url, &self.current_path)
+    }
+
+    #[allow(dead_code)] // kept for the keyboard-driven browser API
+    pub fn enter(&mut self) -> Option<HvscEntry> {
+        let entry = self.entries.get(self.selected)?.clone();
+
+        if entry.is_dir {
+            self.navigate_to(&entry.path);
+            None
+        } else {
+            Some(entry)
+        }
+    }
+
+    /// Go up one directory level.
+    #[allow(dead_code)] // the shell computes the parent path itself
+    pub fn go_up(&mut self) {
+        if self.current_path == "/" {
+            return;
+        }
+
+        // Remove trailing slash, find parent
+        let path = self.current_path.trim_end_matches('/');
+        if let Some(pos) = path.rfind('/') {
+            let parent = if pos == 0 {
+                "/".to_string()
+            } else {
+                format!("{}/", &path[..pos])
+            };
+            self.navigate_to(&parent);
+        }
+    }
+
+    /// Navigate to a specific path.
+    pub fn navigate_to(&mut self, path: &str) {
+        if path == "/" {
+            // Reset entries to root listing without losing the loaded databases.
+            self.entries = root_entries();
+            self.current_path = "/".to_string();
+            self.selected = 0;
+            self.error = None;
+            return;
+        }
+
+        self.loading = true;
+        self.error = None;
+
+        match fetch_directory(&self.base_url, path) {
+            Ok(entries) => {
+                self.current_path = path.to_string();
+                self.entries = entries;
+                self.selected = 0;
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+            }
+        }
+
+        self.loading = false;
+    }
+
+    #[allow(dead_code)] // kept for the keyboard-driven browser API
+    pub fn select_next(&mut self) {
+        if !self.entries.is_empty() {
+            self.selected = (self.selected + 1).min(self.entries.len() - 1);
+        }
+    }
+
+    #[allow(dead_code)] // kept for the keyboard-driven browser API
+    pub fn select_prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Returns the currently selected entry.
+    #[allow(dead_code)]
+    pub fn selected_entry(&self) -> Option<&HvscEntry> {
+        self.entries.get(self.selected)
+    }
+}
+
+/// Fetches and parses a directory listing from HVSC.
+fn fetch_directory(base_url: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
+    if let Some(base_path) = base_url.strip_prefix("file://") {
+        read_local_directory(base_path, path)
+    } else {
+        fetch_http_directory(base_url, path)
+    }
+}
+
+/// Reads a local directory and returns HVSC entries.
+fn read_local_directory(base_path: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
+    let full_path = Path::new(base_path).join(path.trim_start_matches('/'));
+    let mut entries: Vec<HvscEntry> = std::fs::read_dir(&full_path)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.file_type().ok()?.is_dir();
+
+            if !is_browsable(is_dir, &name) {
+                return None;
+            }
+
+            let entry_path = if is_dir {
+                format!("{path}{name}/")
+            } else {
+                format!("{path}{name}")
+            };
+
+            Some(HvscEntry {
+                name,
+                path: entry_path,
+                is_dir,
+            })
+        })
+        .collect();
+
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+/// Sorts entries with directories first, then case-insensitive alphabetical for browsing.
+fn sort_entries(entries: &mut [HvscEntry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+/// Browser shows directories and `.sid` files only.
+fn is_browsable(is_dir: bool, name: &str) -> bool {
+    is_dir || name.to_lowercase().ends_with(".sid")
+}
+
+/// Fetches and parses an HTTP directory listing.
+fn fetch_http_directory(base_url: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
+    let html = fetch_text(&format!("{base_url}{path}"))?;
+    Ok(parse_directory_listing(&html, path))
+}
+
+/// Extracts href value from an HTML line, filtering navigation/special links.
+fn extract_href(line: &str) -> Option<&str> {
+    if line.contains("Parent Directory") {
+        return None;
+    }
+
+    let (_, rest) = line.split_once("href=\"")?;
+    let (href, _) = rest.split_once('"')?;
+
+    // Apache listings include sort links and parent refs we don't want.
+    let is_navigation =
+        href.starts_with('?') || href.starts_with('/') || href.starts_with("http") || href == "../";
+
+    if is_navigation { None } else { Some(href) }
+}
+
+/// Parses an Apache-style directory listing HTML.
+fn parse_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
+    let mut entries: Vec<HvscEntry> = html
+        .lines()
+        .filter_map(|line| {
+            let href = extract_href(line)?;
+            let is_dir = href.ends_with('/');
+            let name = href.trim_end_matches('/').to_string();
+
+            if !is_browsable(is_dir, &name) {
+                return None;
+            }
+
+            Some(HvscEntry {
+                name,
+                path: format!("{base_path}{href}"),
+                is_dir,
+            })
+        })
+        .collect();
+
+    sort_entries(&mut entries);
+    entries
+}

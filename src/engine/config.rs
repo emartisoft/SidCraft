@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2026 Emarti
+//
+// Portions derived from crabsid by Mikael Lund,
+// Copyright (c) 2026 Mikael Lund, licensed under the MIT License.
+// See licenses/MIT-crabsid.txt for the original license text.
+
+//! User configuration persistence.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+
+const fn default_true() -> bool {
+    true
+}
+
+fn default_theme() -> String {
+    "system".to_string()
+}
+
+fn default_viz_mode() -> String {
+    "scope".to_string()
+}
+
+/// User configuration stored in config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Theme preference: `system`, `light` or `dark`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Whether the left tool panel is open.
+    #[serde(default = "default_true")]
+    pub left_panel: bool,
+    /// Whether the right inspector is open.
+    #[serde(default = "default_true")]
+    pub right_panel: bool,
+    /// Visualiser: `scope` or `vu`.
+    #[serde(default = "default_viz_mode")]
+    pub viz_mode: String,
+    /// Path of the playlist that was active when the app last closed.
+    #[serde(default)]
+    pub active_playlist: Option<String>,
+    /// Last window width in points.
+    #[serde(default)]
+    pub window_width: Option<f32>,
+    /// Last window height in points.
+    #[serde(default)]
+    pub window_height: Option<f32>,
+    /// Last window x position in points.
+    #[serde(default)]
+    pub window_x: Option<f32>,
+    /// Last window y position in points.
+    #[serde(default)]
+    pub window_y: Option<f32>,
+    /// Whether the window was maximized when the app last closed.
+    #[serde(default)]
+    pub window_maximized: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            left_panel: true,
+            right_panel: true,
+            viz_mode: default_viz_mode(),
+            active_playlist: None,
+            window_width: None,
+            window_height: None,
+            window_x: None,
+            window_y: None,
+            window_maximized: false,
+        }
+    }
+}
+
+impl Config {
+    /// Loads config from file, returning defaults if not found or invalid.
+    pub fn load() -> Self {
+        config_path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Saves config to file (best-effort, errors ignored).
+    pub fn save(&self) {
+        let Some(path) = config_path() else { return };
+        let Some(parent) = path.parent() else { return };
+        let _ = fs::create_dir_all(parent);
+        if let Ok(content) = toml::to_string_pretty(self) {
+            let _ = fs::write(&path, content);
+        }
+    }
+}
+
+/// Returns the config file path (~/.config/sidcraft/config.toml).
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("sidcraft").join("config.toml"))
+}

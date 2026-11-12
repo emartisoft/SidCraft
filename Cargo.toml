@@ -1,0 +1,36 @@
+[package]
+name = "sidcraft"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+build = "build.rs"
+
+[dependencies]
+eframe = "0.31"
+cpal = "0.17"
+dirs = "6"
+md-5 = "0.10"
+mos6502 = "0.9"
+residfp = { git = "https://github.com/mlund/residfp", features = ["ekv-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ureq = "3"
+rfd = "0.15"
+
+# Embeds icon/sidcraft.ico into the Windows executable so Explorer, the task
+# bar and Alt+Tab show the application icon.
+[build-dependencies]
+winres = "0.1"
+
+# Lets the process set an explicit AppUserModelID, so Windows shows the
+# SidCraft icon (and not a generic one) on the task bar button.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
