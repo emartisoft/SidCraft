@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SidCraft
+GenericName=SID Player
+Comment=Play Commodore 64 SID music and browse the HVSC collection
+Exec=sidcraft %F
+Icon=sidcraft
+Terminal=false
+Categories=Audio;AudioVideo;Player;Music;
+Keywords=SID;C64;Commodore 64;HVSC;chiptune;music;
+StartupNotify=true
+StartupWMClass=sidcraft

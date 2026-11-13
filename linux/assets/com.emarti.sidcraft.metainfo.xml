@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: lets desktop environments and AppImage integration
+     tools show the name, summary and icon of SidCraft. -->
+<component type="desktop-application">
+  <id>com.emarti.sidcraft</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>SidCraft</name>
+  <summary>Commodore 64 SID music player and HVSC browser</summary>
+  <developer id="com.emarti">
+    <name>Emarti</name>
+  </developer>
+  <description>
+    <p>
+      SidCraft is an offline desktop player for Commodore 64 SID music files
+      (PSID and RSID). It runs the tune on a cycle-accurate 6502 emulator with
+      the residfp SID model, visualises playback with spectrum, oscilloscope,
+      piano-roll and filter views, and doubles as a browser for the High
+      Voltage SID Collection (HVSC).
+    </p>
+  </description>
+  <launchable type="desktop-id">sidcraft.desktop</launchable>
+  <categories>
+    <category>Audio</category>
+    <category>AudioVideo</category>
+    <category>Player</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-01-01"/>
+  </releases>
+</component>
