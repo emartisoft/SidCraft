@@ -1470,6 +1470,10 @@ fn main() -> eframe::Result<()> {
     let config = Config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SidCraft - SID Player")
+		// On Wayland the app id is what ties the window to `sidcraft.desktop`,
+        // which is how the desktop environment finds the icon. On X11 it
+        // becomes the WM_CLASS (`StartupWMClass` in the desktop file).
+        .with_app_id("sidcraft")
         .with_inner_size([
             config.window_width.unwrap_or(1180.0),
             config.window_height.unwrap_or(760.0),
