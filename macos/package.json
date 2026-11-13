@@ -1,0 +1,16 @@
+{
+  "name": "@sidcraft/macos-packaging",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run ./build.ts",
+    "app": "bun run ./build.ts app",
+    "dmg": "bun run ./build.ts dmg",
+    "help": "bun run ./build.ts help",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}
