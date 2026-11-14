@@ -16,7 +16,7 @@ The application does two things at once:
    
 ![SidCraft Home](docs/screenshots/01-home.png)
 
-![SidCraft Home](screenshots/light.png)
+![SidCraft Home](docs/screenshots/light.png)
 
 ## Documentation
 

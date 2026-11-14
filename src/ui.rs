@@ -13,6 +13,7 @@
 //! pasteboard, a right inspector plus a navigation rail, and a status bar. The
 //! SID-specific views (player, playlist, HVSC, settings) live inside that shell.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -21,6 +22,7 @@ use eframe::egui::{
 };
 use residfp::ChipModel;
 
+use crate::engine::export::ExportFormat;
 use crate::engine::playlist::playlist_display_name;
 use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
@@ -37,6 +39,7 @@ impl eframe::App for SidcraftApp {
         let viz_mode = self.viz_mode;
         if let Ok(p) = self.player.try_lock() {
             self.vu_meter.update(&p.voice_levels());
+            self.voice_mutes = p.voice_mutes();
             let envelopes = p.envelope_samples();
             self.voice_scopes.update(&envelopes);
             match viz_mode {
@@ -146,7 +149,7 @@ impl eframe::App for SidcraftApp {
         } else if (!self.paused && self.sid_file.name.is_empty() == false) || self.seeking {
             // ~40 FPS for smooth meters, scopes and elapsed time while playing.
             ctx.request_repaint_after(Duration::from_millis(25));
-        } else if self.hvsc_loading {
+        } else if self.hvsc_loading || self.export_progress.is_some() {
             // Keep the loading state responsive without running at full rate.
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
@@ -300,7 +303,7 @@ impl SidcraftApp {
                     );
                     ui.add_space(10.0);
 
-                    for view in [View::Player, View::Playlist, View::Hvsc, View::Settings] {
+                    for view in [View::Player, View::Playlist, View::Hvsc, View::Export, View::Settings] {
                         if mode_tab(ui, &t, view.label(), self.view == view).clicked() {
                             self.view = view;
                             self.last_view = view;
@@ -398,6 +401,7 @@ impl SidcraftApp {
                 View::Player,
                 View::Playlist,
                 View::Hvsc,
+                View::Export,
                 View::Settings,
             ] {
                 if ui
@@ -442,11 +446,6 @@ impl SidcraftApp {
             if ui.button("About SidCraft").clicked() {
                 ui.close_menu();
                 self.show_about = true;
-            }
-            if ui.button("Open HVSC browser").clicked() {
-                ui.close_menu();
-                self.view = View::Hvsc;
-                self.last_view = View::Hvsc;
             }
         });
     }
@@ -510,6 +509,10 @@ impl SidcraftApp {
                         if tool_row(ui, &t, "globe", "HVSC browser", "Search the High Voltage SID Collection", self.view == View::Hvsc).clicked() {
                             self.view = View::Hvsc;
                             self.last_view = View::Hvsc;
+                        }
+                        if tool_row(ui, &t, "save", "Export", "Render to WAV, FLAC or MP3", self.view == View::Export).clicked() {
+                            self.view = View::Export;
+                            self.last_view = View::Export;
                         }
                         if tool_row(ui, &t, "gear", "Settings", "Appearance, audio and emulation", self.view == View::Settings).clicked() {
                             self.view = View::Settings;
@@ -609,6 +612,10 @@ impl SidcraftApp {
                     if icon_button(ui, &t, "globe", 34.0, self.view == View::Hvsc, "HVSC browser").clicked() {
                         self.view = View::Hvsc;
                         self.last_view = View::Hvsc;
+                    }
+                    if icon_button(ui, &t, "save", 34.0, self.view == View::Export, "Export").clicked() {
+                        self.view = View::Export;
+                        self.last_view = View::Export;
                     }
                     if icon_button(ui, &t, "gear", 34.0, self.view == View::Settings, "Settings").clicked() {
                         self.view = View::Settings;
@@ -728,7 +735,22 @@ impl SidcraftApp {
                                 ui.add_space(16.0);
                                 section_title(ui, &t, "Voices");
                                 ui.add_space(4.0);
-                                voice_meters(ui, &t, &self.vu_meter.levels, &self.vu_meter.peaks);
+                                if let Some(voice) = voice_meters(
+                                    ui,
+                                    &t,
+                                    &self.vu_meter.levels,
+                                    &self.vu_meter.peaks,
+                                    &self.voice_mutes,
+                                ) {
+                                    let muted =
+                                        self.voice_mutes.get(voice).copied().unwrap_or(false);
+                                    if let Ok(mut p) = self.player.lock() {
+                                        p.set_voice_muted(voice, !muted);
+                                    }
+                                    if let Some(slot) = self.voice_mutes.get_mut(voice) {
+                                        *slot = !muted;
+                                    }
+                                }
                             });
                     });
             });
@@ -787,6 +809,7 @@ impl SidcraftApp {
                 View::Player => self.player_view(ui),
                 View::Playlist => self.playlist_view(ui),
                 View::Hvsc => self.hvsc_view(ui),
+                View::Export => self.export_view(ui),
                 View::Settings => self.settings_view(ui),
             });
     }
@@ -884,6 +907,7 @@ impl SidcraftApp {
                                 (View::Player, "music", "Player", "Watch the voices and control playback"),
                                 (View::Playlist, "list", "Playlist", "Open, reorder and play your m3u tracks"),
                                 (View::Hvsc, "globe", "HVSC browser", "Search the High Voltage SID Collection"),
+                                (View::Export, "save", "Export", "Render to WAV, FLAC or MP3"),
                                 (View::Settings, "gear", "Settings", "Theme, emulation and visualiser"),
                             ];
                             for (view, icon, title, blurb) in cards {
@@ -944,12 +968,30 @@ impl SidcraftApp {
 
     fn player_view(&mut self, ui: &mut egui::Ui) {
         let t = Tokens::get(ui.ctx());
-        egui::ScrollArea::vertical()
+        // Keep the card within a comfortable range while the window is
+        // resized. Below the minimum the view scrolls horizontally instead of
+        // squeezing the transport controls past usability.
+        const CARD_MARGIN: f32 = 20.0;
+        const MIN_PAGE_WIDTH: f32 = 480.0;
+        const MAX_PAGE_WIDTH: f32 = 720.0;
+        const SIDE_GUTTER: f32 = 24.0;
+
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let available = ui.available_width();
+                // Leave room for the frame margin and both gutters so the card
+                // fits exactly whenever it isn't clamped to its minimum size.
+                let page_width = (available - 2.0 * (SIDE_GUTTER + CARD_MARGIN))
+                    .clamp(MIN_PAGE_WIDTH, MAX_PAGE_WIDTH);
+                // Centre the card including its frame margin, so the gutters
+                // stay equal on both sides as the window is resized.
+                let card_width = page_width + 2.0 * CARD_MARGIN;
+                let side_gutter = ((available - card_width) / 2.0).max(SIDE_GUTTER);
+
                 ui.add_space(24.0);
-                let page_width = (ui.available_width() - 44.0).clamp(220.0, 720.0);
-                ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(side_gutter);
                     egui::Frame::NONE
                         .fill(t.card)
                         .stroke(Stroke::new(1.0_f32, t.border))
@@ -960,200 +1002,260 @@ impl SidcraftApp {
                             color: t.page_shadow,
                         })
                         .corner_radius(CornerRadius::same(12))
-                        .inner_margin(Margin::same(20))
+                        .inner_margin(Margin::same(CARD_MARGIN as i8))
                         .show(ui, |ui| {
-                            ui.set_width(page_width);
+                            // The frame inherits the surrounding horizontal
+                            // layout; give the card its own vertical column.
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                ui.set_width(page_width);
 
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(self.track_title())
-                                            .font(theme::semibold(20.0))
-                                            .color(t.text),
-                                    );
-                                    let author = if self.sid_file.author.is_empty() {
-                                        "Unknown author".to_string()
-                                    } else {
-                                        self.sid_file.author.clone()
-                                    };
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{author}  ·  {}",
-                                            if self.sid_file.released.is_empty() {
-                                                "Unknown release"
-                                            } else {
-                                                &self.sid_file.released
-                                            }
-                                        ))
-                                        .font(theme::regular(12.0))
-                                        .color(t.text_muted),
-                                    );
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(self.track_title())
+                                                .font(theme::semibold(20.0))
+                                                .color(t.text),
+                                        );
+                                        let author = if self.sid_file.author.is_empty() {
+                                            "Unknown author".to_string()
+                                        } else {
+                                            self.sid_file.author.clone()
+                                        };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{author}  ·  {}",
+                                                if self.sid_file.released.is_empty() {
+                                                    "Unknown release"
+                                                } else {
+                                                    &self.sid_file.released
+                                                }
+                                            ))
+                                            .font(theme::regular(12.0))
+                                            .color(t.text_muted),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                        // The visualiser selector stays pinned
+                                        // to the top-right of the header.
+                                        ui.allocate_ui_with_layout(
+                                            vec2(128.0, 0.0),
+                                            Layout::top_down(Align::Max),
+                                            |ui| {
+                                                let mut mode = self.viz_mode;
+                                                egui::ComboBox::from_id_salt("player-viz")
+                                                    .width(128.0)
+                                                    .selected_text(
+                                                        RichText::new(mode.label())
+                                                            .font(theme::medium(11.0)),
+                                                    )
+                                                    .show_ui(ui, |ui| {
+                                                        for option in VizMode::ALL {
+                                                            ui.selectable_value(
+                                                                &mut mode,
+                                                                option,
+                                                                option.label(),
+                                                            );
+                                                        }
+                                                    });
+                                                if mode != self.viz_mode {
+                                                    self.viz_mode = mode;
+                                                }
+                                            },
+                                        );
+                                    });
                                 });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let mut mode = self.viz_mode;
-                                    egui::ComboBox::from_id_salt("player-viz")
-                                        .width(128.0)
-                                        .selected_text(mode.label())
-                                        .show_ui(ui, |ui| {
-                                            for option in VizMode::ALL {
-                                                ui.selectable_value(
-                                                    &mut mode,
-                                                    option,
-                                                    option.label(),
-                                                );
-                                            }
-                                        });
-                                    if mode != self.viz_mode {
-                                        self.viz_mode = mode;
+
+                                ui.add_space(14.0);
+
+                                let (display_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 276.0), Sense::hover());
+                                match self.viz_mode {
+                                    VizMode::Scope => self.paint_scope(ui, &t, display_rect),
+                                    VizMode::Vu => self.paint_display_vu(ui, &t, display_rect),
+                                    VizMode::Spectrum => self.paint_spectrum(ui, &t, display_rect),
+                                    VizMode::Spectrogram => {
+                                        self.paint_spectrogram(ui, &t, display_rect);
                                     }
-                                    if secondary_button(ui, &t, self.chip_label()).clicked() {
+                                    VizMode::Oscilloscope => {
+                                        self.paint_oscilloscope(ui, &t, display_rect);
+                                    }
+                                    VizMode::PianoRoll => self.paint_piano_roll(ui, &t, display_rect),
+                                    VizMode::Filter => self.paint_filter(ui, &t, display_rect),
+                                    VizMode::Adsr => self.paint_adsr(ui, &t, display_rect),
+                                }
+
+                                ui.add_space(10.0);
+                                let total = self.song_timeout.as_secs_f32().max(1.0);
+                                let fraction = (self.current_elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+                                if let Some(f) = seek_bar(ui, &t, fraction) {
+                                    self.seek_to_fraction(f);
+                                }
+                                // Elapsed and total time sit at the edges, with the
+                                // whole play/pause/stop/next/shuffle/repeat group
+                                // centred between them.
+                                let elapsed_text = format_duration(self.current_elapsed());
+                                let total_text = format_duration(self.song_timeout);
+                                let time_font = theme::mono(11.0);
+                                let elapsed_w = text_width(ui, &elapsed_text, &time_font);
+                                let total_w = text_width(ui, &total_text, &time_font);
+                                const TRANSPORT_SIZE: f32 = 46.0;
+                                // The play/pause button is the main action, so
+                                // it is a little larger than its neighbours.
+                                const PLAY_SIZE: f32 = 54.0;
+                                const TOGGLE_SIZE: f32 = 34.0;
+                                const TRANSPORT_GAP: f32 = 8.0;
+                                let group_w = TRANSPORT_SIZE * 3.0
+                                    + PLAY_SIZE
+                                    + TOGGLE_SIZE * 2.0
+                                    + TRANSPORT_GAP * 5.0;
+
+                                // A fixed-height row keeps the time labels and the
+                                // transport buttons on the same vertical centre.
+                                ui.allocate_ui_with_layout(
+                                    vec2(ui.available_width(), PLAY_SIZE),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.add_sized(
+                                            [elapsed_w, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(elapsed_text)
+                                                    .font(time_font.clone())
+                                                    .color(t.text_muted),
+                                            )
+                                            .extend(),
+                                        );
+
+                                        let center_w = (ui.available_width() - total_w).max(0.0);
+                                        ui.add_space(((center_w - group_w) / 2.0).max(0.0));
+                                        // Keep the buttons as direct children of
+                                        // this row so they share its vertical
+                                        // centre with the time labels.
+                                        if transport_button(ui, &t, "prev", TRANSPORT_SIZE, false, "Previous track").clicked() {
+                                            self.prev_track();
+                                        }
+                                        ui.add_space(TRANSPORT_GAP);
+                                        if transport_button(ui, &t, if self.paused { "play" } else { "pause" }, PLAY_SIZE, true, "Play / pause").clicked() {
+                                            self.toggle_pause();
+                                        }
+                                        ui.add_space(TRANSPORT_GAP);
+                                        if transport_button(ui, &t, "stop", TRANSPORT_SIZE, false, "Stop").clicked() {
+                                            self.stop_playback();
+                                        }
+                                        ui.add_space(TRANSPORT_GAP);
+                                        if transport_button(ui, &t, "next", TRANSPORT_SIZE, false, "Next track").clicked() {
+                                            self.next_track();
+                                        }
+                                        ui.add_space(TRANSPORT_GAP);
+                                        if icon_button_glyph(ui, &t, "shuffle", TOGGLE_SIZE, 20.0, 1.9, self.shuffle, "Shuffle").clicked() {
+                                            self.shuffle = !self.shuffle;
+                                        }
+                                        ui.add_space(TRANSPORT_GAP);
+                                        if icon_button_glyph(ui, &t, "repeat", TOGGLE_SIZE, 20.0, 1.9, self.repeat_mode != RepeatMode::Off, "Repeat").clicked() {
+                                            self.cycle_repeat();
+                                        }
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add_sized(
+                                                [total_w, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(total_text)
+                                                        .font(time_font)
+                                                        .color(t.text_faint),
+                                                )
+                                                .extend(),
+                                            );
+                                        });
+                                    },
+                                );
+
+                                // Subsong stepping and volume live on their own row
+                                // below the transport controls.
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    // The chip-model button sits to the left of
+                                    // the subsong stepper.
+                                    if secondary_button_with_font(
+                                        ui,
+                                        &t,
+                                        self.chip_label(),
+                                        theme::medium(11.0),
+                                    )
+                                    .clicked()
+                                    {
                                         self.cycle_chip_model();
                                     }
-                                });
-                            });
-
-                            ui.add_space(14.0);
-
-                            let (display_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 276.0), Sense::hover());
-                            match self.viz_mode {
-                                VizMode::Scope => self.paint_scope(ui, &t, display_rect),
-                                VizMode::Vu => self.paint_display_vu(ui, &t, display_rect),
-                                VizMode::Spectrum => self.paint_spectrum(ui, &t, display_rect),
-                                VizMode::Spectrogram => {
-                                    self.paint_spectrogram(ui, &t, display_rect);
-                                }
-                                VizMode::Oscilloscope => {
-                                    self.paint_oscilloscope(ui, &t, display_rect);
-                                }
-                                VizMode::PianoRoll => self.paint_piano_roll(ui, &t, display_rect),
-                                VizMode::Filter => self.paint_filter(ui, &t, display_rect),
-                                VizMode::Adsr => self.paint_adsr(ui, &t, display_rect),
-                            }
-
-                            ui.add_space(10.0);
-                            let total = self.song_timeout.as_secs_f32().max(1.0);
-                            let fraction = (self.current_elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
-                            if let Some(f) = seek_bar(ui, &t, fraction) {
-                                self.seek_to_fraction(f);
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format_duration(self.current_elapsed()))
-                                        .font(theme::mono(11.0))
-                                        .color(t.text_muted),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icon_button(ui, &t, "chevron-left", 34.0, false, "Previous subsong").clicked() && self.current_song > 1 {
+                                        self.change_subsong(self.current_song - 1);
+                                    }
                                     ui.label(
-                                        RichText::new(format_duration(self.song_timeout))
-                                            .font(theme::mono(11.0))
-                                            .color(t.text_faint),
+                                        RichText::new(format!("{:02}/{:02}", self.current_song, self.total_songs))
+                                            .font(theme::mono(12.0))
+                                            .color(t.text_muted),
                                     );
-                                });
-                            });
-
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                if transport_button(ui, &t, "prev", 46.0, false, "Previous track").clicked() {
-                                    self.prev_track();
-                                }
-                                if transport_button(ui, &t, if self.paused { "play" } else { "pause" }, 46.0, true, "Play / pause").clicked() {
-                                    self.toggle_pause();
-                                }
-                                if transport_button(ui, &t, "stop", 46.0, false, "Stop").clicked() {
-                                    self.stop_playback();
-                                }
-                                if transport_button(ui, &t, "next", 46.0, false, "Next track").clicked() {
-                                    self.next_track();
-                                }
-
-                                ui.add_space(8.0);
-                                if icon_button(ui, &t, "shuffle", 34.0, self.shuffle, "Shuffle").clicked() {
-                                    self.shuffle = !self.shuffle;
-                                }
-                                if icon_button(ui, &t, "repeat", 34.0, self.repeat_mode != RepeatMode::Off, "Repeat").clicked() {
-                                    self.cycle_repeat();
-                                }
-
-                                ui.add_space(8.0);
-                                let sep = ui.cursor().left();
-                                ui.painter().vline(sep, ui.max_rect().y_range().shrink(6.0), Stroke::new(1.0_f32, t.divider));
-                                ui.add_space(8.0);
-
-                                if icon_button(ui, &t, "chevron-left", 34.0, false, "Previous subsong").clicked() && self.current_song > 1 {
-                                    self.change_subsong(self.current_song - 1);
-                                }
-                                ui.label(
-                                    RichText::new(format!("{:02}/{:02}", self.current_song, self.total_songs))
-                                        .font(theme::mono(12.0))
-                                        .color(t.text_muted),
-                                );
-                                if icon_button(ui, &t, "chevron-right", 34.0, false, "Next subsong").clicked() && self.current_song < self.total_songs {
-                                    self.change_subsong(self.current_song + 1);
-                                }
-
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if primary_button(ui, &t, "Open").clicked() {
-                                        self.open_file_dialog();
+                                    if icon_button(ui, &t, "chevron-right", 34.0, false, "Next subsong").clicked() && self.current_song < self.total_songs {
+                                        self.change_subsong(self.current_song + 1);
                                     }
-                                    // Sized to match the prev/next transport
-                                    // arrows: same glyph box and stroke.
-                                    if icon_button_glyph(
-                                        ui,
-                                        &t,
-                                        "plus",
-                                        40.0,
-                                        21.0,
-                                        1.6,
-                                        false,
-                                        "Add current track to playlist",
-                                    )
-                                    .clicked()
-                                    {
-                                        self.add_current_to_playlist();
-                                    }
-                                    // Kept in the same right-to-left row (no nested
-                                    // horizontal) so the speaker lines up with the
-                                    // transport arrows.
-                                    let muted =
-                                        self.muted.load(std::sync::atomic::Ordering::SeqCst);
-                                    if icon_button_glyph(
-                                        ui,
-                                        &t,
-                                        if muted { "speaker-off" } else { "speaker" },
-                                        40.0,
-                                        21.0,
-                                        1.6,
-                                        false,
-                                        "Mute / unmute",
-                                    )
-                                    .clicked()
-                                    {
-                                        self.muted
-                                            .store(!muted, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    let frac = if muted {
-                                        0.0
-                                    } else {
-                                        *self
-                                            .volume
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                    };
-                                    if let Some(f) = volume_bar(ui, &t, frac, 110.0) {
-                                        *self
-                                            .volume
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner()) = f;
-                                        // Adjusting the slider always leaves mute.
-                                        self.muted.store(
+
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        // Sized to match the prev/next transport
+                                        // arrows: same glyph box and stroke.
+                                        if icon_button_glyph(
+                                            ui,
+                                            &t,
+                                            "plus",
+                                            40.0,
+                                            21.0,
+                                            1.6,
                                             false,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                        );
-                                    }
+                                            "Add current track to playlist",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.add_current_to_playlist();
+                                        }
+                                        // Kept in the same right-to-left row so the
+                                        // volume slider stays pinned to the right.
+                                        let muted =
+                                            self.muted.load(std::sync::atomic::Ordering::SeqCst);
+                                        if icon_button_glyph(
+                                            ui,
+                                            &t,
+                                            if muted { "speaker-off" } else { "speaker" },
+                                            40.0,
+                                            21.0,
+                                            1.6,
+                                            false,
+                                            "Mute / unmute",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.muted
+                                                .store(!muted, std::sync::atomic::Ordering::SeqCst);
+                                        }
+                                        let frac = if muted {
+                                            0.0
+                                        } else {
+                                            *self
+                                                .volume
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                        };
+                                        if let Some(f) = volume_bar(ui, &t, frac, 110.0) {
+                                            *self
+                                                .volume
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) = f;
+                                            // Adjusting the slider always leaves mute.
+                                            self.muted.store(
+                                                false,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                        }
+                                    });
                                 });
                             });
                         });
+                    ui.add_space(side_gutter);
                 });
                 ui.add_space(24.0);
             });
@@ -1873,11 +1975,32 @@ impl SidcraftApp {
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("Playlist")
-                        .font(theme::semibold(22.0))
-                        .color(t.text),
-                );
+                let files = self.playlist_files.clone();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Playlist")
+                            .font(theme::semibold(22.0))
+                            .color(t.text),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            files.len(),
+                            if files.len() == 1 {
+                                "playlist"
+                            } else {
+                                "playlists"
+                            }
+                        ))
+                        .font(theme::regular(11.5))
+                        .color(t.text_faint),
+                    );
+                    if icon_button(ui, &t, "folder-open", 26.0, false, "Open playlist folder")
+                        .clicked()
+                    {
+                        self.open_playlist_folder();
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Library")
@@ -1886,7 +2009,6 @@ impl SidcraftApp {
                     );
 
                     let current = playlist_display_name(&self.playlist_path);
-                    let files = self.playlist_files.clone();
                     let mut chosen: Option<std::path::PathBuf> = None;
                     egui::ComboBox::from_id_salt("playlist_library")
                         .selected_text(
@@ -1919,43 +2041,27 @@ impl SidcraftApp {
                         // it must not start playback on its own.
                         self.select_playlist(path);
                     }
-                    if secondary_button(ui, &t, "New…").clicked() {
+                    if icon_button(ui, &t, "plus", 30.0, false, "New playlist…").clicked() {
                         self.show_new_playlist = true;
                         self.new_playlist_name.clear();
                         self.new_playlist_error = None;
                     }
-                    if secondary_button(ui, &t, "Open…").clicked() {
+                    if icon_button(ui, &t, "folder", 30.0, false, "Open playlist or SID…")
+                        .clicked()
+                    {
                         self.open_file_dialog();
                     }
-                    if secondary_button(ui, &t, "Rename").clicked() {
+                    if icon_button(ui, &t, "pencil", 30.0, false, "Rename playlist").clicked() {
                         self.rename_playlist_name = playlist_display_name(&self.playlist_path);
                         self.rename_playlist_error = None;
                         self.show_rename_playlist = true;
                     }
-                    if secondary_button(ui, &t, "Delete").clicked() {
+                    if icon_button(ui, &t, "trash", 30.0, false, "Delete playlist").clicked() {
                         self.confirm_action = Some(ConfirmAction::DeletePlaylist);
                     }
-                    if secondary_button(ui, &t, "Save As").clicked() {
+                    if icon_button(ui, &t, "save", 30.0, false, "Save playlist as…").clicked() {
                         self.save_playlist_as();
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, &t, "folder", 26.0, false, "Open playlist folder").clicked() {
-                            self.open_playlist_folder();
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "{} {}",
-                                files.len(),
-                                if files.len() == 1 {
-                                    "playlist"
-                                } else {
-                                    "playlists"
-                                }
-                            ))
-                            .font(theme::regular(11.5))
-                            .color(t.text_faint),
-                        );
-                    });
                 });
 
                 let summary = format!(
@@ -1976,16 +2082,18 @@ impl SidcraftApp {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if primary_button(ui, &t, "Add files").clicked() {
+                    if primary_icon_button(ui, &t, "file-plus", 30.0, "Add files").clicked() {
                         self.add_files_dialog();
                     }
-                    if secondary_button(ui, &t, "Clear").clicked() {
+                    if icon_button(ui, &t, "eraser", 30.0, false, "Clear playlist").clicked() {
                         self.confirm_action = Some(ConfirmAction::ClearTracks);
                     }
-                    if secondary_button(ui, &t, "Remove").clicked() {
+                    if icon_button(ui, &t, "minus", 30.0, false, "Remove selected track")
+                        .clicked()
+                    {
                         self.confirm_action = Some(ConfirmAction::RemoveTrack);
                     }
-                    if secondary_button(ui, &t, "Play all").clicked() {
+                    if icon_button(ui, &t, "play", 30.0, false, "Play all").clicked() {
                         self.play_all();
                         self.view = View::Player;
                         self.last_view = View::Player;
@@ -2159,6 +2267,426 @@ impl SidcraftApp {
                 if let Some(path) = fetch {
                     self.hvsc_fetch(&path);
                 }
+            });
+    }
+
+    fn export_view(&mut self, ui: &mut egui::Ui) {
+        let t = Tokens::get(ui.ctx());
+
+        // Check if an export just finished
+        let export_done = self
+            .export_progress
+            .as_ref()
+            .map_or(false, |p| p.is_done());
+        if export_done {
+            if let Some(p) = self.export_progress.take() {
+                if let Some(err) = p.error_message() {
+                    self.set_status(format!("Export failed: {err}"));
+                } else if !p.is_cancelled() {
+                    if let Some(ref path) = self.export_last_path {
+                        self.set_status(format!("Export saved: {}", path.display()));
+                    } else {
+                        self.set_status("Export complete");
+                    }
+                } else {
+                    self.set_status("Export cancelled");
+                }
+            }
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(Margin {
+                        left: 32,
+                        right: 32,
+                        top: 26,
+                        bottom: 26,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("Export")
+                                .font(theme::semibold(22.0))
+                                .color(t.text),
+                        );
+                        let subtitle = if self.sid_file.name.is_empty() {
+                            "No active track. Open a SID file to enable export.".to_string()
+                        } else {
+                            format!("Export \"{}\" to WAV, FLAC or MP3.", self.track_title())
+                        };
+                        ui.label(
+                            RichText::new(subtitle)
+                                .font(theme::regular(12.0))
+                                .color(t.text_muted),
+                        );
+                        ui.add_space(16.0);
+
+                        // ── Active Track Details ────────────────────────────
+                        settings_card(ui, &t, "Active SID Track", |ui| {
+                            let title = self.track_title();
+                            property_row(ui, &t, "Title", &title);
+                            let author = if self.sid_file.author.is_empty() {
+                                "Unknown author".to_string()
+                            } else {
+                                self.sid_file.author.clone()
+                            };
+                            property_row(ui, &t, "Author", &author);
+                            if !self.sid_file.released.is_empty() {
+                                property_row(ui, &t, "Released", &self.sid_file.released);
+                            }
+                            property_row(ui, &t, "Clock", self.clock_label());
+                            property_row(ui, &t, "SID chip", self.chip_label());
+                            property_row(ui, &t, "Chips", self.sid_count_label());
+                            property_row(
+                                ui,
+                                &t,
+                                "Subsong",
+                                &format!("{} of {}", self.export_settings.subsong, self.total_songs),
+                            );
+
+                            if self.total_songs > 1 {
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Select Subsong")
+                                            .font(theme::medium(12.0))
+                                            .color(t.text),
+                                    );
+                                    ui.add_space(8.0);
+                                    if icon_button(ui, &t, "chevron-left", 26.0, false, "Previous subsong").clicked()
+                                        && self.export_settings.subsong > 1
+                                    {
+                                        self.export_settings.subsong -= 1;
+                                        if let Some(dur) = self.hvsc_browser.song_duration(&self.sid_file.md5, self.export_settings.subsong) {
+                                            self.export_settings.duration_secs = dur.as_secs_f32();
+                                        }
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:02} / {:02}",
+                                            self.export_settings.subsong, self.total_songs
+                                        ))
+                                        .font(theme::mono(12.0))
+                                        .color(t.text_muted),
+                                    );
+                                    if icon_button(ui, &t, "chevron-right", 26.0, false, "Next subsong").clicked()
+                                        && self.export_settings.subsong < self.total_songs
+                                    {
+                                        self.export_settings.subsong += 1;
+                                        if let Some(dur) = self.hvsc_browser.song_duration(&self.sid_file.md5, self.export_settings.subsong) {
+                                            self.export_settings.duration_secs = dur.as_secs_f32();
+                                        }
+                                    }
+                                });
+                            }
+                        });
+
+                        // ── SID Fine Tuning ─────────────────────────────────
+                        settings_card(ui, &t, "SID Fine Tuning", |ui| {
+                            // EKV filter
+                            let mut ekv = self.export_settings.ekv_filter;
+                            if ui.checkbox(&mut ekv, "EKV transistor filter (6581 model)").changed() {
+                                self.export_settings.ekv_filter = ekv;
+                            }
+                            ui.label(
+                                RichText::new("Enables non-linear transistor ladder simulation for MOS 6581.")
+                                    .font(theme::regular(11.0))
+                                    .color(t.text_faint),
+                            );
+
+                            ui.add_space(10.0);
+
+                            // Voice mutes
+                            ui.label(
+                                RichText::new("Voice Configuration")
+                                    .font(theme::medium(12.5))
+                                    .color(t.text),
+                            );
+                            ui.label(
+                                RichText::new("Select voices to mute during export (unmute = active in mix):")
+                                    .font(theme::regular(11.0))
+                                    .color(t.text_faint),
+                            );
+                            ui.add_space(4.0);
+
+                            let voice_count = self.total_voices();
+                            if self.export_settings.voice_mutes.len() < voice_count {
+                                self.export_settings.voice_mutes.resize(voice_count, false);
+                            }
+
+                            ui.horizontal_wrapped(|ui| {
+                                for i in 0..voice_count {
+                                    let is_muted = self.export_settings.voice_mutes.get(i).copied().unwrap_or(false);
+                                    let mut active = !is_muted;
+                                    let label = format!("Voice {}", i + 1);
+                                    if ui.checkbox(&mut active, &label).changed() {
+                                        if let Some(slot) = self.export_settings.voice_mutes.get_mut(i) {
+                                            *slot = !active;
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                        // ── Format & Audio Settings ─────────────────────────
+                        settings_card(ui, &t, "Format & Quality", |ui| {
+                            ui.label(
+                                RichText::new("Export Format")
+                                    .font(theme::medium(12.5))
+                                    .color(t.text),
+                            );
+                            let fmt_labels = ["WAV", "FLAC", "MP3"];
+                            let fmt_idx = match self.export_settings.format {
+                                ExportFormat::Wav => 0,
+                                ExportFormat::Flac => 1,
+                                ExportFormat::Mp3 => 2,
+                            };
+                            if let Some(choice) = segmented(ui, &t, fmt_idx, &fmt_labels) {
+                                self.export_settings.format = match choice {
+                                    1 => ExportFormat::Flac,
+                                    2 => ExportFormat::Mp3,
+                                    _ => ExportFormat::Wav,
+                                };
+                            }
+                            ui.label(
+                                RichText::new(match self.export_settings.format {
+                                    ExportFormat::Wav => "Lossless 16-bit uncompressed PCM (native support, universal compatibility).",
+                                    ExportFormat::Flac => "Lossless compressed audio (via ffmpeg if installed, or high-definition WAV).",
+                                    ExportFormat::Mp3 => "MPEG Layer-3 compressed audio (delegates to ffmpeg libmp3lame).",
+                                })
+                                .font(theme::regular(11.0))
+                                .color(t.text_faint),
+                            );
+
+                            ui.add_space(10.0);
+
+                            // Duration
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new("Duration")
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_faint),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.export_settings.duration_secs)
+                                        .speed(1.0)
+                                        .range(1.0..=1200.0)
+                                        .suffix(" s"),
+                                );
+                                let secs = self.export_settings.duration_secs as u64;
+                                ui.label(
+                                    RichText::new(format!("({:02}:{:02})", secs / 60, secs % 60))
+                                        .font(theme::mono(11.0))
+                                        .color(t.text_muted),
+                                );
+
+                                if let Some(d) = self.hvsc_browser.song_duration(&self.sid_file.md5, self.export_settings.subsong) {
+                                    let hsecs = d.as_secs();
+                                    if secondary_button(
+                                        ui,
+                                        &t,
+                                        &format!("HVSC Length: {:02}:{:02}", hsecs / 60, hsecs % 60),
+                                    )
+                                    .on_hover_text("Load tune duration from HVSC database")
+                                    .clicked()
+                                    {
+                                        self.export_settings.duration_secs = d.as_secs_f32();
+                                    }
+                                }
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Fade-out
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new("Fade-out")
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_faint),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.export_settings.fade_out_secs)
+                                        .speed(0.5)
+                                        .range(0.0..=30.0)
+                                        .suffix(" s"),
+                                );
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Sample rate
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new("Sample rate")
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_faint),
+                                    ),
+                                );
+                                egui::ComboBox::from_id_salt("export-rate")
+                                    .width(120.0)
+                                    .selected_text(format!("{} Hz", self.export_settings.sample_rate))
+                                    .show_ui(ui, |ui| {
+                                        for &rate in &[22050u32, 44100, 48000, 96000] {
+                                            ui.selectable_value(
+                                                &mut self.export_settings.sample_rate,
+                                                rate,
+                                                format!("{rate} Hz"),
+                                            );
+                                        }
+                                    });
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Master gain
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new("Master gain")
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_faint),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut self.export_settings.gain, 0.0..=1.5)
+                                        .show_value(true),
+                                );
+                            });
+
+                            // MP3 bitrate
+                            if self.export_settings.format == ExportFormat::Mp3 {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(
+                                            RichText::new("MP3 bitrate")
+                                                .font(theme::regular(11.5))
+                                                .color(t.text_faint),
+                                        ),
+                                    );
+                                    egui::ComboBox::from_id_salt("export-mp3-kbps")
+                                        .width(120.0)
+                                        .selected_text(format!("{} kbps", self.export_settings.mp3_bitrate_kbps))
+                                        .show_ui(ui, |ui| {
+                                            for &br in &[128u32, 192, 256, 320] {
+                                                ui.selectable_value(
+                                                    &mut self.export_settings.mp3_bitrate_kbps,
+                                                    br,
+                                                    format!("{br} kbps"),
+                                                );
+                                            }
+                                        });
+                                });
+                            }
+                        });
+
+                        // ── Destination Directory ───────────────────────────
+                        settings_card(ui, &t, "Save Location", |ui| {
+                            ui.horizontal(|ui| {
+                                let dir_display = match &self.export_output_dir {
+                                    Some(d) => d.to_string_lossy().to_string(),
+                                    None => "Default folder (choose destination on export)".to_string(),
+                                };
+                                ui.label(
+                                    RichText::new(dir_display)
+                                        .font(theme::mono(11.5))
+                                        .color(if self.export_output_dir.is_some() {
+                                            t.text
+                                        } else {
+                                            t.text_faint
+                                        }),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if secondary_button(ui, &t, "Choose folder…").clicked() {
+                                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                            self.export_output_dir = Some(folder);
+                                        }
+                                    }
+                                });
+                            });
+
+                            if let Some(ref path) = self.export_last_path {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!("Last exported: {}", path.display()))
+                                        .font(theme::regular(11.0))
+                                        .color(t.text_muted),
+                                );
+                            }
+                        });
+
+                        // ── Export Render / Progress ────────────────────────
+                        let has_track = !self.sid_file.name.is_empty();
+
+                        if let Some(ref progress) = self.export_progress {
+                            let frac = progress.fraction();
+                            settings_card(ui, &t, "Exporting Audio…", |ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), 12.0),
+                                    Sense::hover(),
+                                );
+                                let track = Rect::from_center_size(
+                                    rect.center(),
+                                    vec2(rect.width(), 6.0),
+                                );
+                                ui.painter().rect_filled(track, CornerRadius::same(3), t.hover);
+                                let fill = Rect::from_min_size(
+                                    track.min,
+                                    vec2(track.width() * frac, track.height()),
+                                );
+                                ui.painter().rect_filled(fill, CornerRadius::same(3), t.accent);
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:.1}% rendered", frac * 100.0))
+                                            .font(theme::mono(12.0))
+                                            .color(t.text),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if secondary_button(ui, &t, "Cancel").clicked() {
+                                            progress.cancel.store(true, Ordering::Relaxed);
+                                        }
+                                    });
+                                });
+                            });
+                        } else {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if has_track {
+                                    let export_label = format!("Export to {}…", self.export_settings.format.label());
+                                    if primary_button(ui, &t, &export_label).clicked() {
+                                        self.start_export();
+                                    }
+                                } else {
+                                    let font = theme::medium(12.5);
+                                    let label = "Export…";
+                                    let w = text_width(ui, label, &font) + 26.0;
+                                    let (rect, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
+                                    ui.painter().rect_filled(rect, CornerRadius::same(7), t.hover);
+                                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, t.text_faint);
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new("Open a SID file first from File or Home.")
+                                            .font(theme::regular(12.0))
+                                            .color(t.text_faint),
+                                    );
+                                }
+                            });
+                        }
+                    });
             });
     }
 
@@ -2497,7 +3025,7 @@ impl SidcraftApp {
 
     fn about_window(&mut self, ctx: &egui::Context) {
         let t = Tokens::get(ctx);
-        egui::Window::new("About SidCraft")
+        egui::Window::new("About")
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
@@ -2510,43 +3038,65 @@ impl SidcraftApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.horizontal(|ui| {
-                    // The application artwork from `icon/sidcraft.png`.
-                    let (icon_rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                    match crate::app_icon::texture(ctx) {
-                        Some(texture) => {
-                            egui::Image::from_texture(&texture)
-                                .fit_to_exact_size(icon_rect.size())
-                                .paint_at(ui, icon_rect);
+                // Header: artwork on the left with the name and tagline beside
+                // it. The detail rows are indented to the text column so every
+                // label lines up under the title.
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), ABOUT_ICON),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(ABOUT_ICON), Sense::hover());
+                        match crate::app_icon::texture(ctx) {
+                            Some(texture) => {
+                                egui::Image::from_texture(&texture)
+                                    .fit_to_exact_size(icon_rect.size())
+                                    .paint_at(ui, icon_rect);
+                            }
+                            None => {
+                                // Fall back to the vector mark if the PNG cannot
+                                // be decoded or uploaded.
+                                ui.painter().rect_filled(
+                                    icon_rect,
+                                    CornerRadius::same(20),
+                                    t.accent_soft,
+                                );
+                                paint_icon(
+                                    ui.painter(),
+                                    icon_rect.shrink(18.0),
+                                    "music",
+                                    t.accent,
+                                    1.8,
+                                );
+                            }
                         }
-                        None => {
-                            // Fall back to the vector mark if the PNG cannot be
-                            // decoded or uploaded.
-                            ui.painter()
-                                .rect_filled(icon_rect, CornerRadius::same(10), t.accent_soft);
-                            paint_icon(ui.painter(), icon_rect.shrink(9.0), "music", t.accent, 1.8);
-                        }
-                    }
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("SidCraft")
-                                .font(theme::semibold(19.0))
-                                .color(t.text),
-                        );
-                        ui.label(
-                            RichText::new("SID player and HVSC browser")
-                                .font(theme::regular(12.0))
-                                .color(t.text_muted),
-                        );
-                    });
-                });
-                ui.add_space(14.0);
-                property_row_right(ui, &t, "Version", env!("CARGO_PKG_VERSION"));
-                property_row_right(ui, &t, "Coded by", "emarti, Murat Özdemir");
-                property_row_right(ui, &t, "Engine", "residfp + mos6502");
-                property_row_right(ui, &t, "Interface", "egui / eframe");
-                ui.add_space(14.0);
+                        ui.add_space(ABOUT_GAP);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("SidCraft")
+                                    .font(theme::semibold(20.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("SID player and HVSC browser")
+                                    .font(theme::regular(12.0))
+                                    .color(t.text_muted),
+                            );
+                        });
+                    },
+                );
+                ui.add_space(16.0);
+                hairline(ui, &t);
+                ui.add_space(10.0);
+                about_property_row(ui, &t, "Version", env!("CARGO_PKG_VERSION"));
+                about_property_row(ui, &t, "Coded by", "emarti, Murat Özdemir");
+                about_property_row(ui, &t, "Engine", "residfp + mos6502");
+                about_property_row(ui, &t, "Interface", "egui / eframe");
+                ui.add_space(16.0);
+                hairline(ui, &t);
+                ui.add_space(10.0);
                 // `Align::Min` on the cross axis keeps the button row hugging
                 // its content; `Align::Center` would stretch the row over the
                 // whole remaining height and leave a large gap.
@@ -2689,6 +3239,32 @@ fn icon_button(
         selected,
         tip,
     )
+}
+
+/// Like [`primary_button`] but square and icon-only, for a compact accent action.
+fn primary_icon_button(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    icon: &str,
+    size: f32,
+    tip: &str,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let fill = if resp.hovered() {
+        t.accent.gamma_multiply(1.08)
+    } else {
+        t.accent
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
+    let glyph = size - size * 0.54;
+    paint_icon(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(glyph)),
+        icon,
+        Color32::WHITE,
+        (size * 0.07).clamp(1.2, 1.9),
+    );
+    theme::hand(resp).on_hover_text(tip)
 }
 
 /// Like [`icon_button`] but with an explicit glyph size and stroke width, so a
@@ -3102,7 +3678,15 @@ fn primary_button(ui: &mut egui::Ui, t: &Tokens, label: &str) -> Response {
 }
 
 fn secondary_button(ui: &mut egui::Ui, t: &Tokens, label: &str) -> Response {
-    let font = theme::medium(12.5);
+    secondary_button_with_font(ui, t, label, theme::medium(12.5))
+}
+
+fn secondary_button_with_font(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    label: &str,
+    font: FontId,
+) -> Response {
     let width = text_width(ui, label, &font) + 24.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
     let fill = if resp.hovered() { t.hover } else { t.card };
@@ -3237,6 +3821,42 @@ fn property_row_right(ui: &mut egui::Ui, t: &Tokens, label: &str, value: &str) {
     });
 }
 
+/// Artwork size, the gap between it and the text column, and the left edge of
+/// that column. The About header and its detail rows share these so the title
+/// and every label line up.
+const ABOUT_ICON: f32 = 88.0;
+const ABOUT_GAP: f32 = 16.0;
+const ABOUT_TEXT_X: f32 = ABOUT_ICON + ABOUT_GAP;
+
+/// About dialog row: the label hugs the left edge of the text column and the
+/// value the right edge, so every line of text shares the same two columns as
+/// the title.
+fn about_property_row(ui: &mut egui::Ui, t: &Tokens, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(ABOUT_TEXT_X);
+        ui.label(
+            RichText::new(label)
+                .font(theme::regular(11.5))
+                .color(t.text_faint),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(value)
+                    .font(theme::regular(11.5))
+                    .color(t.text_muted),
+            );
+        });
+    });
+}
+
+/// A one pixel rule used to group the About dialog into header, details and
+/// footer without the heavier default separator.
+fn hairline(ui: &mut egui::Ui, t: &Tokens) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, t.border);
+}
+
 fn spectrum_color(t: &Tokens, value: f32) -> Color32 {
     let hot = Color32::from_rgb(0xFF, 0xC4, 0x5C);
     mix_color(t.accent, hot, value.clamp(0.0, 1.0).powf(1.6))
@@ -3305,13 +3925,43 @@ fn section_title(ui: &mut egui::Ui, t: &Tokens, label: &str) {
     );
 }
 
-fn voice_meters(ui: &mut egui::Ui, t: &Tokens, levels: &[f32], peaks: &[f32]) {
+fn voice_meters(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    levels: &[f32],
+    peaks: &[f32],
+    mutes: &[bool],
+) -> Option<usize> {
+    let mut toggled = None;
     for (i, level) in levels.iter().enumerate() {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let muted = mutes.get(i).copied().unwrap_or(false);
+            // A compact speaker switch sits beside the bar; muting only
+            // silences this voice, the rest of the mix keeps playing.
+            if icon_button_glyph(
+                ui,
+                t,
+                if muted { "speaker-off" } else { "speaker" },
+                16.0,
+                12.0,
+                1.4,
+                muted,
+                if muted { "Unmute voice" } else { "Mute voice" },
+            )
+            .clicked()
+            {
+                toggled = Some(i);
+            }
+            let tint = if muted {
+                t.voice(i).gamma_multiply(0.4)
+            } else {
+                t.voice(i)
+            };
             ui.label(
                 RichText::new(format!("V{}", i + 1))
                     .font(theme::mono(9.5))
-                    .color(t.voice(i)),
+                    .color(tint),
             );
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 10.0), Sense::hover());
             let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
@@ -3320,15 +3970,16 @@ fn voice_meters(ui: &mut egui::Ui, t: &Tokens, levels: &[f32], peaks: &[f32]) {
                 track.min,
                 vec2(track.width() * level.clamp(0.0, 1.0), track.height()),
             );
-            ui.painter().rect_filled(fill, CornerRadius::same(2), t.voice(i));
+            ui.painter().rect_filled(fill, CornerRadius::same(2), tint);
             let peak = peaks.get(i).copied().unwrap_or(0.0);
             let x = track.left() + track.width() * peak.clamp(0.0, 1.0);
             ui.painter().line_segment(
                 [pos2(x, track.top() - 2.0), pos2(x, track.bottom() + 2.0)],
-                Stroke::new(1.5_f32, t.text),
+                Stroke::new(1.5_f32, if muted { tint } else { t.text }),
             );
         });
     }
+    toggled
 }
 
 fn seek_bar(ui: &mut egui::Ui, t: &Tokens, fraction: f32) -> Option<f32> {
@@ -3568,64 +4219,73 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             );
         }
         "shuffle" => {
-            // Two curved arrows (shuffle gesture).
-            let quad = |p0: Pos2, c: Pos2, p1: Pos2, steps: usize, out: &mut Vec<Pos2>| {
-                for i in 0..=steps {
-                    let t = i as f32 / steps as f32;
-                    let u = 1.0 - t;
-                    let x = u * u * p0.x + 2.0 * u * t * c.x + t * t * p1.x;
-                    let y = u * u * p0.y + 2.0 * u * t * c.y + t * t * p1.y;
-                    out.push(pos2(x, y));
-                }
+            // Two crossing tracks with solid arrowheads.
+            let left = r.left() + s * 0.04;
+            let knee = r.left() + s * 0.36;
+            let tip_x = r.right() - s * 0.04;
+            let top = r.top() + s * 0.26;
+            let bottom = r.bottom() - s * 0.26;
+
+            let arrow = |tip: Pos2, dir: Vec2| {
+                let d = dir.normalized();
+                let n = vec2(-d.y, d.x);
+                let base = tip - d * (s * 0.24);
+                poly(vec![
+                    tip,
+                    base + n * (s * 0.12),
+                    base - n * (s * 0.12),
+                ]);
             };
-            let mut a1 = Vec::new();
-            quad(
-                pos2(r.left() + s * 0.2, c.y + s * 0.28),
-                pos2(r.left() + s * 0.5, c.y - s * 0.42),
-                pos2(r.right() - s * 0.2, c.y + s * 0.28),
-                24,
-                &mut a1,
-            );
-            painter.add(egui::Shape::line(a1, stroke));
-            let mut a2 = Vec::new();
-            quad(
-                pos2(r.right() - s * 0.2, c.y - s * 0.28),
-                pos2(r.right() - s * 0.5, c.y + s * 0.42),
-                pos2(r.left() + s * 0.2, c.y - s * 0.28),
-                24,
-                &mut a2,
-            );
-            painter.add(egui::Shape::line(a2, stroke));
+
+            // Lower-left to upper-right track.
+            line(pos2(left, bottom), pos2(knee, bottom));
+            line(pos2(knee, bottom), pos2(tip_x, top));
+            arrow(pos2(tip_x, top), vec2(tip_x - knee, top - bottom));
+
+            // Upper-left to lower-right track.
+            line(pos2(left, top), pos2(knee, top));
+            line(pos2(knee, top), pos2(tip_x, bottom));
+            arrow(pos2(tip_x, bottom), vec2(tip_x - knee, bottom - top));
         }
         "repeat" => {
-            // Two curved arrows in the same rotational direction (repeat).
-            let quad = |p0: Pos2, c: Pos2, p1: Pos2, steps: usize, out: &mut Vec<Pos2>| {
-                for i in 0..=steps {
-                    let t = i as f32 / steps as f32;
-                    let u = 1.0 - t;
-                    let x = u * u * p0.x + 2.0 * u * t * c.x + t * t * p1.x;
-                    let y = u * u * p0.y + 2.0 * u * t * c.y + t * t * p1.y;
-                    out.push(pos2(x, y));
-                }
-            };
-            let mut a1 = Vec::new();
-            quad(
-                pos2(r.left() + s * 0.2, c.y + s * 0.1),
-                pos2(r.left() + s * 0.45, c.y - s * 0.42),
-                pos2(r.right() - s * 0.2, c.y + s * 0.1),
-                24,
-                &mut a1,
-            );
-            painter.add(egui::Shape::line(a1, stroke));
-            let mut a2 = Vec::new();
-            quad(
-                pos2(r.right() - s * 0.2, c.y - s * 0.1),
-                pos2(r.right() - s * 0.45, c.y + s * 0.42),
-                pos2(r.left() + s * 0.2, c.y - s * 0.1),
-                24,
-                &mut a2,
-            );
-            painter.add(egui::Shape::line(a2, stroke));
+            // Rectangular loop: top track pointing right, bottom track
+            // pointing left, each with a solid arrowhead.
+            let left = r.left() + s * 0.04;
+            let right = r.right() - s * 0.04;
+            let top = r.top() + s * 0.24;
+            let bottom = r.bottom() - s * 0.24;
+            let stub = s * 0.26;
+            let head = s * 0.2;
+
+            // Top run.
+            line(pos2(left, top + stub), pos2(left, top));
+            line(pos2(left, top), pos2(right, top));
+            poly(vec![
+                pos2(right - s * 0.02, top),
+                pos2(right - s * 0.02 - head, top - head * 0.7),
+                pos2(right - s * 0.02 - head, top + head * 0.7),
+            ]);
+
+            // Bottom run.
+            line(pos2(right, bottom - stub), pos2(right, bottom));
+            line(pos2(right, bottom), pos2(left, bottom));
+            poly(vec![
+                pos2(left + s * 0.02, bottom),
+                pos2(left + s * 0.02 + head, bottom - head * 0.7),
+                pos2(left + s * 0.02 + head, bottom + head * 0.7),
+            ]);
+        }
+        "eraser" => {
+            // A tilted eraser with the seam between its two halves.
+            let u = vec2(1.0, -1.0).normalized() * (s * 0.3);
+            let v = vec2(1.0, 1.0).normalized() * (s * 0.16);
+            let corners = [c + u + v, c + u - v, c - u - v, c - u + v];
+            painter.add(egui::Shape::line(
+                vec![corners[0], corners[1], corners[2], corners[3], corners[0]],
+                stroke,
+            ));
+            let seam = c - u * 0.2;
+            line(seam + v, seam - v);
         }
         "trash" => {
             // Trash can: lid, body and two vertical lines.
@@ -3730,6 +4390,56 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
                 pos2(tab.right(), body.top()),
             );
         }
+        "folder-open" => {
+            // Back panel with the tab, then the front flap leaning open.
+            let left = r.left() + s * 0.08;
+            let right = r.right() - s * 0.04;
+            let top = r.top() + s * 0.2;
+            let bottom = r.bottom() - s * 0.14;
+            line(pos2(left, bottom), pos2(left, top + s * 0.08));
+            line(pos2(left, top + s * 0.08), pos2(left + s * 0.24, top + s * 0.08));
+            line(
+                pos2(left + s * 0.24, top + s * 0.08),
+                pos2(left + s * 0.34, top),
+            );
+            line(pos2(left + s * 0.34, top), pos2(right, top));
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(left + s * 0.02, bottom),
+                    pos2(right - s * 0.1, bottom),
+                    pos2(right + s * 0.04, top + s * 0.26),
+                    pos2(left + s * 0.16, top + s * 0.26),
+                    pos2(left + s * 0.02, bottom),
+                ],
+                stroke,
+            ));
+        }
+        "pencil" => {
+            // A slanted pencil: two shaft edges, the back seam and a solid tip.
+            let back = pos2(r.left() + s * 0.16, r.bottom() - s * 0.16);
+            let tip = pos2(r.right() - s * 0.2, r.top() + s * 0.2);
+            let d = (tip - back).normalized();
+            let n = vec2(-d.y, d.x) * (s * 0.09);
+            line(back + n, tip + n);
+            line(back - n, tip - n);
+            line(back + n, back - n);
+            poly(vec![tip + n, tip - n, tip + d * (s * 0.18)]);
+        }
+        "save" => {
+            // Floppy disk: body, shutter and label.
+            let body = r.shrink(s * 0.08);
+            painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            let shutter = Rect::from_min_max(
+                pos2(body.left() + s * 0.16, body.top()),
+                pos2(body.right() - s * 0.16, body.top() + s * 0.22),
+            );
+            painter.rect_stroke(shutter, CornerRadius::same(1), stroke, StrokeKind::Inside);
+            let label = Rect::from_min_max(
+                pos2(body.left() + s * 0.18, body.bottom() - s * 0.3),
+                pos2(body.right() - s * 0.18, body.bottom() - s * 0.05),
+            );
+            painter.rect_stroke(label, CornerRadius::same(1), stroke, StrokeKind::Inside);
+        }
         "file" => {
             let body = Rect::from_min_max(
                 pos2(r.left() + s * 0.2, r.top() + s * 0.06),
@@ -3748,6 +4458,29 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
                 pos2(body.right() - s * 0.18, body.top() + s * 0.18),
                 pos2(body.right(), body.top() + s * 0.18),
             );
+        }
+        "file-plus" => {
+            // A file outline with a plus for adding tracks.
+            let body = Rect::from_min_max(
+                pos2(r.left() + s * 0.22, r.top() + s * 0.06),
+                pos2(r.right() - s * 0.16, r.bottom() - s * 0.06),
+            );
+            painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            line(
+                pos2(body.right() - s * 0.18, body.top()),
+                pos2(body.right(), body.top() + s * 0.18),
+            );
+            line(
+                pos2(body.right() - s * 0.18, body.top()),
+                pos2(body.right() - s * 0.18, body.top() + s * 0.18),
+            );
+            line(
+                pos2(body.right() - s * 0.18, body.top() + s * 0.18),
+                pos2(body.right(), body.top() + s * 0.18),
+            );
+            let p = pos2(c.x + s * 0.02, c.y + s * 0.1);
+            line(pos2(p.x - s * 0.11, p.y), pos2(p.x + s * 0.11, p.y));
+            line(pos2(p.x, p.y - s * 0.11), pos2(p.x, p.y + s * 0.11));
         }
         "info" => {
             painter.circle_stroke(c, s * 0.42, stroke);
@@ -3817,9 +4550,11 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             );
         }
         "stop" => {
+            // A crisp square, not a rounded blob, so it reads as a stop button
+            // even at the transport size.
             painter.rect_filled(
-                Rect::from_center_size(c, Vec2::splat(s * 0.36)),
-                CornerRadius::same(2),
+                Rect::from_center_size(c, Vec2::splat(s * 0.4)),
+                CornerRadius::ZERO,
                 color,
             );
         }

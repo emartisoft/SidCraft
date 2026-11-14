@@ -36,7 +36,7 @@ const OFFSET_THIRD_SID: usize = 0x7B;
 ///
 /// The PSID format stores 6502 machine code along with metadata
 /// (title, author, release info) and playback parameters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SidFile {
     /// File format identifier ("PSID" or "RSID"). Read by [`SidFile::is_interrupt_driven`].
     #[allow(dead_code)] // exercised only via a #[cfg(test)] caller in production builds

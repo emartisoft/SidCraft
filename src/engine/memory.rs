@@ -91,10 +91,22 @@ const fn build_kernel_stub() -> [u8; KERNAL_SIZE] {
     stub
 }
 
+/// Control-register bits kept while a voice is muted: sync, ring-mod and test.
+/// Clearing the gate bit lets the envelope release to zero and clearing the
+/// waveform nibble silences the oscillator, while the oscillator itself keeps
+/// clocking so hard-sync relationships with the other voices stay intact.
+const MUTE_CONTROL_MASK: u8 = 0x0E;
+
 /// A SID chip with its base memory address.
 pub struct SidChip {
     pub sid: Sid,
     pub base_address: u16,
+    /// Per-voice mute switches, driven by the mixer UI.
+    voice_mute: [bool; 3],
+    /// Last control value the tune wrote per voice. While a voice is muted the
+    /// chip receives a masked copy; unmuting writes the intended value back so
+    /// a held note starts sounding again.
+    voice_control: [u8; 3],
 }
 
 impl SidChip {
@@ -102,11 +114,57 @@ impl SidChip {
         Self {
             sid: Sid::new(chip_model),
             base_address,
+            voice_mute: [false; 3],
+            voice_control: [0; 3],
         }
     }
 
     fn contains(&self, addr: u16) -> bool {
         addr >= self.base_address && addr < self.base_address + SID_REGISTER_COUNT
+    }
+
+    /// Silences or restores one voice (0-2) without stopping the chip.
+    pub fn set_voice_muted(&mut self, voice: usize, muted: bool) {
+        if voice >= 3 || self.voice_mute[voice] == muted {
+            return;
+        }
+        self.voice_mute[voice] = muted;
+        #[allow(clippy::cast_possible_truncation)]
+        let reg = (voice * 7 + 4) as u8;
+        let value = if muted {
+            self.voice_control[voice] & MUTE_CONTROL_MASK
+        } else {
+            self.voice_control[voice]
+        };
+        self.sid.write(reg, value);
+    }
+
+    pub fn voice_muted(&self, voice: usize) -> bool {
+        self.voice_mute.get(voice).copied().unwrap_or(false)
+    }
+
+    /// Drops the remembered control values after the chip is reset, so a stale
+    /// value cannot be restored by a later unmute.
+    pub const fn forget_voice_controls(&mut self) {
+        self.voice_control = [0; 3];
+    }
+
+    /// Register write that masks the control register of a muted voice.
+    fn write(&mut self, reg: u8, val: u8) {
+        if reg % 7 == 4 {
+            let voice = (reg / 7) as usize;
+            if voice < 3 {
+                self.voice_control[voice] = val;
+                let applied = if self.voice_mute[voice] {
+                    val & MUTE_CONTROL_MASK
+                } else {
+                    val
+                };
+                self.sid.write(reg, applied);
+                return;
+            }
+        }
+        self.sid.write(reg, val);
     }
 }
 
@@ -180,7 +238,28 @@ impl C64Memory {
     pub fn set_chip_model(&mut self, index: usize, chip_model: ChipModel) {
         if let Some(sid_chip) = self.sids.get_mut(index) {
             let base = sid_chip.base_address;
+            // Keep the mixer switches and last control values across the swap:
+            // the caller re-applies the register snapshot right after.
+            let mute = sid_chip.voice_mute;
+            let control = sid_chip.voice_control;
             *sid_chip = SidChip::new(chip_model, base);
+            sid_chip.voice_mute = mute;
+            sid_chip.voice_control = control;
+        }
+    }
+
+    /// Per-voice mute switches, ordered chip by chip (3 entries per SID).
+    pub fn voice_mutes(&self) -> Vec<bool> {
+        self.sids
+            .iter()
+            .flat_map(|chip| (0..3).map(|voice| chip.voice_muted(voice)))
+            .collect()
+    }
+
+    /// Silences or restores one voice by its global index (chip * 3 + voice).
+    pub fn set_voice_muted(&mut self, index: usize, muted: bool) {
+        if let Some(chip) = self.sids.get_mut(index / 3) {
+            chip.set_voice_muted(index % 3, muted);
         }
     }
 
@@ -267,7 +346,6 @@ impl Bus for C64Memory {
                 if sid_chip.contains(addr) {
                     #[allow(clippy::cast_possible_truncation)]
                     sid_chip
-                        .sid
                         .write((addr - sid_chip.base_address) as u8, val);
                     return;
                 }

@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod cia;
 pub mod config;
+pub mod export;
 pub mod hvsc;
 pub mod memory;
 pub mod player;

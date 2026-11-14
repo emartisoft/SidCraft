@@ -809,6 +809,7 @@ impl Player {
 
         for sid_chip in &mut self.cpu.memory.sids {
             sid_chip.sid.reset();
+            sid_chip.forget_voice_controls();
         }
 
         self.cpu.registers.index_x = 0;
@@ -871,6 +872,16 @@ impl Player {
             .iter()
             .flat_map(|s| s.sid.read_state().envelope_counter)
             .collect()
+    }
+
+    /// Returns the per-voice mute switches, ordered chip by chip (3 per SID).
+    pub fn voice_mutes(&self) -> Vec<bool> {
+        self.cpu.memory.voice_mutes()
+    }
+
+    /// Silences or restores one voice by its global index (chip * 3 + voice).
+    pub fn set_voice_muted(&mut self, voice_index: usize, muted: bool) {
+        self.cpu.memory.set_voice_muted(voice_index, muted);
     }
 
     /// Returns the chip models for all SIDs.

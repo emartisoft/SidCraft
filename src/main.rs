@@ -12,6 +12,7 @@ mod visuals;
 use eframe::egui;
 use engine::audio::AudioOutput;
 use engine::config::Config;
+use engine::export::{ExportProgress, ExportSettings};
 use engine::hvsc::{HvscBrowser, HvscEntry, DEFAULT_HVSC_URL};
 use engine::player::{
     FilterInfo, NoteSample, SamplingMethod, SharedPlayer, VoiceInfo, create_shared_player,
@@ -36,6 +37,7 @@ pub enum View {
     Player,
     Playlist,
     Hvsc,
+    Export,
     Settings,
 }
 
@@ -46,6 +48,7 @@ impl View {
             Self::Player => "Player",
             Self::Playlist => "Playlist",
             Self::Hvsc => "HVSC",
+            Self::Export => "Export",
             Self::Settings => "Settings",
         }
     }
@@ -56,6 +59,7 @@ impl View {
             Self::Player => "music",
             Self::Playlist => "list",
             Self::Hvsc => "globe",
+            Self::Export => "save",
             Self::Settings => "gear",
         }
     }
@@ -66,6 +70,7 @@ impl View {
             Self::Player => "Now playing, visualiser and transport",
             Self::Playlist => "Tracks, subsongs and playlist file",
             Self::Hvsc => "Search and browse the High Voltage SID Collection",
+            Self::Export => "Render the active SID tune to WAV, FLAC or MP3",
             Self::Settings => "Appearance, audio and emulation",
         }
     }
@@ -220,6 +225,8 @@ pub struct SidcraftApp {
     envelope_states: Vec<Vec<u8>>,
     /// Raw envelope curves used by the ADSR view.
     envelope_curves: Vec<Vec<f32>>,
+    /// Per-voice mute switches mirrored from the player for the mixer UI.
+    pub voice_mutes: Vec<bool>,
 
     // Song timing
     song_elapsed: Duration,
@@ -285,6 +292,12 @@ pub struct SidcraftApp {
     geometry_saved_at: Option<Instant>,
     /// When set, playback is waiting for a 1s gap before advancing to the next track.
     track_gap_until: Option<Instant>,
+
+    // Export panel
+    pub export_settings: ExportSettings,
+    pub export_progress: Option<ExportProgress>,
+    pub export_output_dir: Option<std::path::PathBuf>,
+    pub export_last_path: Option<std::path::PathBuf>,
 }
 
 fn default_playlist_path() -> PathBuf {
@@ -470,6 +483,7 @@ impl SidcraftApp {
             filter_infos: Vec::new(),
             envelope_states: Vec::new(),
             envelope_curves: Vec::new(),
+            voice_mutes: vec![false; sid_count * 3],
             song_elapsed: Duration::ZERO,
             song_resumed_at: Instant::now(),
             song_timeout: Duration::from_secs(180),
@@ -522,6 +536,10 @@ impl SidcraftApp {
             geometry_dirty: false,
             geometry_saved_at: None,
             track_gap_until: None,
+            export_settings: ExportSettings::default(),
+            export_progress: None,
+            export_output_dir: None,
+            export_last_path: None,
         };
 
         if !sid_file.name.is_empty() {
@@ -610,6 +628,7 @@ impl SidcraftApp {
                 let sid_count = self.chip_models.len();
                 self.vu_meter = VuMeter::with_voice_count(sid_count * 3);
                 self.voice_scopes = VoiceScopes::with_voice_count(sid_count * 3);
+                self.voice_mutes = vec![false; sid_count * 3];
                 self.spectrum = Spectrum::new();
                 self.spectrogram.clear();
                 self.audio_samples.clear();
@@ -620,6 +639,10 @@ impl SidcraftApp {
                 self.envelope_curves.clear();
                 self.set_status(format!("Playing: {}", sid.name));
                 self.sid_file = sid;
+                self.export_settings.subsong = subsong;
+                self.export_settings.duration_secs = self.song_timeout.as_secs_f32();
+                self.export_settings.ekv_filter = self.ekv_filter;
+                self.export_settings.voice_mutes = vec![false; sid_count * 3];
             }
             Err(e) => {
                 self.set_status(format!("Load failed: {e}"));
@@ -684,6 +707,8 @@ impl SidcraftApp {
                 .hvsc_browser
                 .song_duration(md5, song)
                 .unwrap_or(self.default_timeout);
+            self.export_settings.subsong = song;
+            self.export_settings.duration_secs = self.song_timeout.as_secs_f32();
             self.set_status(format!("Subsong: {}/{}", song, self.total_songs));
         }
     }
@@ -1459,6 +1484,79 @@ impl SidcraftApp {
             self.geometry_dirty = false;
             self.geometry_saved_at = Some(Instant::now());
         }
+    }
+
+    /// Total number of emulated voices (3 per SID chip).
+    pub fn total_voices(&self) -> usize {
+        self.chip_models.len() * 3
+    }
+
+    /// Kicks off a background export render.
+    pub fn start_export(&mut self) {
+        use engine::export::render_to_file;
+
+        // Pick an output path
+        let ext = self.export_settings.format.extension();
+        let suggested = engine::export::suggested_filename(
+            &self.sid_file,
+            self.export_settings.subsong,
+            self.export_settings.format,
+        );
+        let dialog = rfd::FileDialog::new()
+            .add_filter(
+                self.export_settings.format.label(),
+                &[ext],
+            )
+            .set_file_name(&suggested);
+
+        let dialog = if let Some(ref dir) = self.export_output_dir {
+            dialog.set_directory(dir)
+        } else {
+            dialog
+        };
+
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+
+        // Ensure the file has the extension matching the selected format.
+        // Some save dialogs (or manual edits) may omit or keep a previous extension,
+        // which would cause ffmpeg to pick the wrong container/format.
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            path.set_extension(ext);
+        }
+
+        // Remember the chosen directory for next time
+        if let Some(parent) = path.parent() {
+            self.export_output_dir = Some(parent.to_path_buf());
+        }
+
+        let total_samples =
+            (self.export_settings.duration_secs * self.export_settings.sample_rate as f32) as u64;
+        let progress = ExportProgress::new(total_samples);
+        let progress_clone = progress.clone();
+
+        self.export_last_path = Some(path.clone());
+        self.export_progress = Some(progress);
+
+        // Ensure voice_mutes has the right length
+        let voice_count = self.total_voices();
+        if self.export_settings.voice_mutes.len() != voice_count {
+            self.export_settings.voice_mutes.resize(voice_count, false);
+        }
+
+        let sid_file = self.sid_file.clone();
+        let settings = self.export_settings.clone();
+
+        std::thread::spawn(move || {
+            render_to_file(&sid_file, &settings, &path, &progress_clone);
+        });
+
+        self.set_status(format!(
+            "Exporting {} to {}…",
+            self.export_settings.format.label(),
+            self.export_last_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        ));
     }
 }
 
