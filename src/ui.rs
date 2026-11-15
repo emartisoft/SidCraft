@@ -2316,8 +2316,14 @@ impl SidcraftApp {
                 ui.add_space(8.0);
                 if !self.hvsc_search_results.is_empty() {
                     ui.horizontal(|ui| {
+                        let count = self.hvsc_search_results.len();
+                        let summary = if count >= 100 {
+                            "first 100 results · double-click to play".to_string()
+                        } else {
+                            format!("{count} results · double-click to play")
+                        };
                         ui.label(
-                            RichText::new(format!("{} results · double-click to play", self.hvsc_search_results.len()))
+                            RichText::new(summary)
                                 .font(theme::regular(11.5))
                                 .color(t.text_muted),
                         );

@@ -8,10 +8,11 @@
 //! HVSC (High Voltage SID Collection) browser with STIL metadata support.
 
 use crate::engine::sid_file::SidFile;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Fetches bytes from a URL (http/https) or local path (file://).
 fn fetch_bytes(url: &str) -> io::Result<Vec<u8>> {
@@ -108,9 +109,6 @@ pub struct StilEntry {
 #[derive(Debug, Default, Clone)]
 pub struct StilDatabase {
     entries: HashMap<String, StilEntry>,
-    // Precomputed lowercase haystack per entry; HVSC has ~50k entries and rebuilding
-    // these per keystroke produces hundreds of thousands of allocations.
-    search_index: Vec<(String, String)>,
 }
 
 impl StilDatabase {
@@ -152,11 +150,7 @@ impl StilDatabase {
             entries.insert(path, current_entry);
         }
 
-        let search_index = build_search_index(&entries);
-        Self {
-            entries,
-            search_index,
-        }
+        Self { entries }
     }
 
     /// Returns the number of entries in the database.
@@ -175,41 +169,15 @@ impl StilDatabase {
     pub fn get(&self, path: &str) -> Option<&StilEntry> {
         self.entries.get(path)
     }
-
-    /// Searches paths, titles, and artists for entries containing the query (case-insensitive).
-    #[allow(dead_code)] // kept for the local STIL index API
-    pub fn search(&self, query: &str) -> Vec<&str> {
-        let query_lower = query.to_lowercase();
-        self.search_index
-            .iter()
-            .filter(|(_, haystack)| haystack.contains(&query_lower))
-            .map(|(path, _)| path.as_str())
-            .collect()
-    }
-}
-
-fn build_search_index(entries: &HashMap<String, StilEntry>) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .map(|(path, entry)| {
-            let mut haystack = path.to_lowercase();
-            if let Some(t) = &entry.title {
-                haystack.push('\n');
-                haystack.push_str(&t.to_lowercase());
-            }
-            if let Some(a) = &entry.artist {
-                haystack.push('\n');
-                haystack.push_str(&a.to_lowercase());
-            }
-            (path.clone(), haystack)
-        })
-        .collect()
 }
 
 /// Song lengths database mapping MD5 hashes to per-subsong durations.
 #[derive(Debug, Default, Clone)]
 pub struct SonglengthsDatabase {
     entries: HashMap<String, Vec<std::time::Duration>>,
+    /// Every SID path listed in the file, in file order. The Songlengths file
+    /// names all of HVSC, so this doubles as the list of tunes that exist.
+    paths: Vec<String>,
 }
 
 impl SonglengthsDatabase {
@@ -224,8 +192,19 @@ impl SonglengthsDatabase {
 
     fn parse(content: &str) -> Self {
         let mut entries = HashMap::new();
+        let mut paths = Vec::new();
         for line in content.lines() {
-            if line.starts_with(';') || line.starts_with('[') || line.trim().is_empty() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('[') {
+                continue;
+            }
+            // `; /MUSICIANS/S/Shogoon/No_Way_Out.sid` names the file the next
+            // MD5 line belongs to; collect these to index the whole collection.
+            if let Some(path) = line.strip_prefix(';') {
+                let path = path.trim();
+                if path.starts_with('/') && path.ends_with(".sid") {
+                    paths.push(path.to_string());
+                }
                 continue;
             }
             // Format: <md5>=<time1> <time2> ...
@@ -239,7 +218,12 @@ impl SonglengthsDatabase {
                 }
             }
         }
-        Self { entries }
+        Self { entries, paths }
+    }
+
+    /// Every SID path listed in the file.
+    pub fn paths(&self) -> &[String] {
+        &self.paths
     }
 
     /// Looks up song durations by MD5 hash. Expects lowercase hex (matches `SidFile::md5`).
@@ -314,15 +298,113 @@ pub struct HvscBrowser {
     /// Selected index
     pub selected: usize,
     /// STIL database for metadata
-    pub stil: Option<StilDatabase>,
+    pub stil: Option<Arc<StilDatabase>>,
     /// STIL loading error (persists across navigation)
     pub stil_error: Option<String>,
     /// Songlengths database for durations
-    pub songlengths: Option<SonglengthsDatabase>,
+    pub songlengths: Option<Arc<SonglengthsDatabase>>,
+    /// Lowercase "path\ntitle\nartist" haystack per SID, shared across clones.
+    search_index: Arc<Vec<(String, String)>>,
     /// Loading state
     pub loading: bool,
     /// Error message if any
     pub error: Option<String>,
+}
+
+/// Normalizes search text: case-insensitive, and `_` in file names counts as a
+/// space so "No Way Out" matches `No_Way_Out.sid`.
+fn normalize_search_text(text: &str) -> String {
+    text.to_lowercase().replace('_', " ")
+}
+
+/// Builds one lowercase haystack per SID: the path plus any STIL title and
+/// artist. Songlengths lists every tune in the collection, while STIL only has
+/// metadata for part of it, so the paths decide what is searchable and STIL
+/// entries missing from Songlengths are added on top.
+fn build_hvsc_search_index(
+    songlengths: Option<&SonglengthsDatabase>,
+    stil: Option<&StilDatabase>,
+) -> Vec<(String, String)> {
+    let mut index = Vec::new();
+    // Paths already indexed, so STIL entries for them are not added twice.
+    let mut covered: HashSet<&str> = HashSet::new();
+
+    if let Some(songlengths) = songlengths {
+        for path in songlengths.paths() {
+            covered.insert(path.as_str());
+            let entry = stil.and_then(|db| db.get(path));
+            index.push((path.clone(), search_haystack(path, entry)));
+        }
+    }
+
+    if let Some(stil) = stil {
+        for (path, entry) in &stil.entries {
+            if !covered.contains(path.as_str()) {
+                index.push((path.clone(), search_haystack(path, Some(entry))));
+            }
+        }
+    }
+
+    index
+}
+
+/// Lowercase search text for one SID: path, then title and artist if known.
+fn search_haystack(path: &str, entry: Option<&StilEntry>) -> String {
+    let mut haystack = normalize_search_text(path);
+    if let Some(entry) = entry {
+        for value in [&entry.title, &entry.artist].into_iter().flatten() {
+            haystack.push('\n');
+            haystack.push_str(&normalize_search_text(value));
+        }
+    }
+    haystack
+}
+
+/// True if `needle` starts a word (not just a substring of a longer one).
+fn contains_at_word_start(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let abs = from + pos;
+        let starts_word = haystack[..abs]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_alphanumeric());
+        if starts_word {
+            return true;
+        }
+        from = abs + needle.len();
+        if from >= haystack.len() {
+            return false;
+        }
+    }
+    false
+}
+
+/// Ranks a match: exact file names first, then names starting with the query,
+/// then path matches, then title/artist mentions.
+fn search_score(path: &str, haystack: &str, phrase: &str, tokens: &[String]) -> u32 {
+    let mut score = 0;
+    if let Some(name) = path.rsplit('/').next() {
+        let stem = normalize_search_text(name);
+        let stem = stem.strip_suffix(".sid").unwrap_or(&stem);
+        if stem == phrase {
+            score += 1000;
+        } else if stem.starts_with(phrase) {
+            score += 500;
+        }
+    }
+    if normalize_search_text(path).contains(phrase) {
+        score += 100;
+    }
+    if haystack.contains(phrase) {
+        score += 50;
+    }
+    for token in tokens {
+        if contains_at_word_start(haystack, token) {
+            score += 10;
+        }
+    }
+    score
 }
 
 /// Top-level HVSC categories shown when the browser is at "/".
@@ -348,6 +430,7 @@ impl HvscBrowser {
             stil: None,
             stil_error: None,
             songlengths: None,
+            search_index: Arc::new(Vec::new()),
             loading: false,
             error: None,
         }
@@ -367,13 +450,22 @@ impl HvscBrowser {
         });
 
         match stil_result {
-            Ok(db) => self.stil = Some(db),
+            Ok(db) => self.stil = Some(Arc::new(db)),
             Err(e) => self.stil_error = Some(e.to_string()),
         }
         // Songlengths errors are silently ignored - we just fall back to playtime
         if let Ok(db) = songlengths_result {
-            self.songlengths = Some(db);
+            self.songlengths = Some(Arc::new(db));
         }
+        self.rebuild_search_index();
+    }
+
+    /// Rebuilds the search index from the databases currently loaded.
+    fn rebuild_search_index(&mut self) {
+        self.search_index = Arc::new(build_hvsc_search_index(
+            self.songlengths.as_deref(),
+            self.stil.as_deref(),
+        ));
     }
 
     /// Clears the HVSC cache and reloads STIL and Songlengths databases.
@@ -383,6 +475,7 @@ impl HvscBrowser {
         self.stil = None;
         self.stil_error = None;
         self.songlengths = None;
+        self.search_index = Arc::new(Vec::new());
         self.load_stil();
     }
 
@@ -408,20 +501,34 @@ impl HvscBrowser {
         self.current_path != "/"
     }
 
-    /// Searches the STIL database for matching paths, titles, or artists.
+    /// Searches every SID in the collection by path, title, and artist.
+    /// Underscores in file names count as spaces, and all query words must
+    /// appear, so both "No Way Out" and "shogoon no way" find
+    /// `/MUSICIANS/S/Shogoon/No_Way_Out.sid`. Exact name matches come first.
     pub fn search(&self, query: &str) -> io::Result<Vec<String>> {
-        let q = query.to_lowercase();
-        let Some(stil) = &self.stil else {
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(normalize_search_text)
+            .filter(|token| !token.is_empty())
+            .collect();
+        if tokens.is_empty() {
             return Ok(Vec::new());
-        };
-        let results = stil
+        }
+        let phrase = tokens.join(" ");
+
+        let mut matches: Vec<(u32, &str)> = self
             .search_index
             .iter()
-            .filter(|(_, haystack)| haystack.contains(&q))
-            .map(|(path, _)| path.clone())
-            .take(100)
+            .filter(|(_, haystack)| tokens.iter().all(|token| haystack.contains(token.as_str())))
+            .map(|(path, haystack)| (search_score(path, haystack, &phrase, &tokens), path.as_str()))
             .collect();
-        Ok(results)
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+
+        Ok(matches
+            .into_iter()
+            .take(100)
+            .map(|(_, path)| path.to_string())
+            .collect())
     }
 
     /// Fetches a specific entry as a SID file from HVSC.
