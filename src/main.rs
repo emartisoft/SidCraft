@@ -277,9 +277,10 @@ pub struct SidcraftApp {
 
     // Shell state
     pub view: View,
-    pub last_view: View,
     pub theme_pref: theme::ThemePreference,
     applied_theme: Option<theme::ThemeKind>,
+    /// Last title sent to the OS title bar, so it is only updated on change.
+    window_title: String,
     pub viz_mode: VizMode,
     pub left_open: bool,
     pub right_open: bool,
@@ -524,13 +525,13 @@ impl SidcraftApp {
             hvsc_async_tx,
             hvsc_async_rx,
             view: View::Home,
-            last_view: View::Player,
             theme_pref: match config.theme.as_str() {
                 "light" => theme::ThemePreference::Light,
                 "dark" => theme::ThemePreference::Dark,
                 _ => theme::ThemePreference::System,
             },
             applied_theme: None,
+            window_title: "SidCraft".to_string(),
             viz_mode: VizMode::from_config(&config.viz_mode),
             left_open: config.left_panel,
             right_open: config.right_panel,
@@ -551,7 +552,6 @@ impl SidcraftApp {
         if !sid_file.name.is_empty() {
             app.load_sid_direct(sid_file, Some(initial_song), initial_source);
             app.view = View::Player;
-            app.last_view = View::Player;
         } else {
             app.paused = true;
             app.song_elapsed = Duration::ZERO;
@@ -862,7 +862,6 @@ impl SidcraftApp {
                         self.selected_playlist_idx = self.playlist.len().saturating_sub(1);
                         self.load_sid_direct(sid, None, Some(path_str));
                         self.view = View::Player;
-                        self.last_view = View::Player;
                     }
                     Err(e) => self.set_status(format!("Error: {e}")),
                 }
@@ -1625,7 +1624,7 @@ fn main() -> eframe::Result<()> {
 
     let config = Config::load();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("SidCraft - SID Player")
+        .with_title("SidCraft")
 		// On Wayland the app id is what ties the window to `sidcraft.desktop`,
         // which is how the desktop environment finds the icon. On X11 it
         // becomes the WM_CLASS (`StartupWMClass` in the desktop file).

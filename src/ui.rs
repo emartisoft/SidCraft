@@ -117,7 +117,20 @@ impl eframe::App for SidcraftApp {
         self.sync_config();
         self.remember_window(ctx);
 
-        self.tab_strip(ctx);
+        // Keep the OS title bar in step with the loaded tune:
+        // "<composer> - <track> - SidCraft".
+        let title = if self.sid_file.name.is_empty() {
+            "SidCraft".to_string()
+        } else if self.sid_file.author.is_empty() {
+            format!("{} - SidCraft", self.sid_file.name)
+        } else {
+            format!("{} - {} - SidCraft", self.sid_file.author, self.sid_file.name)
+        };
+        if self.window_title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+
         self.mode_bar(ctx);
         self.status_bar(ctx);
         self.right_rail(ctx);
@@ -183,47 +196,87 @@ impl SidcraftApp {
         }
     }
 
-    // ── tab strip ───────────────────────────────────────────────────────────
+    // ── mode bar ────────────────────────────────────────────────────────────
 
-    fn tab_strip(&mut self, ctx: &egui::Context) {
+    fn mode_bar(&mut self, ctx: &egui::Context) {
         let t = Tokens::get(ctx);
-        egui::TopBottomPanel::top("sidcraft_tab_strip")
-            .exact_height(38.0)
+        egui::TopBottomPanel::top("sidcraft_mode_bar")
+            .exact_height(48.0)
             .frame(
                 egui::Frame::NONE
                     .fill(t.titlebar)
-                    .inner_margin(Margin {
-                        left: 8,
-                        right: 10,
-                        top: 0,
-                        bottom: 0,
-                    }),
+                    .inner_margin(Margin::symmetric(10, 0))
+                    .stroke(Stroke::new(1.0_f32, t.divider)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if icon_button(ui, &t, "home", 28.0, self.view == View::Home, "Home")
+                    ui.spacing_mut().item_spacing.x = 2.0;
+
+                    // Home sits just left of the menu: the shell has a single
+                    // top bar, so view switching lives here.
+                    if icon_button(ui, &t, "home", 30.0, self.view == View::Home, "Home")
                         .clicked()
                     {
                         self.view = View::Home;
                     }
+                    ui.add_space(4.0);
 
-                    let title = if self.sid_file.name.is_empty() {
-                        "SID Player".to_string()
-                    } else {
-                        self.sid_file.name.clone()
-                    };
-                    let selected = self.view != View::Home;
-                    if document_tab(ui, &t, &title, selected).clicked() {
-                        self.view = if self.last_view == View::Home {
-                            View::Player
-                        } else {
-                            self.last_view
-                        };
+                    let menu_resp = ui.menu_button(
+                        RichText::new("☰  Menu")
+                            .font(theme::medium(13.0))
+                            .color(t.text),
+                        |ui| self.menus(ui),
+                    );
+                    if menu_resp.response.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    ui.add_space(6.0);
+                    let sep = ui.cursor().left();
+                    ui.painter().vline(
+                        sep,
+                        ui.max_rect().y_range().shrink(12.0),
+                        Stroke::new(1.0_f32, t.divider),
+                    );
+                    ui.add_space(10.0);
+
+                    for view in [View::Player, View::Playlist, View::Hvsc, View::Export, View::Settings] {
+                        if mode_tab(ui, &t, view.label(), self.view == view).clicked() {
+                            self.view = view;
+                        }
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
+                        // The bar also holds the panel toggles, the theme
+                        // switch and About, so let the search field shrink on
+                        // narrow windows instead of pushing them out of view.
+                        let search_width = (ui.available_width() - 165.0).clamp(110.0, 240.0);
+                        if icon_button(ui, &t, "panel-right", 32.0, self.right_open, "Toggle inspector")
+                            .clicked()
+                        {
+                            self.right_open = !self.right_open;
+                        }
+                        if icon_button(ui, &t, "panel-left", 32.0, self.left_open, "Toggle tool panel")
+                            .clicked()
+                        {
+                            self.left_open = !self.left_open;
+                        }
+                        ui.add_space(4.0);
+                        let search = search_box(
+                            ui,
+                            &t,
+                            &mut self.global_search,
+                            search_width,
+                            "Search HVSC tunes",
+                        );
+                        if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.hvsc_search_query = self.global_search.clone();
+                            self.view = View::Hvsc;
+                            self.start_hvsc_search();
+                        }
+                        ui.add_space(4.0);
+                        // Theme switch and About sit just left of the search
+                        // field, where the removed tab strip used to keep them.
                         let theme_tip = if t.dark() {
                             "Switch to light theme"
                         } else {
@@ -257,84 +310,8 @@ impl SidcraftApp {
                                 ThemePreference::Dark
                             };
                         }
-                        if icon_button(ui, &t, "info", 28.0, false, "About SidCraft").clicked() {
+                        if icon_button(ui, &t, "info", 30.0, false, "About SidCraft").clicked() {
                             self.show_about = true;
-                        }
-                        let open = toolbar_button(ui, &t, "folder", "Open", false);
-                        if open.clicked() {
-                            self.open_file_dialog();
-                        }
-                    });
-                });
-            });
-    }
-
-    // ── mode bar ────────────────────────────────────────────────────────────
-
-    fn mode_bar(&mut self, ctx: &egui::Context) {
-        let t = Tokens::get(ctx);
-        egui::TopBottomPanel::top("sidcraft_mode_bar")
-            .exact_height(48.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(t.chrome)
-                    .inner_margin(Margin::symmetric(10, 0))
-                    .stroke(Stroke::new(1.0_f32, t.divider)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-
-                    let menu_resp = ui.menu_button(
-                        RichText::new("☰  Menu")
-                            .font(theme::medium(13.0))
-                            .color(t.text),
-                        |ui| self.menus(ui),
-                    );
-                    if menu_resp.response.hovered() {
-                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                    }
-                    ui.add_space(6.0);
-                    let sep = ui.cursor().left();
-                    ui.painter().vline(
-                        sep,
-                        ui.max_rect().y_range().shrink(12.0),
-                        Stroke::new(1.0_f32, t.divider),
-                    );
-                    ui.add_space(10.0);
-
-                    for view in [View::Player, View::Playlist, View::Hvsc, View::Export, View::Settings] {
-                        if mode_tab(ui, &t, view.label(), self.view == view).clicked() {
-                            self.view = view;
-                            self.last_view = view;
-                        }
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if icon_button(ui, &t, "panel-right", 32.0, self.right_open, "Toggle inspector")
-                            .clicked()
-                        {
-                            self.right_open = !self.right_open;
-                        }
-                        if icon_button(ui, &t, "panel-left", 32.0, self.left_open, "Toggle tool panel")
-                            .clicked()
-                        {
-                            self.left_open = !self.left_open;
-                        }
-                        ui.add_space(4.0);
-                        let search = search_box(
-                            ui,
-                            &t,
-                            &mut self.global_search,
-                            240.0,
-                            "Search HVSC tunes",
-                        );
-                        if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            self.hvsc_search_query = self.global_search.clone();
-                            self.view = View::Hvsc;
-                            self.last_view = View::Hvsc;
-                            self.start_hvsc_search();
                         }
                     });
                 });
@@ -411,7 +388,6 @@ impl SidcraftApp {
                     ui.close_menu();
                     self.view = view;
                     if view != View::Home {
-                        self.last_view = view;
                     }
                 }
             }
@@ -500,23 +476,18 @@ impl SidcraftApp {
                         }
                         if tool_row(ui, &t, "music", "Player", "Now playing and visualiser", self.view == View::Player).clicked() {
                             self.view = View::Player;
-                            self.last_view = View::Player;
                         }
                         if tool_row(ui, &t, "list", "Playlist", &format!("{} tracks", self.playlist.len()), self.view == View::Playlist).clicked() {
                             self.view = View::Playlist;
-                            self.last_view = View::Playlist;
                         }
                         if tool_row(ui, &t, "globe", "HVSC browser", "Search the High Voltage SID Collection", self.view == View::Hvsc).clicked() {
                             self.view = View::Hvsc;
-                            self.last_view = View::Hvsc;
                         }
                         if tool_row(ui, &t, "save", "Export", "Render to WAV, FLAC or MP3", self.view == View::Export).clicked() {
                             self.view = View::Export;
-                            self.last_view = View::Export;
                         }
                         if tool_row(ui, &t, "gear", "Settings", "Appearance, audio and emulation", self.view == View::Settings).clicked() {
                             self.view = View::Settings;
-                            self.last_view = View::Settings;
                         }
 
                         ui.add_space(8.0);
@@ -603,32 +574,23 @@ impl SidcraftApp {
                     }
                     if icon_button(ui, &t, "music", 34.0, self.view == View::Player, "Player").clicked() {
                         self.view = View::Player;
-                        self.last_view = View::Player;
                     }
                     if icon_button(ui, &t, "list", 34.0, self.view == View::Playlist, "Playlist").clicked() {
                         self.view = View::Playlist;
-                        self.last_view = View::Playlist;
                     }
                     if icon_button(ui, &t, "globe", 34.0, self.view == View::Hvsc, "HVSC browser").clicked() {
                         self.view = View::Hvsc;
-                        self.last_view = View::Hvsc;
                     }
                     if icon_button(ui, &t, "save", 34.0, self.view == View::Export, "Export").clicked() {
                         self.view = View::Export;
-                        self.last_view = View::Export;
                     }
                     if icon_button(ui, &t, "gear", 34.0, self.view == View::Settings, "Settings").clicked() {
                         self.view = View::Settings;
-                        self.last_view = View::Settings;
                     }
                 });
 
                 ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    if icon_button(ui, &t, "panel-right", 32.0, self.right_open, "Toggle inspector").clicked() {
-                        self.right_open = !self.right_open;
-                    }
-                    ui.add_space(4.0);
                     if icon_button(ui, &t, "next", 32.0, false, "Next track").clicked() {
                         self.next_track();
                     }
@@ -913,7 +875,6 @@ impl SidcraftApp {
                             for (view, icon, title, blurb) in cards {
                                 if tool_card(ui, &t, icon, title, blurb, t.voice(view as usize)).clicked() {
                                     self.view = view;
-                                    self.last_view = view;
                                 }
                             }
                         });
@@ -928,7 +889,6 @@ impl SidcraftApp {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ghost_button(ui, &t, "View all").clicked() {
                                     self.view = View::Playlist;
-                                    self.last_view = View::Playlist;
                                 }
                             });
                         });
@@ -959,7 +919,6 @@ impl SidcraftApp {
                             if let Some(idx) = play {
                                 self.play_playlist_index(idx);
                                 self.view = View::Player;
-                                self.last_view = View::Player;
                             }
                         }
                     });
@@ -2166,7 +2125,6 @@ impl SidcraftApp {
                     if icon_button(ui, &t, "play", 30.0, false, "Play all").clicked() {
                         self.play_all();
                         self.view = View::Player;
-                        self.last_view = View::Player;
                     }
                 });
                 ui.add_space(12.0);
@@ -2313,7 +2271,6 @@ impl SidcraftApp {
                 if let Some(idx) = play {
                     self.play_playlist_index(idx);
                     self.view = View::Player;
-                    self.last_view = View::Player;
                 }
             });
     }
@@ -3378,57 +3335,6 @@ impl SidcraftApp {
 
 // ── reusable widgets ────────────────────────────────────────────────────────
 
-fn document_tab(ui: &mut egui::Ui, t: &Tokens, title: &str, selected: bool) -> Response {
-    let font = theme::medium(12.5);
-    let text_w = text_width(ui, title, &font);
-    let width = (text_w + 52.0).clamp(96.0, 240.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
-    let fill = if selected {
-        t.card
-    } else if resp.hovered() {
-        t.hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect(
-        rect.shrink(1.0),
-        CornerRadius::same(7),
-        fill,
-        if selected {
-            Stroke::new(1.0_f32, t.border)
-        } else {
-            Stroke::NONE
-        },
-        StrokeKind::Inside,
-    );
-    paint_icon(
-        ui.painter(),
-        Rect::from_min_size(rect.left_center() + vec2(9.0, -8.0), vec2(16.0, 16.0)),
-        "music",
-        if selected { t.accent } else { t.icon },
-        1.4,
-    );
-    paint_text_elided(
-        ui,
-        rect.left_center() + vec2(31.0, 0.0),
-        Align2::LEFT_CENTER,
-        title,
-        font,
-        if selected { t.text } else { t.text_muted },
-        rect.width() - 42.0,
-    );
-    if selected {
-        ui.painter().line_segment(
-            [
-                pos2(rect.left() + 10.0, rect.bottom() - 2.0),
-                pos2(rect.right() - 10.0, rect.bottom() - 2.0),
-            ],
-            Stroke::new(2.0_f32, t.accent),
-        );
-    }
-    theme::hand(resp).on_hover_text(title)
-}
-
 fn mode_tab(ui: &mut egui::Ui, t: &Tokens, label: &str, selected: bool) -> Response {
     let font = theme::medium(13.0);
     let width = text_width(ui, label, &font) + 22.0;
@@ -3597,43 +3503,6 @@ fn transport_button(
         );
     }
     theme::hand(resp).on_hover_text(tip)
-}
-
-fn toolbar_button(
-    ui: &mut egui::Ui,
-    t: &Tokens,
-    icon: &str,
-    label: &str,
-    selected: bool,
-) -> Response {
-    let font = theme::medium(12.5);
-    let width = text_width(ui, label, &font) + 42.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
-    let fill = if selected {
-        t.selected
-    } else if resp.hovered() {
-        t.hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
-    paint_icon(
-        ui.painter(),
-        Rect::from_min_size(rect.left_center() + vec2(8.0, -7.0), vec2(14.0, 14.0)),
-        icon,
-        if selected { t.accent_text } else { t.icon },
-        1.4,
-    );
-    paint_text_elided(
-        ui,
-        rect.left_center() + vec2(27.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        if selected { t.accent_text } else { t.text },
-        rect.width() - 34.0,
-    );
-    theme::hand(resp)
 }
 
 fn search_box(
