@@ -1,28 +1,33 @@
 # ![SidCraft](icon/sidcraft-header.png) SidCraft
-**SidCraft** is a desktop player for Commodore 64 SID music files — both PSID
-and RSID formats — that works fully offline. At the same time it doubles as a
-browser for the [High Voltage SID Collection (HVSC)](https://hvsc.brona.dk/)
-archive.
 
-The application does two things at once:
+SidCraft is a desktop player for Commodore 64 SID music files in PSID and RSID
+formats, written in Rust. It emulates SID audio, so an internet connection is
+not required to play local files. The built-in HVSC browser connects to an
+online HVSC mirror.
 
-1. **It plays.** The SID file is executed through a cycle-accurate 6502
-   emulator; the audio is produced by [residfp](https://github.com/mlund/residfp)
-   with its physics-based filter model. Up to three SID chips (1SID / 2SID /
-   3SID) are supported.
-2. **It shows.** It visualises what is happening inside the tune: an FFT
-   spectrum, an oscilloscope, a piano roll, the ADSR envelope, the filter
-   response and three more views.
+## Features
+
+- Open SID files and switch between the tunes (subsongs) included in a file.
+- Emulate and play C64 SID audio, including tunes that use one, two, or three
+  SID chips.
+- Configure the SID chip model and the EKV transistor filter for the MOS 6581.
+- Play, pause, stop, and seek within a tune.
+- Create, manage, and save M3U playlists; shuffle and repeat playback.
+- Browse folders and search by title, author, or path in an HVSC mirror.
+  Tunes can be downloaded from the browser and played.
+- Choose from eight visualisations: envelope, VU meter, spectrum,
+  spectrogram, oscilloscope, piano roll, filter, and ADSR.
+- Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
+  fade-out, sample rate, and master gain; mute individual voices.
+- Choose system, light, or dark themes. Preferences such as window size and
+  position are saved in the application settings.
+
+![SidCraft-Player](docs/screenshots/player.png)
    
-![SidCraft Home](docs/screenshots/01-home.png)
-
-![SidCraft Home](docs/screenshots/light.png)
-
 ## Documentation
 
-See [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for what SidCraft does, the
-full feature list, screenshots and build instructions for Windows, Linux and
-macOS.
+See [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for the feature overview,
+FFmpeg requirements and build instructions for Windows, Linux and macOS.
 
 ## License
 
