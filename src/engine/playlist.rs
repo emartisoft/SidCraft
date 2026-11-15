@@ -200,6 +200,23 @@ impl Playlist {
         }
     }
 
+    /// Moves the entry at `from` to the final index `to`, clamped to the last
+    /// entry. Returns the entry's new index, or `None` when the move is a
+    /// no-op or an index is out of bounds.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> Option<usize> {
+        let len = self.entries.len();
+        if from >= len {
+            return None;
+        }
+        let to = to.min(len - 1);
+        if from == to {
+            return None;
+        }
+        let entry = self.entries.remove(from);
+        self.entries.insert(to, entry);
+        Some(to)
+    }
+
     /// Returns true if the playlist has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -277,4 +294,55 @@ pub fn playlist_display_name(path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playlist(names: &[&str]) -> Playlist {
+        Playlist {
+            entries: names
+                .iter()
+                .map(|name| PlaylistEntry {
+                    source: (*name).to_string(),
+                    display_name: (*name).to_string(),
+                    subsong: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn names(playlist: &Playlist) -> Vec<&str> {
+        playlist
+            .entries
+            .iter()
+            .map(|entry| entry.display_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn move_entry_reorders_up_and_down() {
+        let mut list = playlist(&["a", "b", "c", "d"]);
+
+        assert_eq!(list.move_entry(2, 0), Some(0));
+        assert_eq!(names(&list), ["c", "a", "b", "d"]);
+
+        assert_eq!(list.move_entry(0, 3), Some(3));
+        assert_eq!(names(&list), ["a", "b", "d", "c"]);
+    }
+
+    #[test]
+    fn move_entry_clamps_and_ignores_noops() {
+        let mut list = playlist(&["a", "b"]);
+
+        assert_eq!(list.move_entry(0, 0), None);
+        assert_eq!(names(&list), ["a", "b"]);
+
+        assert_eq!(list.move_entry(0, 99), Some(1));
+        assert_eq!(names(&list), ["b", "a"]);
+
+        assert_eq!(list.move_entry(5, 0), None);
+        assert_eq!(names(&list), ["b", "a"]);
+    }
 }

@@ -951,7 +951,7 @@ impl SidcraftApp {
                                 .collect();
                             for (idx, name, source, subsong) in rows {
                                 let selected = idx == self.selected_playlist_idx;
-                                let row = playlist_row(ui, &t, idx, &name, &source, subsong, selected);
+                                let row = playlist_row(ui, &t, idx, &name, &source, subsong, selected, false);
                                 if row.double_clicked() {
                                     play = Some(idx);
                                 }
@@ -1966,6 +1966,14 @@ impl SidcraftApp {
 
     fn playlist_view(&mut self, ui: &mut egui::Ui) {
         let t = Tokens::get(ui.ctx());
+        // A drag whose release happened while another view was open must not
+        // come back as a phantom reorder the next time this view is shown.
+        if self.playlist_drag_from.is_some()
+            && !ui.input(|i| i.pointer.primary_down())
+            && !ui.input(|i| i.pointer.primary_released())
+        {
+            self.playlist_drag_from = None;
+        }
         egui::Frame::NONE
             .inner_margin(Margin {
                 left: 28,
@@ -2081,7 +2089,11 @@ impl SidcraftApp {
                 );
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                let track_count = self.playlist.len();
+                let selected = self.selected_playlist_idx;
+                let can_move_up = selected > 0 && selected < track_count;
+                let can_move_down = selected + 1 < track_count;
+                ui.horizontal_wrapped(|ui| {
                     if primary_icon_button(ui, &t, "file-plus", 30.0, "Add files").clicked() {
                         self.add_files_dialog();
                     }
@@ -2093,6 +2105,64 @@ impl SidcraftApp {
                     {
                         self.confirm_action = Some(ConfirmAction::RemoveTrack);
                     }
+                    ui.add_space(6.0);
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "up",
+                        30.0,
+                        false,
+                        can_move_up,
+                        "Move track up",
+                    )
+                    .clicked()
+                        && can_move_up
+                    {
+                        self.move_selected_track_up();
+                    }
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "down",
+                        30.0,
+                        false,
+                        can_move_down,
+                        "Move track down",
+                    )
+                    .clicked()
+                        && can_move_down
+                    {
+                        self.move_selected_track_down();
+                    }
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "to-top",
+                        30.0,
+                        false,
+                        can_move_up,
+                        "Move to top",
+                    )
+                    .clicked()
+                        && can_move_up
+                    {
+                        self.move_selected_track_to_top();
+                    }
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "to-bottom",
+                        30.0,
+                        false,
+                        can_move_down,
+                        "Move to bottom",
+                    )
+                    .clicked()
+                        && can_move_down
+                    {
+                        self.move_selected_track_to_bottom();
+                    }
+                    ui.add_space(6.0);
                     if icon_button(ui, &t, "play", 30.0, false, "Play all").clicked() {
                         self.play_all();
                         self.view = View::Player;
@@ -2112,8 +2182,16 @@ impl SidcraftApp {
                     .enumerate()
                     .map(|(i, e)| (i, e.display_name.clone(), e.source.clone(), e.subsong))
                     .collect();
+                let scroll_to_selected = self.playlist_scroll_to_selected;
+                let mut selected_rect: Option<Rect> = None;
+                let mut drag_started: Option<usize> = None;
+                let mut drag_from: Option<usize> = None;
+                let mut drop_insert: Option<usize> = None;
+                let mut row_rects: Vec<(usize, Rect)> = Vec::new();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    // Dragging a row reorders it; it must not scroll the list.
+                    .drag_to_scroll(false)
                     .show(ui, |ui| {
                         if rows.is_empty() {
                             ui.add_space(24.0);
@@ -2125,7 +2203,16 @@ impl SidcraftApp {
                         }
                         for (idx, name, source, subsong) in rows {
                             let selected = idx == self.selected_playlist_idx;
-                            let row = playlist_row(ui, &t, idx, &name, &source, subsong, selected);
+                            let row = playlist_row(
+                                ui, &t, idx, &name, &source, subsong, selected, true,
+                            );
+                            row_rects.push((idx, row.rect));
+                            if selected {
+                                selected_rect = Some(row.rect);
+                            }
+                            if row.drag_started() {
+                                drag_started = Some(idx);
+                            }
                             if row.clicked() {
                                 select = Some(idx);
                             }
@@ -2133,8 +2220,94 @@ impl SidcraftApp {
                                 play = Some(idx);
                             }
                         }
+
+                        // The drag source survives across frames; a drag that
+                        // started in this very frame is used for the first time.
+                        drag_from = self.playlist_drag_from.or(drag_started);
+                        if let (Some(from), Some(pointer)) =
+                            (drag_from, ui.ctx().pointer_latest_pos())
+                        {
+                            let clip = ui.clip_rect();
+                            if clip.contains(pointer) {
+                                // Insertion slot: the row whose centre is below
+                                // the pointer, or after the last row.
+                                let mut insert = row_rects.len();
+                                for (idx, rect) in &row_rects {
+                                    if pointer.y < rect.center().y {
+                                        insert = *idx;
+                                        break;
+                                    }
+                                }
+                                drop_insert = Some(insert);
+                                // The source row may be scrolled out of view;
+                                // keep the grab cursor for the whole drag.
+                                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+
+                                if insert != from && insert != from + 1 {
+                                    let gap = ui.spacing().item_spacing.y;
+                                    let line_y = if insert == 0 {
+                                        row_rects
+                                            .first()
+                                            .map(|(_, rect)| rect.top() - gap * 0.5)
+                                    } else if insert >= row_rects.len() {
+                                        row_rects
+                                            .last()
+                                            .map(|(_, rect)| rect.bottom() + gap * 0.5)
+                                    } else {
+                                        Some(row_rects[insert].1.top() - gap * 0.5)
+                                    };
+                                    if let (Some(y), Some((_, first))) =
+                                        (line_y, row_rects.first())
+                                    {
+                                        ui.painter().line_segment(
+                                            [
+                                                pos2(first.left() + 6.0, y),
+                                                pos2(first.right() - 6.0, y),
+                                            ],
+                                            Stroke::new(2.0_f32, t.accent),
+                                        );
+                                    }
+                                }
+
+                                // Auto-scroll near the viewport edges so a row
+                                // can be dropped beyond the visible tracks.
+                                let edge = 24.0;
+                                if pointer.y < clip.top() + edge {
+                                    ui.scroll_with_delta(vec2(0.0, 18.0));
+                                } else if pointer.y > clip.bottom() - edge {
+                                    ui.scroll_with_delta(vec2(0.0, -18.0));
+                                }
+                            }
+                        }
+
+                        // Keep the selected row in view after a button move,
+                        // with the smallest scroll that makes it visible.
+                        if scroll_to_selected && let Some(rect) = selected_rect {
+                            ui.scroll_to_rect(rect, None);
+                        }
                     });
-                if let Some(idx) = select {
+                if scroll_to_selected {
+                    self.playlist_scroll_to_selected = false;
+                }
+
+                if ui.input(|i| i.pointer.primary_released()) {
+                    if let Some(from) = drag_from {
+                        self.selected_playlist_idx = from;
+                        if let Some(insert) = drop_insert {
+                            let to = if insert > from { insert - 1 } else { insert };
+                            if to != from && to < self.playlist.len() {
+                                self.move_selected_playlist_entry(to);
+                            }
+                        }
+                    }
+                    self.playlist_drag_from = None;
+                } else if let Some(from) = drag_started {
+                    self.selected_playlist_idx = from;
+                    self.playlist_drag_from = Some(from);
+                }
+                if drag_from.is_none()
+                    && let Some(idx) = select
+                {
                     self.selected_playlist_idx = idx;
                 }
                 if let Some(idx) = play {
@@ -3279,9 +3452,10 @@ fn icon_button_glyph(
     selected: bool,
     tip: &str,
 ) -> Response {
+    let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    let down = resp.is_pointer_button_down_on();
-    if selected || resp.hovered() || down {
+    let down = enabled && resp.is_pointer_button_down_on();
+    if enabled && (selected || resp.hovered() || down) {
         let fill = if selected {
             t.accent_soft
         } else if down {
@@ -3291,7 +3465,13 @@ fn icon_button_glyph(
         };
         ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     }
-    let color = if selected { t.accent } else { t.text };
+    let color = if !enabled {
+        t.text_faint
+    } else if selected {
+        t.accent
+    } else {
+        t.text
+    };
     paint_icon(
         ui.painter(),
         Rect::from_center_size(rect.center(), Vec2::splat(glyph)),
@@ -3299,7 +3479,30 @@ fn icon_button_glyph(
         color,
         stroke,
     );
-    theme::hand(resp).on_hover_text(tip)
+    if enabled {
+        theme::hand(resp).on_hover_text(tip)
+    } else {
+        resp
+    }
+}
+
+/// [`icon_button`] that can be drawn and treated as disabled. The caller must
+/// also check its own `enabled` flag before acting on the click.
+fn icon_button_enabled(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    icon: &str,
+    size: f32,
+    selected: bool,
+    enabled: bool,
+    tip: &str,
+) -> Response {
+    if enabled {
+        icon_button(ui, t, icon, size, selected, tip)
+    } else {
+        ui.add_enabled_ui(false, |ui| icon_button(ui, t, icon, size, selected, tip))
+            .inner
+    }
 }
 
 fn transport_button(
@@ -3503,9 +3706,17 @@ fn playlist_row(
     source: &str,
     subsong: Option<u16>,
     selected: bool,
+    draggable: bool,
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
-    let fill = if selected {
+    let sense = if draggable {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), sense);
+    let fill = if resp.dragged() {
+        t.pressed
+    } else if selected {
         t.selected
     } else if resp.hovered() {
         t.hover
@@ -3525,14 +3736,17 @@ fn playlist_row(
     } else {
         String::new()
     };
-    let name_width = (rect.width() - 72.0).max(40.0);
+    // A drag handle needs a little room at the right edge, so the text stops
+    // short of it.
+    let gutter = if draggable { 22.0 } else { 0.0 };
+    let name_width = (rect.width() - 72.0 - gutter).max(40.0);
     paint_text_elided(
         ui,
         rect.left_center() + vec2(34.0, -8.0),
         Align2::LEFT_CENTER,
         &format!("{:02}. {name}", idx + 1),
         theme::medium(12.5),
-        if selected { t.text } else { t.text },
+        t.text,
         name_width,
     );
     paint_text_elided(
@@ -3546,14 +3760,30 @@ fn playlist_row(
     );
     if !right.is_empty() {
         ui.painter().text(
-            rect.right_center() - vec2(10.0, 0.0),
+            rect.right_center() - vec2(10.0 + gutter, 0.0),
             Align2::RIGHT_CENTER,
             right,
             theme::regular(10.0),
             t.text_faint,
         );
     }
-    theme::hand(resp)
+    if draggable {
+        paint_icon(
+            ui.painter(),
+            Rect::from_center_size(rect.right_center() - vec2(13.0, 0.0), vec2(14.0, 18.0)),
+            "grip",
+            if resp.dragged() { t.accent } else { t.text_faint },
+            1.2,
+        );
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            resp
+        } else {
+            resp.on_hover_cursor(CursorIcon::Grab)
+        }
+    } else {
+        theme::hand(resp)
+    }
 }
 
 fn result_row(
@@ -4512,6 +4742,32 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
         "chevron-down" | "down" => {
             line(pos2(c.x - s * 0.24, c.y - s * 0.12), pos2(c.x, c.y + s * 0.12));
             line(pos2(c.x, c.y + s * 0.12), pos2(c.x + s * 0.24, c.y - s * 0.12));
+        }
+        "to-top" => {
+            // An arrow stopping at a bar, for "jump to the top".
+            line(
+                pos2(c.x - s * 0.24, c.y - s * 0.28),
+                pos2(c.x + s * 0.24, c.y - s * 0.28),
+            );
+            line(pos2(c.x - s * 0.22, c.y + s * 0.18), pos2(c.x, c.y - s * 0.06));
+            line(pos2(c.x, c.y - s * 0.06), pos2(c.x + s * 0.22, c.y + s * 0.18));
+        }
+        "to-bottom" => {
+            // The same arrow mirrored, for "jump to the bottom".
+            line(
+                pos2(c.x - s * 0.24, c.y + s * 0.28),
+                pos2(c.x + s * 0.24, c.y + s * 0.28),
+            );
+            line(pos2(c.x - s * 0.22, c.y - s * 0.18), pos2(c.x, c.y + s * 0.06));
+            line(pos2(c.x, c.y + s * 0.06), pos2(c.x + s * 0.22, c.y - s * 0.18));
+        }
+        "grip" => {
+            // Two columns of dots: the drag handle of a reorderable row.
+            for i in 0..3 {
+                let y = c.y - s * 0.2 + i as f32 * s * 0.2;
+                painter.circle_filled(pos2(c.x - s * 0.12, y), s * 0.055, color);
+                painter.circle_filled(pos2(c.x + s * 0.12, y), s * 0.055, color);
+            }
         }
         "panel-left" => {
             let body = r.shrink(s * 0.08);

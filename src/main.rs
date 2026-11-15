@@ -249,6 +249,10 @@ pub struct SidcraftApp {
     playlist: Playlist,
     playlist_path: PathBuf,
     selected_playlist_idx: usize,
+    /// Row being dragged in the playlist view, for drag-to-reorder.
+    playlist_drag_from: Option<usize>,
+    /// Scroll the selected playlist row into view on the next render.
+    playlist_scroll_to_selected: bool,
     playlist_files: Vec<PathBuf>,
     pub show_new_playlist: bool,
     pub new_playlist_name: String,
@@ -500,6 +504,8 @@ impl SidcraftApp {
             playlist,
             playlist_path,
             selected_playlist_idx: 0,
+            playlist_drag_from: None,
+            playlist_scroll_to_selected: false,
             playlist_files,
             show_new_playlist: false,
             new_playlist_name: String::new(),
@@ -875,6 +881,8 @@ impl SidcraftApp {
                 self.playlist = playlist;
                 self.playlist_path = path;
                 self.selected_playlist_idx = 0;
+                self.playlist_drag_from = None;
+                self.playlist_scroll_to_selected = false;
                 self.refresh_playlist_files();
                 if !self.playlist.is_empty() {
                     self.play_playlist_index(0);
@@ -983,10 +991,58 @@ impl SidcraftApp {
         ));
     }
 
+    /// Moves the selected playlist entry to the final index `to`, keeping the
+    /// selection on the moved track and persisting the new order.
+    pub fn move_selected_playlist_entry(&mut self, to: usize) {
+        let from = self.selected_playlist_idx;
+        if from >= self.playlist.len() {
+            return;
+        }
+        let name = self.playlist.entries[from].display_name.clone();
+        let Some(new_index) = self.playlist.move_entry(from, to) else {
+            return;
+        };
+        self.selected_playlist_idx = new_index;
+        self.playlist_scroll_to_selected = true;
+        self.save_playlist();
+        self.set_status(format!(
+            "Moved “{name}” to position {} of {}",
+            new_index + 1,
+            self.playlist.len()
+        ));
+    }
+
+    /// Moves the selected track one position up.
+    pub fn move_selected_track_up(&mut self) {
+        if self.selected_playlist_idx > 0 {
+            self.move_selected_playlist_entry(self.selected_playlist_idx - 1);
+        }
+    }
+
+    /// Moves the selected track one position down.
+    pub fn move_selected_track_down(&mut self) {
+        let next = self.selected_playlist_idx + 1;
+        if next < self.playlist.len() {
+            self.move_selected_playlist_entry(next);
+        }
+    }
+
+    /// Moves the selected track to the top of the playlist.
+    pub fn move_selected_track_to_top(&mut self) {
+        self.move_selected_playlist_entry(0);
+    }
+
+    /// Moves the selected track to the bottom of the playlist.
+    pub fn move_selected_track_to_bottom(&mut self) {
+        let last = self.playlist.len().saturating_sub(1);
+        self.move_selected_playlist_entry(last);
+    }
+
     /// Clears every track of the active playlist and persists it.
     pub fn clear_playlist_tracks(&mut self) {
         self.playlist.entries.clear();
         self.selected_playlist_idx = 0;
+        self.playlist_drag_from = None;
         self.save_playlist();
         self.set_status("Playlist cleared");
     }
@@ -1006,6 +1062,8 @@ impl SidcraftApp {
 
         self.playlist_files.retain(|p| *p != path);
         self.selected_playlist_idx = 0;
+        self.playlist_drag_from = None;
+        self.playlist_scroll_to_selected = false;
 
         if let Some(next) = self.playlist_files.first().cloned() {
             self.playlist = Playlist::load(&next).unwrap_or_default();
