@@ -39,7 +39,7 @@ const OFFSET_THIRD_SID: usize = 0x7B;
 #[derive(Debug, Clone)]
 pub struct SidFile {
     /// File format identifier ("PSID" or "RSID"). Read by [`SidFile::is_interrupt_driven`].
-    #[allow(dead_code)] // exercised only via a #[cfg(test)] caller in production builds
+    #[allow(dead_code)]
     pub magic: String,
     /// PSID version (1, 2, 3, or 4)
     pub version: u16,
@@ -196,7 +196,7 @@ impl SidFile {
     /// RSID files always set their own IRQ vector during init; PSID files with
     /// `play_address == 0` are the "PSID with KERNAL emulation" variant and use
     /// the same path. Either way, the player runs with no per-frame `JSR`.
-    #[allow(dead_code)] // public API, used by tests; production code reads play_address directly
+    #[allow(dead_code)] // Public API kept for completeness
     pub fn is_interrupt_driven(&self) -> bool {
         self.magic == "RSID" || self.play_address == 0
     }

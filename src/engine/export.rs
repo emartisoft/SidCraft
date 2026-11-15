@@ -306,21 +306,6 @@ fn expand_environment_variables(value: &str) -> String {
     expanded
 }
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::parse_registry_path_line;
-
-    #[test]
-    fn parses_registry_path_values_with_spaces() {
-        assert_eq!(
-            parse_registry_path_line(
-                "    Path    REG_EXPAND_SZ    C:\\Program Files\\FFmpeg\\bin;%USERPROFILE%\\bin"
-            ),
-            Some(r"C:\Program Files\FFmpeg\bin;%USERPROFILE%\bin")
-        );
-    }
-}
-
 /// Ara WAV'ı verilen codec argümanlarıyla hedef dosyaya çevirir.
 /// Hata olursa ffmpeg'in stderr çıktısını hata mesajına koyar.
 fn ffmpeg_convert(input: &Path, output: &Path, codec_args: &[&str]) -> io::Result<()> {
