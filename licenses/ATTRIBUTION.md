@@ -26,7 +26,7 @@ file headers, and the full licence texts are stored in this directory.
 * Licence: MIT (the project is dual-licensed; the MIT terms apply to these files)
 * Licence text: [MIT-crabsid.txt](MIT-crabsid.txt)
 
-The files (excluding `export.rs` and `playlist.rs`) in `src/engine/` originate from crabsid. Files that were modified for
+The files (excluding `export.rs`) in `src/engine/` originate from crabsid. Files that were modified for
 SidCraft carry a "Portions derived from crabsid" note in their header; files
 that are byte-for-byte identical keep their original MIT header unchanged.
 
