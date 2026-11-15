@@ -3210,12 +3210,12 @@ impl SidcraftApp {
                     .inner_margin(Margin::same(20)),
             )
             .show(ctx, |ui| {
-                ui.set_width(380.0);
-                // Header: artwork on the left with the name and tagline beside
-                // it. The detail rows are indented to the text column so every
-                // label lines up under the title.
+                ui.set_width(400.0);
+                // Header: artwork on the left with the name, tagline, version
+                // and author beside it. They share the text column so the block
+                // reads as one unit.
                 ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), ABOUT_ICON),
+                    vec2(ui.available_width(), ABOUT_HEADER),
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -3246,6 +3246,10 @@ impl SidcraftApp {
                         }
                         ui.add_space(ABOUT_GAP);
                         ui.vertical(|ui| {
+                            // The header block is placed by hand, so the
+                            // version and author lines sit tight under the
+                            // tagline instead of on the default row spacing.
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(
                                 RichText::new("SidCraft")
                                     .font(theme::semibold(20.0))
@@ -3257,24 +3261,81 @@ impl SidcraftApp {
                                     .font(theme::regular(12.0))
                                     .color(t.text_muted),
                             );
+                            ui.add_space(7.0);
+                            ui.label(
+                                RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                                    .font(theme::regular(11.5))
+                                    .color(t.text_faint),
+                            );
+                            ui.label(
+                                RichText::new("Coded by emarti, Murat Özdemir")
+                                    .font(theme::regular(11.5))
+                                    .color(t.text_faint),
+                            );
                         });
                     },
                 );
-                ui.add_space(16.0);
+                ui.add_space(14.0);
                 hairline(ui, &t);
                 ui.add_space(10.0);
-                about_property_row(ui, &t, "Version", env!("CARGO_PKG_VERSION"));
-                about_property_row(ui, &t, "Coded by", "emarti, Murat Özdemir");
-                about_property_row(ui, &t, "Engine", "residfp + mos6502");
-                about_property_row(ui, &t, "Interface", "egui / eframe");
-                ui.add_space(16.0);
+                let link = about_link_row(ui, &t, "Web Site", ABOUT_WEBSITE);
+                if link.clicked() {
+                    open_url(ABOUT_WEBSITE);
+                }
+                ui.add_space(10.0);
+                hairline(ui, &t);
+                ui.add_space(10.0);
+                // The licence block: the project licence first, then the
+                // third-party code the About window is expected to call out.
+                egui::Frame::NONE
+                    .fill(t.card)
+                    .stroke(Stroke::new(1.0_f32, t.divider))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin {
+                        left: 12,
+                        right: 12,
+                        top: 10,
+                        bottom: 10,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("Licenses")
+                                .font(theme::semibold(11.5))
+                                .color(t.text),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(
+                                "SidCraft is free software under the GNU General Public License \
+                                 v3.0 only. It includes code from the projects below.",
+                            )
+                            .font(theme::regular(11.0))
+                            .color(t.text_muted),
+                        );
+                        ui.add_space(7.0);
+                        about_license_row(ui, &t, "SidCraft", "GPL-3.0-only");
+                        about_license_row(ui, &t, "crabsid (Mikael Lund)", "MIT");
+                        about_license_row(ui, &t, "PdfCraft theme tokens", "MIT OR Apache-2.0");
+                        about_license_row(ui, &t, "residfp", "GPL-3.0-or-later");
+                        ui.add_space(7.0);
+                        ui.label(
+                            RichText::new(
+                                "Full license texts are in the licenses folder of the source \
+                                 distribution.",
+                            )
+                            .font(theme::regular(10.0))
+                            .color(t.text_faint),
+                        );
+                    });
+                ui.add_space(14.0);
                 hairline(ui, &t);
                 ui.add_space(10.0);
                 // `Align::Min` on the cross axis keeps the button row hugging
                 // its content; `Align::Center` would stretch the row over the
                 // whole remaining height and leave a large gap.
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if primary_button(ui, &t, "Close").clicked() {
+                    if primary_button(ui, &t, "Ok").clicked() {
                         self.show_about = false;
                     }
                 });
@@ -4051,33 +4112,78 @@ fn property_row_right(ui: &mut egui::Ui, t: &Tokens, label: &str, value: &str) {
     });
 }
 
-/// Artwork size, the gap between it and the text column, and the left edge of
-/// that column. The About header and its detail rows share these so the title
-/// and every label line up.
+/// Artwork size, the gap between it and the text column, and the header height
+/// that leaves room for the name, tagline, version and author block.
 const ABOUT_ICON: f32 = 88.0;
 const ABOUT_GAP: f32 = 16.0;
-const ABOUT_TEXT_X: f32 = ABOUT_ICON + ABOUT_GAP;
+const ABOUT_HEADER: f32 = 96.0;
+const ABOUT_WEBSITE: &str = "https://github.com/emartisoft/SidCraft";
 
-/// About dialog row: the label hugs the left edge of the text column and the
-/// value the right edge, so every line of text shares the same two columns as
-/// the title.
-fn about_property_row(ui: &mut egui::Ui, t: &Tokens, label: &str, value: &str) {
+/// About dialog link row: a quiet label on the left and a clickable URL that
+/// hugs the right edge.
+fn about_link_row(ui: &mut egui::Ui, t: &Tokens, label: &str, url: &str) -> Response {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(ABOUT_TEXT_X);
         ui.label(
             RichText::new(label)
                 .font(theme::regular(11.5))
                 .color(t.text_faint),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(url)
+                        .font(theme::regular(11.5))
+                        .color(t.accent_text)
+                        .underline(),
+                )
+                .sense(Sense::click()),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Open in your default browser")
+        })
+        .inner
+    })
+    .inner
+}
+
+/// About dialog licence row: the component on the left, its licence on the
+/// right, so the names and the SPDX identifiers form two clean columns.
+fn about_license_row(ui: &mut egui::Ui, t: &Tokens, component: &str, license: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(component)
+                .font(theme::regular(11.0))
+                .color(t.text_muted),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(value)
-                    .font(theme::regular(11.5))
-                    .color(t.text_muted),
+                RichText::new(license)
+                    .font(theme::regular(11.0))
+                    .color(t.text_faint),
             );
         });
     });
+}
+
+/// Opens `url` in the user's default browser through the OS protocol handler,
+/// so the About link behaves like a normal hyperlink.
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    {
+        // `rundll32` is a GUI process, so this does not flash a console window
+        // the way spawning a console program from a GUI app can.
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 /// A one pixel rule used to group the About dialog into header, details and
