@@ -30,6 +30,7 @@ use crate::{ConfirmAction, RepeatMode, SidcraftApp, View, VizMode};
 
 impl eframe::App for SidcraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_open_requests();
         self.handle_async_hvsc();
         self.handle_seek();
 

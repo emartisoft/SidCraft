@@ -1,6 +1,6 @@
 [package]
 name = "sidcraft"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
 build = "build.rs"
@@ -27,6 +27,20 @@ winres = "0.1"
 # SidCraft icon (and not a generic one) on the task bar button.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+
+# Receives the "open documents" AppleEvent when a SID file is opened with
+# SidCraft in Finder. macOS does not pass such files as command line
+# arguments to application bundles.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
+    "NSObject",
+    "NSString",
+    "NSURL",
+] }
 
 [profile.release]
 opt-level = "z"

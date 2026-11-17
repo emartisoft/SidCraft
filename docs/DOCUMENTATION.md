@@ -1,5 +1,41 @@
 # ![SidCraft](../icon/sidcraft-header.png) SidCraft
 
+## Opening SID files from the OS
+
+SidCraft can be started with a SID file as its argument. The file is loaded
+and played immediately; the saved playlist stays untouched. When no file is
+given, SidCraft resumes with the playlist that was active last time. If the
+argument is an `.m3u` playlist, that playlist becomes the active one.
+
+### Windows
+
+Right-click a `.sid` file, choose **Open with** → **Choose another app** and
+pick `sidcraft.exe`. Dragging a file onto `sidcraft.exe` works as well. From a
+terminal:
+
+```powershell
+.\target\release\sidcraft.exe "C:\Music\HVSC\...\Tune.sid"
+```
+
+### Linux
+
+The desktop entry declares the `audio/prs.sid`, `audio/x-sid` and
+`audio/x-psid` MIME types, so file managers list SidCraft under **Open With**
+after `bun run appimage install` (or when using the AppImage). From a terminal:
+
+```bash
+./target/release/sidcraft ~/Music/HVSC/MUSICIANS/.../Tune.sid
+```
+
+### macOS
+
+The `.app` bundle built by `macos/build.ts` declares the SID document type, so
+Finder lists SidCraft under **Open With**. From a terminal:
+
+```bash
+./target/release/sidcraft ~/Music/HVSC/MUSICIANS/.../Tune.sid
+```
+
 ## FFmpeg dependency
 
 FFmpeg is not required to build SidCraft or play SID files. WAV export is

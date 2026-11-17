@@ -20,6 +20,11 @@
     </p>
   </description>
   <launchable type="desktop-id">sidcraft.desktop</launchable>
+  <provides>
+    <mediatype>audio/prs.sid</mediatype>
+    <mediatype>audio/x-sid</mediatype>
+    <mediatype>audio/x-psid</mediatype>
+  </provides>
   <categories>
     <category>Audio</category>
     <category>AudioVideo</category>

@@ -113,6 +113,50 @@ function infoPlist(version: string): string {
   <key>NSHighResolutionCapable</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Emarti</string>
+  <!-- "Open With" support: Finder sends the chosen file as an AppleEvent,
+       which src/startup.rs receives. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Commodore 64 SID music</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.emarti.sidcraft.sid</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>sid</string>
+        <string>mus</string>
+      </array>
+    </dict>
+  </array>
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.emarti.sidcraft.sid</string>
+      <key>UTTypeDescription</key><string>Commodore 64 SID music</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.audio</string>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>sid</string>
+          <string>mus</string>
+        </array>
+        <key>public.mime-type</key>
+        <array>
+          <string>audio/prs.sid</string>
+          <string>audio/x-sid</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>
 `;

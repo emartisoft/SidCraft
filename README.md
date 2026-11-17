@@ -8,6 +8,9 @@ online HVSC mirror.
 ## Features
 
 - Open SID files and switch between the tunes (subsongs) included in a file.
+- Open SID files with SidCraft from the OS ("Open with", Finder, a file
+  manager or the command line); without a file argument the active playlist
+  is used.
 - Emulate and play C64 SID audio, including tunes that use one, two, or three
   SID chips.
 - Configure the SID chip model and the EKV transistor filter for the MOS 6581.

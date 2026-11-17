@@ -5,6 +5,7 @@
 
 mod app_icon;
 mod engine;
+mod startup;
 mod theme;
 mod ui;
 mod visuals;
@@ -350,28 +351,68 @@ fn startup_playlist(config: &Config) -> (Playlist, PathBuf) {
     (playlist, active)
 }
 
+/// Loads the first entry of `playlist`, or a silent stub when the playlist is
+/// empty or its first file cannot be read.
+fn first_playlist_tune(playlist: &Playlist) -> (SidFile, u16, Option<String>) {
+    let Some(entry) = playlist.entries.first() else {
+        return (SidFile::silent(), 1, None);
+    };
+    match entry.load() {
+        Ok(sid) => {
+            let song = entry.subsong.unwrap_or(sid.start_song);
+            (sid, song, Some(entry.source.clone()))
+        }
+        Err(_) => (SidFile::silent(), 1, None),
+    }
+}
+
 impl SidcraftApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, startup_path: Option<PathBuf>) -> Self {
         let config = Config::load();
-        let (playlist, playlist_path) = startup_playlist(&config);
+
+        // A file named by the OS ("Open with", Finder, a file manager or the
+        // shell) wins over the saved playlist. An M3U becomes the active
+        // playlist; a SID is played directly and leaves the playlist alone.
+        let mut startup_error = None;
+        let (playlist, playlist_path) = match startup_path
+            .as_deref()
+            .filter(|path| startup::is_playlist(path))
+        {
+            Some(path) => match Playlist::load(path) {
+                Ok(playlist) => (playlist, path.to_path_buf()),
+                Err(e) => {
+                    startup_error =
+                        Some(format!("Could not open playlist {}: {e}", path.display()));
+                    startup_playlist(&config)
+                }
+            },
+            None => startup_playlist(&config),
+        };
+
         let mut playlist_files = playlist::list_playlists();
         if !playlist_files.contains(&playlist_path) && playlist_path.is_file() {
             playlist_files.push(playlist_path.clone());
         }
 
-        let playlist = playlist;
-
-        let (sid_file, initial_song, initial_source) = if !playlist.is_empty() {
-            let entry = &playlist.entries[0];
-            match entry.load() {
+        let (sid_file, initial_song, initial_source) = match startup_path
+            .as_deref()
+            .filter(|path| startup::is_sid(path))
+        {
+            Some(path) => match SidFile::load(path) {
                 Ok(sid) => {
-                    let song = entry.subsong.unwrap_or(sid.start_song);
-                    (sid, song, Some(entry.source.clone()))
+                    let song = sid.start_song;
+                    let source = path.to_string_lossy().to_string();
+                    (sid, song, Some(source))
                 }
-                Err(_) => (SidFile::silent(), 1, None),
-            }
-        } else {
-            (SidFile::silent(), 1, None)
+                Err(e) => {
+                    startup_error = Some(format!(
+                        "Could not open {}: {e}; continuing with the playlist",
+                        path.display()
+                    ));
+                    first_playlist_tune(&playlist)
+                }
+            },
+            None => first_playlist_tune(&playlist),
         };
 
         let audio = match AudioOutput::probe() {
@@ -561,6 +602,9 @@ impl SidcraftApp {
                     p.toggle_pause();
                 }
             }
+        }
+        if let Some(error) = startup_error {
+            app.set_status(error);
         }
 
         app
@@ -848,24 +892,50 @@ impl SidcraftApp {
             .add_filter("Playlists", &["m3u"])
             .pick_file()
         {
-            let path_str = path.to_string_lossy().to_string();
-            if path_str.ends_with(".m3u") {
-                // Loading an .m3u makes it the active playlist and starts its
-                // first track; the previous list stays saved on disk.
+            // Loading an .m3u makes it the active playlist and starts its
+            // first track; the previous list stays saved on disk.
+            if startup::is_playlist(&path) {
                 self.switch_playlist(path);
-            } else {
-                match SidFile::load(&path) {
-                    Ok(sid) => {
-                        if self.playlist.add(&path_str, None) {
-                            self.save_playlist();
-                        }
-                        self.selected_playlist_idx = self.playlist.len().saturating_sub(1);
-                        self.load_sid_direct(sid, None, Some(path_str));
-                        self.view = View::Player;
-                    }
-                    Err(e) => self.set_status(format!("Error: {e}")),
-                }
+                return;
             }
+            let path_str = path.to_string_lossy().to_string();
+            match SidFile::load(&path) {
+                Ok(sid) => {
+                    if self.playlist.add(&path_str, None) {
+                        self.save_playlist();
+                    }
+                    self.selected_playlist_idx = self.playlist.len().saturating_sub(1);
+                    self.load_sid_direct(sid, None, Some(path_str));
+                    self.view = View::Player;
+                }
+                Err(e) => self.set_status(format!("Error: {e}")),
+            }
+        }
+    }
+
+    /// Opens a tune or playlist handed over by the OS or the command line.
+    ///
+    /// Unlike the file dialog this does not add the tune to the playlist: an
+    /// "Open with" request is a one-off request to play that file.
+    pub fn open_path(&mut self, path: PathBuf) {
+        if startup::is_playlist(&path) {
+            self.switch_playlist(path);
+            return;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        match SidFile::load(&path) {
+            Ok(sid) => {
+                self.load_sid_direct(sid, None, Some(path_str));
+                self.view = View::Player;
+            }
+            Err(e) => self.set_status(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
+    /// Opens files the OS asked for while the app was already running.
+    fn handle_open_requests(&mut self) {
+        for path in startup::take_pending() {
+            self.open_path(path);
         }
     }
 
@@ -1622,6 +1692,11 @@ fn main() -> eframe::Result<()> {
     // the right identity and icon.
     app_icon::set_app_user_model_id();
 
+    // On macOS the file from Finder arrives as an AppleEvent after launch;
+    // the other platforms pass it on the command line.
+    startup::install_open_handler();
+    let startup_path = startup::from_args();
+
     let config = Config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SidCraft")
@@ -1655,6 +1730,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SidCraft",
         native_options,
-        Box::new(|cc| Ok(Box::new(SidcraftApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(SidcraftApp::new(cc, startup_path)))),
     )
 }
