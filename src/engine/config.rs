@@ -41,6 +41,9 @@ pub struct Config {
     /// Whether the EKV transistor-model filter is enabled (6581 chips only).
     #[serde(default)]
     pub ekv_filter: bool,
+    /// Whether SidCraft asks GitHub for a newer release shortly after startup.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
     /// Path of the playlist that was active when the app last closed.
     #[serde(default)]
     pub active_playlist: Option<String>,
@@ -69,6 +72,7 @@ impl Default for Config {
             right_panel: true,
             viz_mode: default_viz_mode(),
             ekv_filter: false,
+            check_updates: true,
             active_playlist: None,
             window_width: None,
             window_height: None,

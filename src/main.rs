@@ -8,6 +8,7 @@ mod engine;
 mod startup;
 mod theme;
 mod ui;
+mod update;
 mod visuals;
 
 use eframe::egui;
@@ -28,6 +29,7 @@ use std::sync::Mutex;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use update::ReleaseInfo;
 use visuals::{Spectrogram, Spectrum, VoiceScopes, VuMeter};
 
 /// The primary views of the shell. The Home view is the equivalent of PdfCraft's
@@ -192,6 +194,38 @@ enum HvscAsyncMsg {
     Error(String),
 }
 
+/// Where the in-app update flow currently is. The release itself is kept
+/// separately in [`SidcraftApp::update_release`] so retries do not lose it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdatePhase {
+    /// Nothing has been checked in this session.
+    Idle,
+    /// GitHub is being asked for the newest stable release.
+    Checking,
+    /// A newer release is waiting for the user to start the download.
+    Available,
+    /// The asset is being written to the Downloads folder.
+    Downloading { received: u64, total: Option<u64> },
+    /// Cancelled an active download; the worker is winding down.
+    Cancelling,
+    /// The verified file is on disk and can be installed.
+    Ready(PathBuf),
+    /// The check finished and this build is the current stable release.
+    UpToDate,
+    /// Asking GitHub failed.
+    CheckFailed(String),
+    /// Downloading or verifying the asset failed.
+    DownloadFailed(String),
+}
+
+enum UpdateAsyncMsg {
+    Checked(Result<Option<ReleaseInfo>, String>),
+    Progress { received: u64, total: Option<u64> },
+    Downloaded { release: ReleaseInfo, path: PathBuf },
+    Cancelled,
+    DownloadFailed(String),
+}
+
 pub struct SidcraftApp {
     player: SharedPlayer,
     sid_file: SidFile,
@@ -275,6 +309,22 @@ pub struct SidcraftApp {
     hvsc_loading: bool,
     hvsc_async_tx: Sender<HvscAsyncMsg>,
     hvsc_async_rx: Receiver<HvscAsyncMsg>,
+
+    // Update check and in-app download
+    pub update_phase: UpdatePhase,
+    /// Newest release returned by GitHub, kept for retries and the dialog.
+    pub update_release: Option<ReleaseInfo>,
+    /// True when the current check was started by the user, so the result is
+    /// also reported in the status bar and the About window.
+    pub update_manual: bool,
+    /// The startup check runs once per session.
+    update_checked_once: bool,
+    /// When the automatic check should run; set on the first frame.
+    update_auto_at: Option<Instant>,
+    update_async_tx: Sender<UpdateAsyncMsg>,
+    update_async_rx: Receiver<UpdateAsyncMsg>,
+    update_cancel: Arc<AtomicBool>,
+    pub show_update_dialog: bool,
 
     // Shell state
     pub view: View,
@@ -495,6 +545,7 @@ impl SidcraftApp {
 
         let (hvsc_async_tx, hvsc_async_rx) = channel();
         let (seek_tx, seek_rx) = channel();
+        let (update_async_tx, update_async_rx) = channel();
 
         // Initial fetch of HVSC root directory
         let tx = hvsc_async_tx.clone();
@@ -570,6 +621,15 @@ impl SidcraftApp {
             hvsc_loading: true,
             hvsc_async_tx,
             hvsc_async_rx,
+            update_phase: UpdatePhase::Idle,
+            update_release: None,
+            update_manual: false,
+            update_checked_once: false,
+            update_auto_at: None,
+            update_async_tx,
+            update_async_rx,
+            update_cancel: Arc::new(AtomicBool::new(false)),
+            show_update_dialog: false,
             view: View::Home,
             theme_pref: match config.theme.as_str() {
                 "light" => theme::ThemePreference::Light,
@@ -1482,6 +1542,269 @@ impl SidcraftApp {
         }
     }
 
+    /// Runs the startup check six seconds after launch, once per session.
+    fn maybe_auto_check_updates(&mut self) {
+        if self.update_checked_once || !self.config.check_updates {
+            return;
+        }
+        let now = Instant::now();
+        match self.update_auto_at {
+            Some(at) if now >= at => {
+                self.update_checked_once = true;
+                self.start_update_check(false);
+            }
+            None => self.update_auto_at = Some(now + Duration::from_secs(6)),
+            _ => {}
+        }
+    }
+
+    /// Asks GitHub for the newest stable release on a worker thread. The UI
+    /// stays responsive while the request runs.
+    pub fn start_update_check(&mut self, manual: bool) {
+        if self.update_busy() {
+            return;
+        }
+        self.update_manual = manual;
+        self.update_phase = UpdatePhase::Checking;
+        self.update_release = None;
+        // A check started by hand also satisfies the once-per-session startup
+        // check, so the app does not ask GitHub twice on launch.
+        self.update_checked_once = true;
+        if manual {
+            self.set_status("Checking for updates…");
+        }
+
+        let tx = self.update_async_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(UpdateAsyncMsg::Checked(update::fetch_latest()));
+        });
+    }
+
+    /// Downloads the asset of the release found by the check. The file is
+    /// cached until the user presses Download, so the check alone costs only
+    /// one small JSON request.
+    pub fn start_update_download(&mut self) {
+        let Some(release) = self.update_release.clone() else {
+            return;
+        };
+        let Some(url) = release.download_url.clone() else {
+            self.update_phase = UpdatePhase::DownloadFailed(
+                "This release has no download for this platform.".to_string(),
+            );
+            self.show_update_dialog = true;
+            return;
+        };
+
+        let dest = update::download_path(&release);
+        let digest = release.digest.clone();
+        self.update_cancel.store(false, Ordering::Relaxed);
+        self.show_update_dialog = true;
+        self.update_phase = UpdatePhase::Downloading {
+            received: 0,
+            total: release.download_size,
+        };
+
+        let cancel = Arc::clone(&self.update_cancel);
+        let tx = self.update_async_tx.clone();
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let result = update::download(&url, digest.as_deref(), &dest, &cancel, |received, total| {
+                let _ = progress_tx.send(UpdateAsyncMsg::Progress { received, total });
+            });
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(UpdateAsyncMsg::Downloaded {
+                        release,
+                        path: dest,
+                    });
+                }
+                Err(error) if error == "cancelled" => {
+                    let _ = tx.send(UpdateAsyncMsg::Cancelled);
+                }
+                Err(error) => {
+                    let _ = tx.send(UpdateAsyncMsg::DownloadFailed(error));
+                }
+            }
+        });
+    }
+
+    /// Asks the worker to stop. The phase stays `Cancelling` until the worker
+    /// confirms, so a fresh download cannot race the old one.
+    pub fn cancel_update_download(&mut self) {
+        if matches!(self.update_phase, UpdatePhase::Downloading { .. }) {
+            self.update_cancel.store(true, Ordering::Relaxed);
+            self.update_phase = UpdatePhase::Cancelling;
+        }
+    }
+
+    /// Applies messages from the update worker.
+    fn handle_update_async(&mut self) {
+        while let Ok(msg) = self.update_async_rx.try_recv() {
+            match msg {
+                UpdateAsyncMsg::Checked(Ok(Some(release))) => {
+                    let newer =
+                        update::is_newer(&release.version, env!("CARGO_PKG_VERSION"));
+                    self.update_release = Some(release.clone());
+                    if newer {
+                        self.update_phase = UpdatePhase::Available;
+                        self.show_update_dialog = true;
+                        self.set_status(format!(
+                            "SidCraft {} is available",
+                            release.version
+                        ));
+                    } else {
+                        self.update_phase = UpdatePhase::UpToDate;
+                        if self.update_manual {
+                            self.set_status(format!(
+                                "SidCraft {} is up to date",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                        }
+                    }
+                }
+                UpdateAsyncMsg::Checked(Ok(None)) => {
+                    self.update_release = None;
+                    self.update_phase = UpdatePhase::UpToDate;
+                    if self.update_manual {
+                        self.set_status("No releases were found on GitHub");
+                    }
+                }
+                UpdateAsyncMsg::Checked(Err(error)) => {
+                    self.update_phase = UpdatePhase::CheckFailed(error.clone());
+                    if self.update_manual {
+                        self.set_status(format!("Update check failed: {error}"));
+                    }
+                }
+                UpdateAsyncMsg::Progress { received, total } => {
+                    if matches!(self.update_phase, UpdatePhase::Downloading { .. }) {
+                        self.update_phase =
+                            UpdatePhase::Downloading { received, total };
+                    }
+                }
+                UpdateAsyncMsg::Downloaded { release, path } => {
+                    if matches!(self.update_phase, UpdatePhase::Cancelling) {
+                        // The user cancelled while the last chunk was arriving.
+                        let _ = fs::remove_file(&path);
+                    } else if matches!(self.update_phase, UpdatePhase::Downloading { .. }) {
+                        self.update_release = Some(release);
+                        self.update_phase = UpdatePhase::Ready(path);
+                        self.show_update_dialog = true;
+                        self.set_status("Update downloaded");
+                    }
+                }
+                UpdateAsyncMsg::Cancelled => {
+                    if matches!(
+                        self.update_phase,
+                        UpdatePhase::Downloading { .. } | UpdatePhase::Cancelling
+                    ) {
+                        self.update_phase = UpdatePhase::Available;
+                        self.set_status("Download cancelled");
+                    }
+                }
+                UpdateAsyncMsg::DownloadFailed(error) => {
+                    if matches!(
+                        self.update_phase,
+                        UpdatePhase::Downloading { .. } | UpdatePhase::Cancelling
+                    ) {
+                        self.update_phase = UpdatePhase::DownloadFailed(error);
+                        self.show_update_dialog = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// True while a check or download keeps the update flow busy.
+    pub fn update_busy(&self) -> bool {
+        matches!(
+            self.update_phase,
+            UpdatePhase::Checking
+                | UpdatePhase::Downloading { .. }
+                | UpdatePhase::Cancelling
+        )
+    }
+
+    /// Status line for the update row in About and Settings.
+    pub fn update_status_line(&self) -> Option<String> {
+        match &self.update_phase {
+            UpdatePhase::Idle => None,
+            UpdatePhase::Checking => Some("Checking for updates…".to_string()),
+            UpdatePhase::Available => self
+                .update_release
+                .as_ref()
+                .map(|release| format!("SidCraft {} is available.", release.version)),
+            UpdatePhase::Downloading { received, total } => {
+                let mut line =
+                    format!("Downloading update… {}", update::format_size(*received));
+                if let Some(total) = total {
+                    line.push_str(&format!(" of {}", update::format_size(*total)));
+                }
+                Some(line)
+            }
+            UpdatePhase::Cancelling => Some("Cancelling the download…".to_string()),
+            UpdatePhase::Ready(path) => Some(format!(
+                "Update downloaded to {}.",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            UpdatePhase::UpToDate => Some(format!(
+                "SidCraft {} is up to date.",
+                env!("CARGO_PKG_VERSION")
+            )),
+            UpdatePhase::CheckFailed(error) => {
+                Some(format!("Could not check for updates: {error}"))
+            }
+            UpdatePhase::DownloadFailed(error) => {
+                Some(format!("Could not download the update: {error}"))
+            }
+        }
+    }
+
+    /// The About window only shows results that belong to a manual check;
+    /// an automatic check stays quiet unless it found a new release.
+    pub fn update_about_line(&self) -> Option<String> {
+        if self.update_manual
+            || matches!(
+                self.update_phase,
+                UpdatePhase::Checking
+                    | UpdatePhase::Available
+                    | UpdatePhase::Downloading { .. }
+                    | UpdatePhase::Cancelling
+                    | UpdatePhase::Ready(_)
+            )
+        {
+            self.update_status_line()
+        } else {
+            None
+        }
+    }
+
+    /// Replaces the running executable with the downloaded one and asks the
+    /// helper to start the new version once this process exits. Windows and
+    /// Linux only; macOS opens the DMG instead.
+    pub fn install_update(&mut self, ctx: &egui::Context) {
+        let UpdatePhase::Ready(path) = &self.update_phase else {
+            return;
+        };
+        let path = path.clone();
+        match update::install_downloaded(&path) {
+            Ok(executable) => match update::relaunch_after_exit(&executable) {
+                Ok(()) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(error) => {
+                    self.update_phase = UpdatePhase::DownloadFailed(format!(
+                        "The update was installed, but SidCraft could not restart: {error}"
+                    ));
+                    self.show_update_dialog = true;
+                }
+            },
+            Err(error) => {
+                self.update_phase = UpdatePhase::DownloadFailed(error);
+                self.show_update_dialog = true;
+            }
+        }
+    }
+
     pub fn current_elapsed(&self) -> Duration {
         if self.paused || self.seeking {
             self.song_elapsed
@@ -1724,6 +2047,10 @@ fn main() -> eframe::Result<()> {
     if startup::hand_over_to_running_instance(startup_path.as_deref()) {
         return Ok(());
     }
+
+    // A Windows self-update renames the old executable and leaves it behind;
+    // remove it now that the new build is running.
+    update::cleanup_previous_install();
 
     let config = Config::load();
     let mut viewport = egui::ViewportBuilder::default()

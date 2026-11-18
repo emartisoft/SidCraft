@@ -24,6 +24,10 @@ online HVSC mirror.
   spectrogram, oscilloscope, piano roll, filter, and ADSR.
 - Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
   fade-out, sample rate, and master gain; mute individual voices.
+- Check GitHub for a newer stable release from Help, About or Settings, either
+  automatically a few seconds after startup or on demand. The update is
+  downloaded in the app after confirmation and verified against its SHA-256
+  digest; Windows and Linux restart into the new version, macOS opens the DMG.
 - Choose system, light, or dark themes. Preferences such as window size and
   position are saved in the application settings.
 

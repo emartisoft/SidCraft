@@ -26,13 +26,15 @@ use crate::engine::export::ExportFormat;
 use crate::engine::playlist::playlist_display_name;
 use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
-use crate::{ConfirmAction, RepeatMode, SidcraftApp, View, VizMode};
+use crate::{ConfirmAction, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode};
 
 impl eframe::App for SidcraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_open_requests(ctx);
         self.handle_async_hvsc();
         self.handle_seek();
+        self.handle_update_async();
+        self.maybe_auto_check_updates();
 
         // Pull the emulated voice state once per frame for the meters and scopes.
         // `try_lock` matters while a seek is fast-forwarding in the background:
@@ -154,6 +156,9 @@ impl eframe::App for SidcraftApp {
         if self.confirm_action.is_some() {
             self.confirm_window(ctx);
         }
+        if self.show_update_dialog {
+            self.update_window(ctx);
+        }
 
         // Repaint only as fast as needed: real-time visuals/timing while playing
         // or seeking, a precise wake-up for the inter-track gap, otherwise idle.
@@ -163,7 +168,7 @@ impl eframe::App for SidcraftApp {
         } else if (!self.paused && self.sid_file.name.is_empty() == false) || self.seeking {
             // ~40 FPS for smooth meters, scopes and elapsed time while playing.
             ctx.request_repaint_after(Duration::from_millis(25));
-        } else if self.hvsc_loading || self.export_progress.is_some() {
+        } else if self.hvsc_loading || self.export_progress.is_some() || self.update_busy() {
             // Keep the loading state responsive without running at full rate.
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
@@ -420,6 +425,25 @@ impl SidcraftApp {
         });
 
         ui.menu_button("Help", |ui| {
+            let busy = self.update_busy();
+            let has_result = matches!(
+                self.update_phase,
+                UpdatePhase::Available | UpdatePhase::Ready(_)
+            );
+            let label = if has_result {
+                "Show Update…"
+            } else {
+                "Check for Updates…"
+            };
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                ui.close_menu();
+                if has_result {
+                    self.show_update_dialog = true;
+                } else {
+                    self.start_update_check(true);
+                }
+            }
+            ui.separator();
             if ui.button("About SidCraft").clicked() {
                 ui.close_menu();
                 self.show_about = true;
@@ -2941,6 +2965,48 @@ impl SidcraftApp {
                             property_row(ui, &t, "Voices", &self.vu_meter.voice_count().to_string());
                             property_row(ui, &t, "Status", if self.paused { "Paused" } else { "Playing" });
                         });
+
+                        settings_card(ui, &t, "Updates", |ui| {
+                            let mut check = self.config.check_updates;
+                            if ui
+                                .checkbox(&mut check, "Check for new versions at startup")
+                                .changed()
+                            {
+                                self.config.check_updates = check;
+                                self.config.save();
+                                if check {
+                                    self.start_update_check(true);
+                                }
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "SidCraft asks GitHub for the newest stable release a few \
+                                     seconds after it opens. Pre-releases are ignored.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let busy = self.update_busy();
+                                let clicked = ui
+                                    .add_enabled_ui(!busy, |ui| {
+                                        secondary_button(ui, &t, "Check now")
+                                    })
+                                    .inner
+                                    .clicked();
+                                if clicked {
+                                    self.start_update_check(true);
+                                }
+                                if let Some(line) = self.update_about_line() {
+                                    ui.label(
+                                        RichText::new(line)
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_muted),
+                                    );
+                                }
+                            });
+                        });
                     });
             });
     }
@@ -3311,6 +3377,30 @@ impl SidcraftApp {
                             .color(t.text_faint),
                         );
                     });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let busy = self.update_busy();
+                    let clicked = ui
+                        .add_enabled_ui(!busy, |ui| {
+                            secondary_button(ui, &t, "Check for Updates")
+                        })
+                        .inner
+                        .clicked();
+                    if clicked {
+                        self.start_update_check(true);
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+                if let Some(line) = self.update_about_line() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(line)
+                            .font(theme::regular(11.0))
+                            .color(t.text_muted),
+                    );
+                }
                 ui.add_space(14.0);
                 hairline(ui, &t);
                 ui.add_space(10.0);
@@ -3326,6 +3416,274 @@ impl SidcraftApp {
     }
 
     // ── small presentation helpers ──────────────────────────────────────────
+
+    /// Modal update window: check result, download progress and the install
+    /// step. While a download runs, Esc and clicks on the backdrop are ignored
+    /// so the transfer can only be stopped with Cancel.
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let busy = matches!(
+            self.update_phase,
+            UpdatePhase::Downloading { .. } | UpdatePhase::Cancelling
+        );
+        let phase = self.update_phase.clone();
+        let mut install_now = false;
+
+        let modal = egui::Modal::new(egui::Id::new("sidcraft-update"))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(
+                    RichText::new("Software Update")
+                        .font(theme::semibold(17.0))
+                        .color(t.text),
+                );
+                ui.add_space(10.0);
+
+                match phase {
+                    UpdatePhase::Idle => {
+                        ui.label("No update information is available.");
+                    }
+                    UpdatePhase::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Checking for updates…")
+                                    .font(theme::regular(12.5))
+                                    .color(t.text_muted),
+                            );
+                        });
+                    }
+                    UpdatePhase::Available => {
+                        let (version, notes) = self
+                            .update_release
+                            .as_ref()
+                            .map(|release| (release.version.clone(), release.notes.clone()))
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!("SidCraft {version} is available."))
+                                .font(theme::semibold(13.5))
+                                .color(t.text),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "You are running {}.",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .font(theme::regular(11.5))
+                            .color(t.text_muted),
+                        );
+                        if !notes.trim().is_empty() {
+                            ui.add_space(10.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(170.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(notes)
+                                            .font(theme::regular(11.5))
+                                            .color(t.text_muted),
+                                    );
+                                });
+                        }
+                        ui.add_space(14.0);
+                        let can_download = self
+                            .update_release
+                            .as_ref()
+                            .is_some_and(|release| release.download_url.is_some());
+                        if !can_download {
+                            ui.label(
+                                RichText::new(
+                                    "This release has no download for your platform. \
+                                     Open the release page to choose one.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                            ui.add_space(8.0);
+                        }
+                        ui.horizontal(|ui| {
+                            if can_download
+                                && primary_button(ui, &t, "Download").clicked()
+                            {
+                                self.start_update_download();
+                            }
+                            if !can_download {
+                                if secondary_button(ui, &t, "Open release page").clicked()
+                                    && let Some(release) = self.update_release.as_ref()
+                                {
+                                    open_url(&release.page_url);
+                                }
+                            }
+                            if secondary_button(ui, &t, "Later").clicked() {
+                                self.show_update_dialog = false;
+                            }
+                        });
+                    }
+                    UpdatePhase::Downloading { received, total } => {
+                        let fraction = total
+                            .filter(|total| *total > 0)
+                            .map_or(0.0, |total| {
+                                (received as f32 / total as f32).clamp(0.0, 1.0)
+                            });
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.add_space(6.0);
+                        let line = match total {
+                            Some(total) => format!(
+                                "{} of {}",
+                                crate::update::format_size(received),
+                                crate::update::format_size(total)
+                            ),
+                            None => format!(
+                                "{} downloaded",
+                                crate::update::format_size(received)
+                            ),
+                        };
+                        ui.label(
+                            RichText::new(line)
+                                .font(theme::regular(11.5))
+                                .color(t.text_muted),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if secondary_button(ui, &t, "Cancel").clicked() {
+                                self.cancel_update_download();
+                            }
+                        });
+                    }
+                    UpdatePhase::Cancelling => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Cancelling the download…")
+                                    .font(theme::regular(12.5))
+                                    .color(t.text_muted),
+                            );
+                        });
+                    }
+                    UpdatePhase::Ready(path) => {
+                        ui.label(
+                            RichText::new("The update has been downloaded.")
+                                .font(theme::semibold(13.5))
+                                .color(t.text),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(path.display().to_string())
+                                .font(theme::regular(10.5))
+                                .color(t.text_faint),
+                        );
+                        ui.add_space(10.0);
+                        if crate::update::can_install_in_place() {
+                            ui.label(
+                                RichText::new(
+                                    "SidCraft will close, replace itself with the new \
+                                     version and start again.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_muted),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if primary_button(ui, &t, "Restart and Install").clicked() {
+                                    install_now = true;
+                                    self.show_update_dialog = false;
+                                }
+                                if secondary_button(ui, &t, "Later").clicked() {
+                                    self.show_update_dialog = false;
+                                }
+                            });
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Quit SidCraft, open the DMG and drag SidCraft into \
+                                     Applications.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_muted),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if primary_button(ui, &t, "Open DMG").clicked() {
+                                    let _ = crate::update::open_path(&path);
+                                }
+                                if secondary_button(ui, &t, "Show in Finder").clicked() {
+                                    let _ = crate::update::reveal_path(&path);
+                                }
+                                if secondary_button(ui, &t, "Later").clicked() {
+                                    self.show_update_dialog = false;
+                                }
+                            });
+                        }
+                    }
+                    UpdatePhase::UpToDate => {
+                        ui.label(
+                            RichText::new(format!(
+                                "SidCraft {} is up to date.",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .font(theme::semibold(13.5))
+                            .color(t.text),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("No newer stable release was found on GitHub.")
+                                .font(theme::regular(11.5))
+                                .color(t.text_muted),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if primary_button(ui, &t, "Ok").clicked() {
+                                self.show_update_dialog = false;
+                            }
+                        });
+                    }
+                    UpdatePhase::CheckFailed(error) | UpdatePhase::DownloadFailed(error) => {
+                        ui.label(
+                            RichText::new("The update could not be completed.")
+                                .font(theme::semibold(13.5))
+                                .color(t.text),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(error)
+                                .font(theme::regular(11.5))
+                                .color(t.accent_text),
+                        );
+                        ui.add_space(12.0);
+                        let can_retry = self
+                            .update_release
+                            .as_ref()
+                            .is_some_and(|release| release.download_url.is_some());
+                        ui.horizontal(|ui| {
+                            if can_retry && secondary_button(ui, &t, "Try Again").clicked() {
+                                self.start_update_download();
+                            }
+                            if primary_button(ui, &t, "Close").clicked() {
+                                self.show_update_dialog = false;
+                            }
+                        });
+                    }
+                }
+            });
+
+        if install_now {
+            self.install_update(ctx);
+        }
+        if !busy && modal.should_close() {
+            self.show_update_dialog = false;
+        }
+    }
 
     fn track_title(&self) -> String {
         if self.sid_file.name.is_empty() {

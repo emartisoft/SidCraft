@@ -43,6 +43,47 @@ Finder lists SidCraft under **Open With**. From a terminal:
 ./target/release/sidcraft ~/Music/HVSC/MUSICIANS/.../Tune.sid
 ```
 
+## Updating SidCraft
+
+SidCraft can check GitHub for a newer stable release. The check runs once,
+about six seconds after launch, when **Settings → Updates → Check for new
+versions at startup** is enabled (the default). It can also be started by hand
+from **Help → Check for Updates…**, from the **Check for Updates** button in
+**About**, or from **Settings → Updates → Check now**.
+
+The release list is read from the public GitHub API and pre-releases are
+ignored, so only finished versions are offered. A manual check reports its
+result in the status bar and in the About window when it is open. An automatic
+check only announces a newer version. Nothing is downloaded until **Download**
+is pressed in the update window.
+
+The asset matching the operating system is saved to the Downloads folder under
+its release name, with a numbered suffix if a file with that name already
+exists. The SHA-256 digest published by GitHub is verified before the file is
+used; a failed or cancelled download leaves no partial file behind. The update
+window is modal, so the rest of the interface is unavailable until the dialog
+is closed, but playback continues. During a download, Esc and clicks outside
+the dialog are ignored; use **Cancel** to stop it.
+
+How the downloaded file is applied depends on the platform:
+
+- **Windows** — the `.zip` is unpacked and its `sidcraft.exe` replaces the
+  running executable. SidCraft closes, the new version starts, and the previous
+  executable (named `sidcraft.exe.old-<pid>`) is deleted on the next launch. The
+  folder containing `sidcraft.exe` must be writable; a copy in `Program Files`
+  needs an administrator or a portable folder instead.
+- **Linux** — when SidCraft runs from an AppImage, the new AppImage is copied
+  next to the old one, marked executable and swapped in, then started again. A
+  build that was not started from an AppImage cannot replace itself; the
+  downloaded file is kept in Downloads for a manual install.
+- **macOS** — the `.dmg` is saved to Downloads and the app does not replace its
+  own bundle. Use **Open DMG** (or **Show in Finder**), quit SidCraft, open the
+  DMG and drag SidCraft into **Applications**. The DMG is not notarized unless
+  the release was signed with a Developer ID.
+
+The update check only contacts GitHub and sends no information about your
+library or listening habits.
+
 ## FFmpeg dependency
 
 FFmpeg is not required to build SidCraft or play SID files. WAV export is
