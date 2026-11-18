@@ -7,6 +7,13 @@ and played immediately; the saved playlist stays untouched. When no file is
 given, SidCraft resumes with the playlist that was active last time. If the
 argument is an `.m3u` playlist, that playlist becomes the active one.
 
+Only one SidCraft instance runs at a time. Opening a file while the app is
+already running hands it to the existing window over a local socket and the
+new process exits, so the current tune is replaced instead of a second window
+and a second audio stream appearing. Starting SidCraft again without a file
+brings the running window to the front. On macOS this is Finder's normal
+behaviour; on Windows and Linux the app takes care of it.
+
 ### Windows
 
 Right-click a `.sid` file, choose **Open with** → **Choose another app** and

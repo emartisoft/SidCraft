@@ -119,13 +119,24 @@ impl SidFile {
             0
         };
 
-        // v3+ multi-SID addresses (byte encodes high nybble of $Dxx0)
+        // Multi-SID layout differs by version:
+        // - v3/v4: +7A/+7B are the SID #2/#3 address bytes (v3 has no third SID).
+        // - v5: the same offsets hold multiSidConfig/sidAddressConfigStart, and
+        //   flag bits 6-9 describe panning instead of per-chip models.
         let (second_sid_address, third_sid_address) =
             if version >= 3 && bytes.len() > OFFSET_THIRD_SID {
-                (
-                    parse_sid_address(bytes[OFFSET_SECOND_SID]),
-                    parse_sid_address(bytes[OFFSET_THIRD_SID]),
-                )
+                if version >= 5 {
+                    parse_v5_sid_addresses(bytes[OFFSET_SECOND_SID], bytes[OFFSET_THIRD_SID])
+                } else {
+                    (
+                        parse_sid_address(bytes[OFFSET_SECOND_SID]),
+                        if version >= 4 {
+                            parse_sid_address(bytes[OFFSET_THIRD_SID])
+                        } else {
+                            None
+                        },
+                    )
+                }
             } else {
                 (None, None)
             };
@@ -219,7 +230,12 @@ impl SidFile {
     }
 
     /// Returns the preferred chip model per SID, applying `override_model` to all if given.
-    /// Otherwise reads PSID v2+ flag bits (4-5 = SID1, 6-7 = SID2, 8-9 = SID3; value 2 = 8580).
+    ///
+    /// Otherwise the header decides (PSID/RSID spec, `flags` at offset 0x76):
+    /// - v2+: bits 4-5 give the first SID's model (`10` = 8580).
+    /// - v3/v4: bits 6-7 hold the second SID's model and bits 8-9 the third
+    ///   SID's model (v4 only); `00` means "same model as the first SID".
+    /// - v5: bits 6-9 describe panning, so every chip uses bits 4-5.
     pub fn preferred_chip_models(&self, override_model: Option<ChipModel>) -> Vec<ChipModel> {
         (0..self.sid_count())
             .map(|i| override_model.unwrap_or_else(|| self.chip_model_for_sid(i)))
@@ -230,13 +246,15 @@ impl SidFile {
         if self.version < 2 {
             return ChipModel::Mos6581;
         }
-        let shift = 4 + index * 2;
-        let model = (self.flags >> shift) & 0x03;
-        // 0=unknown, 1=6581, 2=8580, 3=6581+8580 (PSID spec)
-        if model == 2 {
-            ChipModel::Mos8580
+        if self.version >= 5 || index == 0 {
+            return chip_model_from_bits((self.flags >> 4) & 0x03);
+        }
+        let model = (self.flags >> (4 + index * 2)) & 0x03;
+        if model == 0 {
+            // Unknown: the chip uses the first SID's model.
+            self.chip_model_for_sid(0)
         } else {
-            ChipModel::Mos6581
+            chip_model_from_bits(model)
         }
     }
 
@@ -273,13 +291,70 @@ fn read_u32_be(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// Parses v3+ SID address byte: 0x42 -> $D420, 0x00 -> None.
-/// The byte encodes (address - $D000) >> 4, so 0x42 means $D420.
+/// Parses a v3/v4 SID address byte: 0x42 -> $D420, anything invalid -> None.
+///
+/// The byte encodes (address - $D000) >> 4, so 0x42 means $D420. Only the
+/// even values in $D420-$D7E0 and $DE00-$DFE0 are valid; any other value means
+/// that the chip is absent (PSID spec).
 fn parse_sid_address(byte: u8) -> Option<u16> {
-    if byte == 0 {
-        None
+    match byte {
+        0x42..=0x7E | 0xE0..=0xFE if byte % 2 == 0 => Some(0xD000 | (u16::from(byte) << 4)),
+        _ => None,
+    }
+}
+
+/// Addresses of the second and third SID in a v5 file.
+///
+/// In v5, `multiSidConfig` (+7A) holds the chip count in bits 0-3 and the
+/// address configuration in bits 4-7; `sidAddressConfigStart` (+7B) optionally
+/// moves SID #2. Flag bits 6-9 describe panning and do not affect addresses.
+/// Only the first two extra chips are returned: the player emulates at most
+/// three SIDs.
+fn parse_v5_sid_addresses(multi_sid_config: u8, config_start: u8) -> (Option<u16>, Option<u16>) {
+    let count = usize::from(multi_sid_config & 0x0F);
+    if count < 2 {
+        return (None, None);
+    }
+    let (steps, default_start): (&[u32], u32) = match multi_sid_config >> 4 {
+        0 => (&[0x20], 0xD420),
+        1 => (&[0x40], 0xD440),
+        2 => (&[0x80], 0xD480),
+        3 => (&[0x100], 0xD500),
+        4 => (&[0x20, 0x60], 0xD420),
+        5 => (&[0x20, 0xE0], 0xD420),
+        6 => (&[0x100, 0x300], 0xD500),
+        _ => return (None, None), // reserved configuration
+    };
+
+    let mut addr = parse_sid_address(config_start).map_or(default_start, u32::from);
+    let mut addresses = Vec::with_capacity(2);
+    let mut step_index = 0;
+    while addresses.len() + 1 < count && addresses.len() < 2 {
+        addresses.push(addr as u16);
+        let step = steps[step_index % steps.len()];
+        step_index += 1;
+        let next = addr + step;
+        // A step leaving $D400-$D7E0 resumes in $DE00-$DFE0, keeping the
+        // overshoot; a step leaving the second window ends the list.
+        addr = if (0xD800..0xDE00).contains(&next) {
+            0xDE00 + (next - 0xD800)
+        } else {
+            next
+        };
+        if addr > 0xDFE0 || (0xD800..0xDE00).contains(&addr) {
+            break;
+        }
+    }
+    (addresses.first().copied(), addresses.get(1).copied())
+}
+
+/// Converts the PSID `sidModel` bitfield (0 = unknown, 1 = 6581, 2 = 8580,
+/// 3 = both). SidCraft uses the 6581 for "unknown" and "both".
+fn chip_model_from_bits(bits: u16) -> ChipModel {
+    if bits == 2 {
+        ChipModel::Mos8580
     } else {
-        Some(0xD000 | (u16::from(byte) << 4))
+        ChipModel::Mos6581
     }
 }
 

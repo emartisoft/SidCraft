@@ -367,8 +367,13 @@ fn first_playlist_tune(playlist: &Playlist) -> (SidFile, u16, Option<String>) {
 }
 
 impl SidcraftApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, startup_path: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup_path: Option<PathBuf>) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        startup::set_wakeup(move || ctx.request_repaint());
         let config = Config::load();
+        // Remembered filter model: 6581 chips use the EKV transistor model
+        // when the user turned it on in Settings or the player panel.
+        let ekv_filter = config.ekv_filter;
 
         // A file named by the OS ("Open with", Finder, a file manager or the
         // shell) wins over the saved playlist. An M3U becomes the active
@@ -517,7 +522,7 @@ impl SidcraftApp {
             selected_sid: 0,
             sample_rate,
             sampling_method,
-            ekv_filter: false,
+            ekv_filter,
             _stream: stream,
             vu_meter: VuMeter::with_voice_count(sid_count * 3),
             voice_scopes: VoiceScopes::with_voice_count(sid_count * 3),
@@ -584,7 +589,10 @@ impl SidcraftApp {
             geometry_dirty: false,
             geometry_saved_at: None,
             track_gap_until: None,
-            export_settings: ExportSettings::default(),
+            export_settings: ExportSettings {
+                ekv_filter,
+                ..ExportSettings::default()
+            },
             export_progress: None,
             export_output_dir: None,
             export_last_path: None,
@@ -628,12 +636,14 @@ impl SidcraftApp {
             || self.config.left_panel != self.left_open
             || self.config.right_panel != self.right_open
             || self.config.viz_mode != viz
+            || self.config.ekv_filter != self.ekv_filter
             || self.config.active_playlist.as_deref() != Some(active.as_str())
         {
             self.config.theme = theme.to_string();
             self.config.left_panel = self.left_open;
             self.config.right_panel = self.right_open;
             self.config.viz_mode = viz.to_string();
+            self.config.ekv_filter = self.ekv_filter;
             self.config.active_playlist = Some(active);
             self.config.save();
         }
@@ -788,6 +798,7 @@ impl SidcraftApp {
             p.set_ekv_filter(enabled);
         }
         self.ekv_filter = enabled;
+        self.sync_config();
         self.set_status(if enabled {
             "EKV transistor filter enabled"
         } else {
@@ -933,10 +944,21 @@ impl SidcraftApp {
     }
 
     /// Opens files the OS asked for while the app was already running.
-    fn handle_open_requests(&mut self) {
-        for path in startup::take_pending() {
-            self.open_path(path);
+    fn handle_open_requests(&mut self, ctx: &egui::Context) {
+        let requests = startup::take_requests();
+        if requests.is_empty() {
+            return;
         }
+        // A forwarded launch is a user action: bring the window forward.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        for request in requests {
+            match request {
+                startup::Request::Open(path) => self.open_path(path),
+                startup::Request::Focus => {}
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// Makes `path` the active playlist, loading its entries and starting the
@@ -1696,6 +1718,12 @@ fn main() -> eframe::Result<()> {
     // the other platforms pass it on the command line.
     startup::install_open_handler();
     let startup_path = startup::from_args();
+
+    // Opening another file while SidCraft runs hands it to the existing
+    // window instead of starting a second instance and a second audio stream.
+    if startup::hand_over_to_running_instance(startup_path.as_deref()) {
+        return Ok(());
+    }
 
     let config = Config::load();
     let mut viewport = egui::ViewportBuilder::default()

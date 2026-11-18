@@ -10,10 +10,12 @@ online HVSC mirror.
 - Open SID files and switch between the tunes (subsongs) included in a file.
 - Open SID files with SidCraft from the OS ("Open with", Finder, a file
   manager or the command line); without a file argument the active playlist
-  is used.
+  is used. Only one instance runs: opening another file replaces the tune in
+  the window that is already playing.
 - Emulate and play C64 SID audio, including tunes that use one, two, or three
   SID chips.
-- Configure the SID chip model and the EKV transistor filter for the MOS 6581.
+- Configure the SID chip model and the EKV transistor filter for the MOS 6581;
+  the EKV/standard filter choice is remembered between sessions.
 - Play, pause, stop, and seek within a tune.
 - Create, manage, and save M3U playlists; shuffle and repeat playback.
 - Browse folders and search by title, author, or path in an HVSC mirror.

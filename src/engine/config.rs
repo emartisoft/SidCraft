@@ -38,6 +38,9 @@ pub struct Config {
     /// Visualiser: `scope` or `vu`.
     #[serde(default = "default_viz_mode")]
     pub viz_mode: String,
+    /// Whether the EKV transistor-model filter is enabled (6581 chips only).
+    #[serde(default)]
+    pub ekv_filter: bool,
     /// Path of the playlist that was active when the app last closed.
     #[serde(default)]
     pub active_playlist: Option<String>,
@@ -65,6 +68,7 @@ impl Default for Config {
             left_panel: true,
             right_panel: true,
             viz_mode: default_viz_mode(),
+            ekv_filter: false,
             active_playlist: None,
             window_width: None,
             window_height: None,

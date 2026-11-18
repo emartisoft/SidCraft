@@ -30,7 +30,7 @@ use crate::{ConfirmAction, RepeatMode, SidcraftApp, View, VizMode};
 
 impl eframe::App for SidcraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_open_requests();
+        self.handle_open_requests(ctx);
         self.handle_async_hvsc();
         self.handle_seek();
 
@@ -1143,6 +1143,25 @@ impl SidcraftApp {
                                     .clicked()
                                     {
                                         self.cycle_chip_model();
+                                    }
+                                    // Filter-model toggle: "EKV" when the
+                                    // transistor model is on, "STD" for the
+                                    // standard spline filter. The choice is a
+                                    // persisted preference.
+                                    let filter_label =
+                                        if self.ekv_filter { "EKV" } else { "STD" };
+                                    if secondary_button_with_font(
+                                        ui,
+                                        &t,
+                                        filter_label,
+                                        theme::medium(11.0),
+                                    )
+                                    .on_hover_text(
+                                        "Filter model: EKV transistor (6581) / standard",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.set_ekv_filter(!self.ekv_filter);
                                     }
                                     if icon_button(ui, &t, "chevron-left", 34.0, false, "Previous subsong").clicked() && self.current_song > 1 {
                                         self.change_subsong(self.current_song - 1);

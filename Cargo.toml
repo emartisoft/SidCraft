@@ -17,6 +17,8 @@ toml = "0.8"
 ureq = "3"
 rfd = "0.15"
 hound = "3"
+# Local socket used to hand a file to an already running instance.
+interprocess = "2.4"
 
 # Embeds icon/sidcraft.ico into the Windows executable so Explorer, the task
 # bar and Alt+Tab show the application icon.
