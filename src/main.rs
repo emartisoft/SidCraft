@@ -15,7 +15,7 @@ use eframe::egui;
 use engine::audio::AudioOutput;
 use engine::config::Config;
 use engine::export::{ExportProgress, ExportSettings};
-use engine::hvsc::{HvscBrowser, HvscEntry, DEFAULT_HVSC_URL};
+use engine::hvsc::{HvscBrowser, HvscCollectionFilter, HvscEntry, DEFAULT_HVSC_URL};
 use engine::player::{
     FilterInfo, NoteSample, SamplingMethod, SharedPlayer, VoiceInfo, create_shared_player,
 };
@@ -40,6 +40,7 @@ pub enum View {
     Player,
     Playlist,
     Hvsc,
+    RandomList,
     Export,
     Settings,
 }
@@ -51,6 +52,7 @@ impl View {
             Self::Player => "Player",
             Self::Playlist => "Playlist",
             Self::Hvsc => "HVSC",
+            Self::RandomList => "Random List",
             Self::Export => "Export",
             Self::Settings => "Settings",
         }
@@ -62,6 +64,7 @@ impl View {
             Self::Player => "music",
             Self::Playlist => "list",
             Self::Hvsc => "globe",
+            Self::RandomList => "shuffle",
             Self::Export => "save",
             Self::Settings => "gear",
         }
@@ -73,6 +76,7 @@ impl View {
             Self::Player => "Now playing, visualiser and transport",
             Self::Playlist => "Tracks, subsongs and playlist file",
             Self::Hvsc => "Search and browse the High Voltage SID Collection",
+            Self::RandomList => "Build a random playlist from HVSC collections",
             Self::Export => "Render the active SID tune to WAV, FLAC or MP3",
             Self::Settings => "Appearance, audio and emulation",
         }
@@ -309,6 +313,12 @@ pub struct SidcraftApp {
     hvsc_loading: bool,
     hvsc_async_tx: Sender<HvscAsyncMsg>,
     hvsc_async_rx: Receiver<HvscAsyncMsg>,
+
+    // Random List panel
+    random_playlist_name: String,
+    random_track_count: u32,
+    random_collections: HvscCollectionFilter,
+    random_list_error: Option<String>,
 
     // Update check and in-app download
     pub update_phase: UpdatePhase,
@@ -621,6 +631,10 @@ impl SidcraftApp {
             hvsc_loading: true,
             hvsc_async_tx,
             hvsc_async_rx,
+            random_playlist_name: String::new(),
+            random_track_count: 25,
+            random_collections: HvscCollectionFilter::default(),
+            random_list_error: None,
             update_phase: UpdatePhase::Idle,
             update_release: None,
             update_manual: false,
@@ -1090,6 +1104,79 @@ impl SidcraftApp {
             playlist::playlist_display_name(&self.playlist_path)
         ));
         true
+    }
+
+    /// Builds a playlist from randomly sampled HVSC paths and activates it
+    /// without interrupting the current playback.
+    pub fn create_random_playlist(&mut self) {
+        self.random_list_error = None;
+
+        let name = self.random_playlist_name.trim().to_string();
+        if name.is_empty() {
+            self.fail_random_list("Enter a name for the random playlist.");
+            return;
+        }
+        if !self.random_collections.any() {
+            self.fail_random_list("Select at least one collection: Demos, Games or Musicians.");
+            return;
+        }
+
+        let count = self.random_track_count.clamp(5, 100) as usize;
+        let paths = self
+            .hvsc_browser
+            .random_paths(self.random_collections, count);
+        if paths.is_empty() {
+            self.fail_random_list("No HVSC tunes are available for the selected collections.");
+            return;
+        }
+
+        let path = playlist::new_playlist_path(&name);
+        if path.exists() {
+            let message = format!(
+                "A playlist named “{}” already exists",
+                playlist::playlist_display_name(&path)
+            );
+            self.fail_random_list(&message);
+            return;
+        }
+        if let Err(e) = fs::create_dir_all(playlist::playlists_dir()) {
+            self.fail_random_list(&format!("Could not create playlist folder: {e}"));
+            return;
+        }
+
+        let mut list = Playlist::empty();
+        for hvsc_path in paths {
+            list.add(&format!("{DEFAULT_HVSC_URL}{hvsc_path}"), None);
+        }
+        if let Err(e) = list.save(&path) {
+            self.fail_random_list(&format!("Could not save random playlist: {e}"));
+            return;
+        }
+
+        let created = list.len();
+        self.playlist = list;
+        self.playlist_path = path;
+        self.selected_playlist_idx = 0;
+        self.playlist_drag_from = None;
+        self.playlist_scroll_to_selected = false;
+        self.refresh_playlist_files();
+        self.sync_config();
+        self.random_playlist_name.clear();
+
+        let mut message = format!(
+            "Created random playlist “{}” — {} tracks",
+            playlist::playlist_display_name(&self.playlist_path),
+            created
+        );
+        if created < count {
+            message.push_str(&format!(" (only {created} available)"));
+        }
+        self.set_status(message);
+    }
+
+    fn fail_random_list(&mut self, message: &str) {
+        self.random_list_error = Some(message.to_string());
+        self.set_status(message);
     }
 
     pub fn save_playlist(&mut self) {

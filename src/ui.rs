@@ -245,7 +245,7 @@ impl SidcraftApp {
                     );
                     ui.add_space(10.0);
 
-                    for view in [View::Player, View::Playlist, View::Hvsc, View::Export, View::Settings] {
+                    for view in [View::Player, View::Playlist, View::Hvsc, View::RandomList, View::Export, View::Settings] {
                         if mode_tab(ui, &t, view.label(), self.view == view).clicked() {
                             self.view = view;
                         }
@@ -384,6 +384,7 @@ impl SidcraftApp {
                 View::Player,
                 View::Playlist,
                 View::Hvsc,
+                View::RandomList,
                 View::Export,
                 View::Settings,
             ] {
@@ -513,6 +514,9 @@ impl SidcraftApp {
                         if tool_row(ui, &t, "globe", "HVSC browser", "Search the High Voltage SID Collection", self.view == View::Hvsc).clicked() {
                             self.view = View::Hvsc;
                         }
+                        if tool_row(ui, &t, "shuffle", "Random List", "Random playlists from HVSC collections", self.view == View::RandomList).clicked() {
+                            self.view = View::RandomList;
+                        }
                         if tool_row(ui, &t, "save", "Export", "Render to WAV, FLAC or MP3", self.view == View::Export).clicked() {
                             self.view = View::Export;
                         }
@@ -610,6 +614,9 @@ impl SidcraftApp {
                     }
                     if icon_button(ui, &t, "globe", 34.0, self.view == View::Hvsc, "HVSC browser").clicked() {
                         self.view = View::Hvsc;
+                    }
+                    if icon_button(ui, &t, "shuffle", 34.0, self.view == View::RandomList, "Random List").clicked() {
+                        self.view = View::RandomList;
                     }
                     if icon_button(ui, &t, "save", 34.0, self.view == View::Export, "Export").clicked() {
                         self.view = View::Export;
@@ -817,6 +824,7 @@ impl SidcraftApp {
                 View::Player => self.player_view(ui),
                 View::Playlist => self.playlist_view(ui),
                 View::Hvsc => self.hvsc_view(ui),
+                View::RandomList => self.random_list_view(ui),
                 View::Export => self.export_view(ui),
                 View::Settings => self.settings_view(ui),
             });
@@ -915,6 +923,7 @@ impl SidcraftApp {
                                 (View::Player, "music", "Player", "Watch the voices and control playback"),
                                 (View::Playlist, "list", "Playlist", "Open, reorder and play your m3u tracks"),
                                 (View::Hvsc, "globe", "HVSC browser", "Search the High Voltage SID Collection"),
+                                (View::RandomList, "shuffle", "Random List", "Build a random playlist from HVSC"),
                                 (View::Export, "save", "Export", "Render to WAV, FLAC or MP3"),
                                 (View::Settings, "gear", "Settings", "Theme, emulation and visualiser"),
                             ];
@@ -2468,6 +2477,131 @@ impl SidcraftApp {
                 if let Some(path) = fetch {
                     self.hvsc_fetch(&path);
                 }
+            });
+    }
+
+    fn random_list_view(&mut self, ui: &mut egui::Ui) {
+        let t = Tokens::get(ui.ctx());
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(Margin {
+                        left: 28,
+                        right: 28,
+                        top: 24,
+                        bottom: 16,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("Random List")
+                                .font(theme::semibold(22.0))
+                                .color(t.text),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Create a random playlist from the HVSC tune index. Choose 5–100 tracks, \
+                                 pick one or more collections and give the list a name. The .m3u is \
+                                 saved to your playlist library and becomes active.",
+                            )
+                            .font(theme::regular(12.0))
+                            .color(t.text_muted),
+                        );
+                        ui.add_space(16.0);
+
+                        settings_card(ui, &t, "Playlist settings", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Playlist name")
+                                        .font(theme::medium(12.0))
+                                        .color(t.text),
+                                );
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.random_playlist_name)
+                                        .hint_text("e.g. Random C64 Gems")
+                                        .desired_width(280.0)
+                                        .font(theme::regular(13.0)),
+                                );
+                                if resp.changed() {
+                                    self.random_list_error = None;
+                                }
+                            });
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("SID tracks")
+                                        .font(theme::medium(12.0))
+                                        .color(t.text),
+                                );
+                                let previous = self.random_track_count;
+                                ui.add(
+                                    egui::DragValue::new(&mut self.random_track_count)
+                                        .range(5..=100)
+                                        .speed(1.0),
+                                );
+                                ui.label(
+                                    RichText::new("5–100")
+                                        .font(theme::regular(11.5))
+                                        .color(t.text_faint),
+                                );
+                                if previous != self.random_track_count {
+                                    self.random_list_error = None;
+                                }
+                            });
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Collections")
+                                    .font(theme::medium(12.0))
+                                    .color(t.text),
+                            );
+                            ui.horizontal(|ui| {
+                                let changed =
+                                    ui.checkbox(&mut self.random_collections.demos, "Demos").changed();
+                                if changed {
+                                    self.random_list_error = None;
+                                }
+                                let changed =
+                                    ui.checkbox(&mut self.random_collections.games, "Games").changed();
+                                if changed {
+                                    self.random_list_error = None;
+                                }
+                                let changed = ui
+                                    .checkbox(&mut self.random_collections.musicians, "Musicians")
+                                    .changed();
+                                if changed {
+                                    self.random_list_error = None;
+                                }
+                            });
+
+                            ui.add_space(8.0);
+                            let available =
+                                self.hvsc_browser.collection_count(self.random_collections);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{available} matching SID files in the loaded HVSC index."
+                                ))
+                                .font(theme::regular(11.5))
+                                .color(t.text_muted),
+                            );
+
+                            if let Some(err) = &self.random_list_error {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(err)
+                                        .font(theme::regular(11.5))
+                                        .color(t.accent_text),
+                                );
+                            }
+
+                            ui.add_space(12.0);
+                            if primary_button(ui, &t, "Create random playlist").clicked() {
+                                self.create_random_playlist();
+                            }
+                        });
+                    });
             });
     }
 

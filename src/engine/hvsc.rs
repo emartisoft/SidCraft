@@ -8,6 +8,7 @@
 //! HVSC (High Voltage SID Collection) browser with STIL metadata support.
 
 use crate::engine::sid_file::SidFile;
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
@@ -286,6 +287,34 @@ impl HvscEntry {
     }
 }
 
+/// Top-level HVSC collections that can be sampled for a random playlist.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HvscCollectionFilter {
+    pub demos: bool,
+    pub games: bool,
+    pub musicians: bool,
+}
+
+impl HvscCollectionFilter {
+    /// True when at least one collection is selected.
+    pub const fn any(self) -> bool {
+        self.demos || self.games || self.musicians
+    }
+
+    /// True when `path` belongs to one of the selected collections.
+    pub fn matches(self, path: &str) -> bool {
+        let normalized = format!(
+            "/{}",
+            path.trim_start_matches('/')
+                .replace('\\', "/")
+                .to_ascii_uppercase()
+        );
+        (self.demos && normalized.contains("/DEMOS/"))
+            || (self.games && normalized.contains("/GAMES/"))
+            || (self.musicians && normalized.contains("/MUSICIANS/"))
+    }
+}
+
 /// HVSC directory browser state.
 #[derive(Clone)]
 pub struct HvscBrowser {
@@ -529,6 +558,33 @@ impl HvscBrowser {
             .take(100)
             .map(|(_, path)| path.to_string())
             .collect())
+    }
+
+    /// Number of indexed SID paths in the selected collections.
+    pub fn collection_count(&self, collections: HvscCollectionFilter) -> usize {
+        self.search_index
+            .iter()
+            .filter(|(path, _)| collections.matches(path))
+            .count()
+    }
+
+    /// Picks up to `count` distinct SID paths from the selected collections.
+    /// The index is already in memory, so this needs no network access.
+    pub fn random_paths(&self, collections: HvscCollectionFilter, count: usize) -> Vec<String> {
+        if !collections.any() || count == 0 {
+            return Vec::new();
+        }
+
+        let mut pool: Vec<&str> = self
+            .search_index
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| collections.matches(path))
+            .collect();
+        let take = count.min(pool.len());
+        let mut rng = rand::rng();
+        pool.shuffle(&mut rng);
+        pool.into_iter().take(take).map(str::to_string).collect()
     }
 
     /// Fetches a specific entry as a SID file from HVSC.
