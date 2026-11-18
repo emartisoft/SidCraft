@@ -196,7 +196,8 @@ fn fill_chunk(
     }
 }
 
-/// ffmpeg'i bulur: önce FFMPEG_PATH, sonra etkin PATH, Windows'ta kayıtlı PATH.
+/// ffmpeg'i bulur: önce FFMPEG_PATH, sonra etkin PATH, sonra platforma özgü
+/// bilinen konumlar (Windows kayıt defteri / macOS ve Linux'ta yaygın dizinler).
 fn find_ffmpeg() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("FFMPEG_PATH") {
         let p = PathBuf::from(p);
@@ -214,6 +215,11 @@ fn find_ffmpeg() -> Option<PathBuf> {
 
     #[cfg(windows)]
     if let Some(ffmpeg) = find_ffmpeg_in_dirs(windows_registry_path_dirs()) {
+        return Some(ffmpeg);
+    }
+
+    #[cfg(not(windows))]
+    if let Some(ffmpeg) = find_ffmpeg_in_dirs(unix_fallback_ffmpeg_dirs()) {
         return Some(ffmpeg);
     }
 
@@ -304,6 +310,27 @@ fn expand_environment_variables(value: &str) -> String {
     }
     expanded.push_str(remaining);
     expanded
+}
+
+/// macOS/Linux'ta PATH'te görünmeyen yaygın kurulum dizinleri.
+/// GUI uygulamaları Finder/Dock üzerinden başlatıldığında sınırlı bir PATH
+/// miras aldığı için Homebrew vb. konumları ayrıca yokluyoruz.
+#[cfg(not(windows))]
+fn unix_fallback_ffmpeg_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"), // Homebrew (Apple Silicon)
+        PathBuf::from("/usr/local/bin"),    // Homebrew (Intel) / elle kurulum
+        PathBuf::from("/opt/local/bin"),    // MacPorts
+        PathBuf::from("/snap/bin"),         // Snap (Linux)
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join("bin"));
+    }
+    dirs
 }
 
 /// Ara WAV'ı verilen codec argümanlarıyla hedef dosyaya çevirir.

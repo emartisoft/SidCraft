@@ -347,6 +347,7 @@ pub fn relaunch_after_exit(executable: &Path) -> Result<(), String> {
         return Err("Automatic restart is not supported on this platform.".to_string());
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     Ok(())
 }
 
