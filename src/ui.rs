@@ -502,7 +502,12 @@ impl SidcraftApp {
                         if tool_row(ui, &t, "music", "Player", "Now playing and visualiser", self.view == View::Player).clicked() {
                             self.view = View::Player;
                         }
-                        if tool_row(ui, &t, "list", "Playlist", &format!("{} tracks", self.playlist.len()), self.view == View::Playlist).clicked() {
+                        let playlist_info = format!(
+                            "{} - {} tracks",
+                            playlist_display_name(&self.playlist_path),
+                            self.playlist.len()
+                        );
+                        if tool_row(ui, &t, "list", "Playlist", &playlist_info, self.view == View::Playlist).clicked() {
                             self.view = View::Playlist;
                         }
                         if tool_row(ui, &t, "globe", "HVSC browser", "Search the High Voltage SID Collection", self.view == View::Hvsc).clicked() {
@@ -714,9 +719,25 @@ impl SidcraftApp {
                                 property_row_right(ui, &t, "Format", &self.sid_file.magic);
                                 property_row_right(ui, &t, "Songs", &self.total_songs.to_string());
                                 property_row_right(ui, &t, "Subsong", &format!("{} of {}", self.current_song, self.total_songs));
-                                property_row_right(ui, &t, "Clock", self.clock_label());
-                                property_row_right(ui, &t, "SID chips", self.sid_count_label());
-                                property_row_right(ui, &t, "Sample rate", &format!("{} Hz", self.sample_rate));
+                                let load = self.sid_file.load_address;
+                                let init = self.sid_file.init_address;
+                                let play = self.sid_file.play_address;
+                                let size = self.sid_file.data.len();
+                                let end = load
+                                    .wrapping_add(size as u16)
+                                    .wrapping_sub(u16::from(size != 0));
+                                property_row_right(
+                                    ui,
+                                    &t,
+                                    "Memory range",
+                                    &format!("${load:04X}-${end:04X}, {size} bytes"),
+                                );
+                                property_row_right(
+                                    ui,
+                                    &t,
+                                    "Load-Init-Play",
+                                    &format!("${load:04X}-${init:04X}-${play:04X}"),
+                                );
                                 property_row_right(ui, &t, "Filter", if self.ekv_filter { "EKV on" } else { "Standard" });
 
                                 ui.add_space(16.0);
@@ -2006,7 +2027,7 @@ impl SidcraftApp {
                         .font(theme::regular(11.5))
                         .color(t.text_faint),
                     );
-                    if icon_button(ui, &t, "folder-open", 26.0, false, "Open playlist folder")
+                    if icon_button(ui, &t, "folder-open", 34.0, false, "Open playlist folder")
                         .clicked()
                     {
                         self.open_playlist_folder();
@@ -2052,25 +2073,25 @@ impl SidcraftApp {
                         // it must not start playback on its own.
                         self.select_playlist(path);
                     }
-                    if icon_button(ui, &t, "plus", 30.0, false, "New playlist…").clicked() {
+                    if icon_button(ui, &t, "plus", 34.0, false, "New playlist…").clicked() {
                         self.show_new_playlist = true;
                         self.new_playlist_name.clear();
                         self.new_playlist_error = None;
                     }
-                    if icon_button(ui, &t, "folder", 30.0, false, "Open playlist or SID…")
+                    if icon_button(ui, &t, "folder", 34.0, false, "Open playlist or SID…")
                         .clicked()
                     {
                         self.open_file_dialog();
                     }
-                    if icon_button(ui, &t, "pencil", 30.0, false, "Rename playlist").clicked() {
+                    if icon_button(ui, &t, "pencil", 34.0, false, "Rename playlist").clicked() {
                         self.rename_playlist_name = playlist_display_name(&self.playlist_path);
                         self.rename_playlist_error = None;
                         self.show_rename_playlist = true;
                     }
-                    if icon_button(ui, &t, "trash", 30.0, false, "Delete playlist").clicked() {
+                    if icon_button(ui, &t, "trash", 34.0, false, "Delete playlist").clicked() {
                         self.confirm_action = Some(ConfirmAction::DeletePlaylist);
                     }
-                    if icon_button(ui, &t, "save", 30.0, false, "Save playlist as…").clicked() {
+                    if icon_button(ui, &t, "save", 34.0, false, "Save playlist as…").clicked() {
                         self.save_playlist_as();
                     }
                 });
@@ -2097,13 +2118,13 @@ impl SidcraftApp {
                 let can_move_up = selected > 0 && selected < track_count;
                 let can_move_down = selected + 1 < track_count;
                 ui.horizontal_wrapped(|ui| {
-                    if primary_icon_button(ui, &t, "file-plus", 30.0, "Add files").clicked() {
+                    if primary_icon_button(ui, &t, "file-plus", 34.0, "Add files").clicked() {
                         self.add_files_dialog();
                     }
-                    if icon_button(ui, &t, "eraser", 30.0, false, "Clear playlist").clicked() {
+                    if icon_button(ui, &t, "eraser", 34.0, false, "Clear playlist").clicked() {
                         self.confirm_action = Some(ConfirmAction::ClearTracks);
                     }
-                    if icon_button(ui, &t, "minus", 30.0, false, "Remove selected track")
+                    if icon_button(ui, &t, "minus", 34.0, false, "Remove selected track")
                         .clicked()
                     {
                         self.confirm_action = Some(ConfirmAction::RemoveTrack);
@@ -2113,7 +2134,7 @@ impl SidcraftApp {
                         ui,
                         &t,
                         "up",
-                        30.0,
+                        34.0,
                         false,
                         can_move_up,
                         "Move track up",
@@ -2127,7 +2148,7 @@ impl SidcraftApp {
                         ui,
                         &t,
                         "down",
-                        30.0,
+                        34.0,
                         false,
                         can_move_down,
                         "Move track down",
@@ -2141,7 +2162,7 @@ impl SidcraftApp {
                         ui,
                         &t,
                         "to-top",
-                        30.0,
+                        34.0,
                         false,
                         can_move_up,
                         "Move to top",
@@ -2155,7 +2176,7 @@ impl SidcraftApp {
                         ui,
                         &t,
                         "to-bottom",
-                        30.0,
+                        34.0,
                         false,
                         can_move_down,
                         "Move to bottom",
@@ -2166,7 +2187,7 @@ impl SidcraftApp {
                         self.move_selected_track_to_bottom();
                     }
                     ui.add_space(6.0);
-                    if icon_button(ui, &t, "play", 30.0, false, "Play all").clicked() {
+                    if icon_button(ui, &t, "play", 34.0, false, "Play all").clicked() {
                         self.play_all();
                         self.view = View::Player;
                     }

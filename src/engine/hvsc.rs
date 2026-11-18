@@ -670,9 +670,14 @@ fn sort_entries(entries: &mut [HvscEntry]) {
     });
 }
 
-/// Browser shows directories and `.sid` files only.
+/// Browser shows directories and `.sid` files only. HVSC's `DOCUMENTS/` and
+/// `update/` directories are housekeeping, not browsable music.
 fn is_browsable(is_dir: bool, name: &str) -> bool {
-    is_dir || name.to_lowercase().ends_with(".sid")
+    if is_dir {
+        !name.eq_ignore_ascii_case("DOCUMENTS") && !name.eq_ignore_ascii_case("update")
+    } else {
+        name.to_ascii_lowercase().ends_with(".sid")
+    }
 }
 
 /// Fetches and parses an HTTP directory listing.
