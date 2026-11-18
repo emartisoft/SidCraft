@@ -20,6 +20,9 @@ online HVSC mirror.
 - Create, manage, and save M3U playlists; shuffle and repeat playback.
 - Browse folders and search by title, author, or path in an HVSC mirror.
   Tunes can be downloaded from the browser and played.
+- Generate random playlists from the HVSC index: choose 5–100 tracks and one
+  or more collections (Demos, Games, Musicians), then save the result as a
+  named M3U playlist in the library.
 - Choose from eight visualisations: envelope, VU meter, spectrum,
   spectrogram, oscilloscope, piano roll, filter, and ADSR.
 - Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
