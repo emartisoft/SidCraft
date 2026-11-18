@@ -2980,7 +2980,7 @@ impl SidcraftApp {
                             }
                             ui.label(
                                 RichText::new(
-                                    "SidCraft asks GitHub for the newest stable release a few \
+                                    "SidCraft asks GitHub for the newest stable release about 30 \
                                      seconds after it opens. Pre-releases are ignored.",
                                 )
                                 .font(theme::regular(11.5))
@@ -3377,13 +3377,13 @@ impl SidcraftApp {
                             .color(t.text_faint),
                         );
                     });
-                ui.add_space(12.0);
+                ui.add_space(14.0);
+                hairline(ui, &t);
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let busy = self.update_busy();
                     let clicked = ui
-                        .add_enabled_ui(!busy, |ui| {
-                            secondary_button(ui, &t, "Check for Updates")
-                        })
+                        .add_enabled_ui(!busy, |ui| secondary_button(ui, &t, "Check for Updates"))
                         .inner
                         .clicked();
                     if clicked {
@@ -3392,25 +3392,20 @@ impl SidcraftApp {
                     if busy {
                         ui.spinner();
                     }
-                });
-                if let Some(line) = self.update_about_line() {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(line)
-                            .font(theme::regular(11.0))
-                            .color(t.text_muted),
-                    );
-                }
-                ui.add_space(14.0);
-                hairline(ui, &t);
-                ui.add_space(10.0);
-                // `Align::Min` on the cross axis keeps the button row hugging
-                // its content; `Align::Center` would stretch the row over the
-                // whole remaining height and leave a large gap.
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if primary_button(ui, &t, "Ok").clicked() {
-                        self.show_about = false;
+                    if let Some(line) = self.update_about_line() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(line)
+                                .font(theme::regular(11.0))
+                                .color(t.text_muted),
+                        );
                     }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_button(ui, &t, "Ok").clicked() {
+                            self.show_about = false;
+                        }
+                    });
                 });
             });
     }

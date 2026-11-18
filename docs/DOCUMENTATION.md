@@ -46,7 +46,7 @@ Finder lists SidCraft under **Open With**. From a terminal:
 ## Updating SidCraft
 
 SidCraft can check GitHub for a newer stable release. The check runs once,
-about six seconds after launch, when **Settings → Updates → Check for new
+about 30 seconds after launch, when **Settings → Updates → Check for new
 versions at startup** is enabled (the default). It can also be started by hand
 from **Help → Check for Updates…**, from the **Check for Updates** button in
 **About**, or from **Settings → Updates → Check now**.

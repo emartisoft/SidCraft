@@ -1542,7 +1542,7 @@ impl SidcraftApp {
         }
     }
 
-    /// Runs the startup check six seconds after launch, once per session.
+    /// Runs the startup check 30 seconds after launch, once per session.
     fn maybe_auto_check_updates(&mut self) {
         if self.update_checked_once || !self.config.check_updates {
             return;
@@ -1553,7 +1553,7 @@ impl SidcraftApp {
                 self.update_checked_once = true;
                 self.start_update_check(false);
             }
-            None => self.update_auto_at = Some(now + Duration::from_secs(6)),
+            None => self.update_auto_at = Some(now + Duration::from_secs(30)),
             _ => {}
         }
     }
