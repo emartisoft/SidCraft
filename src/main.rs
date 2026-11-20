@@ -319,6 +319,9 @@ pub struct SidcraftApp {
     random_track_count: u32,
     random_collections: HvscCollectionFilter,
     random_list_error: Option<String>,
+    /// Summary of a freshly created random playlist, shown in a confirmation
+    /// dialog. Pressing "Ok" reveals the Playlist view.
+    random_list_result: Option<String>,
 
     // Update check and in-app download
     pub update_phase: UpdatePhase,
@@ -635,6 +638,7 @@ impl SidcraftApp {
             random_track_count: 25,
             random_collections: HvscCollectionFilter::default(),
             random_list_error: None,
+            random_list_result: None,
             update_phase: UpdatePhase::Idle,
             update_release: None,
             update_manual: false,
@@ -1171,7 +1175,10 @@ impl SidcraftApp {
         if created < count {
             message.push_str(&format!(" (only {created} available)"));
         }
-        self.set_status(message);
+        self.set_status(message.clone());
+        // Report the result in a dialog; the Playlist view is revealed only
+        // after the user acknowledges it.
+        self.random_list_result = Some(message);
     }
 
     fn fail_random_list(&mut self, message: &str) {

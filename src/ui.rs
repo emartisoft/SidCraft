@@ -156,6 +156,9 @@ impl eframe::App for SidcraftApp {
         if self.confirm_action.is_some() {
             self.confirm_window(ctx);
         }
+        if self.random_list_result.is_some() {
+            self.random_list_result_window(ctx);
+        }
         if self.show_update_dialog {
             self.update_window(ctx);
         }
@@ -3320,6 +3323,59 @@ impl SidcraftApp {
                 ConfirmAction::ClearTracks => self.clear_playlist_tracks(),
             }
             self.confirm_action = None;
+        }
+    }
+
+    /// Reports a freshly created random playlist. The Playlist view is
+    /// revealed only after the user presses "Ok", so the summary is read
+    /// before the app navigates away from the Random List panel.
+    fn random_list_result_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let Some(message) = self.random_list_result.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut acknowledged = false;
+
+        egui::Window::new("Random List created")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(16)),
+            )
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    RichText::new("Your random playlist is ready")
+                        .font(theme::semibold(16.0))
+                        .color(t.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(&message)
+                        .font(theme::regular(11.5))
+                        .color(t.text_muted),
+                );
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if primary_button(ui, &t, "Ok").clicked() {
+                        acknowledged = true;
+                    }
+                });
+            });
+
+        if acknowledged {
+            self.random_list_result = None;
+            self.view = View::Playlist;
+        } else if !open {
+            // Closing with the window button or Escape leaves the view alone.
+            self.random_list_result = None;
         }
     }
 
