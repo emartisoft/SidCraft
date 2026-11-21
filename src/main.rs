@@ -481,8 +481,21 @@ fn first_playlist_tune(playlist: &Playlist) -> (SidFile, u16, Option<String>) {
 }
 
 impl SidcraftApp {
+    /// macOS renders the native title bar through the window's alpha channel,
+    /// so a transparent viewport makes it see-through. The alpha buffer is still
+    /// required for the mini player's opacity, hence toggle the OS window
+    /// transparency around mode switches instead of removing it at creation.
+    #[cfg(target_os = "macos")]
+    fn set_macos_window_transparency(ctx: &egui::Context, transparent: bool) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(transparent));
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, startup_path: Option<PathBuf>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        // Keep the full shell's title bar opaque on macOS. The viewport itself
+        // stays transparent so the frameless mini player can still fade.
+        #[cfg(target_os = "macos")]
+        Self::set_macos_window_transparency(&ctx, false);
         startup::set_wakeup(move || ctx.request_repaint());
         let config = Config::load();
         // Remembered filter model: 6581 chips use the EKV transistor model
@@ -2260,6 +2273,10 @@ impl SidcraftApp {
         // change preserves the outer rect, so resizing first would let the
         // freed title bar/border enlarge the frameless client area.
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        // The frameless player has no native title bar; restore transparency so
+        // its opacity setting can still show the desktop through the window.
+        #[cfg(target_os = "macos")]
+        Self::set_macos_window_transparency(ctx, true);
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
         // The full shell has a 760x520 minimum; lower it before resizing or
         // the OS clamps the mini window back to the large size. The upper
@@ -2308,6 +2325,9 @@ impl SidcraftApp {
             at: Instant::now(),
         });
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        // The native title bar is back: make it opaque again (macOS only).
+        #[cfg(target_os = "macos")]
+        Self::set_macos_window_transparency(ctx, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
             MIN_WINDOW_SIZE[0],
@@ -2450,7 +2470,8 @@ fn main() -> eframe::Result<()> {
         ])
         .with_min_inner_size(MIN_WINDOW_SIZE)
         // Required for the mini player's opacity setting: the OpenGL surface
-        // needs an alpha channel. The full shell still clears to opaque.
+        // needs an alpha channel. The full shell still clears to opaque, and on
+        // macOS its native title bar is made opaque again after startup.
         .with_transparent(true);
     if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
         viewport = viewport.with_position([x, y]);
