@@ -25,6 +25,12 @@ online HVSC mirror.
   named M3U playlist in the library.
 - Choose from eight visualisations: envelope, VU meter, spectrum,
   spectrogram, oscilloscope, piano roll, filter, and ADSR.
+- Switch to a frameless mini player with Ctrl+M, the mini button, or a
+  double-click on the header. It has transport controls, an inline progress
+  bar and a compact visualisation; double-click the visualisation to cycle to
+  the next one. Drag the header to move it and the bottom-right corner to
+  resize it. Size and position are remembered, and Settings offers adjustable
+  opacity (64% by default) and a "Start in mini player" option.
 - Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
   fade-out, sample rate, and master gain; mute individual voices.
 - Check GitHub for a newer stable release from Help, About or Settings, either
