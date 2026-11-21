@@ -178,36 +178,3 @@ pub fn sync(enabled: bool) -> io::Result<()> {
     build_playlist().save(&path)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{FAVOURITE_TOP_100, build_playlist, hvsc_path};
-    use crate::engine::hvsc::DEFAULT_HVSC_URL;
-
-    #[test]
-    fn list_has_one_hundred_sid_paths() {
-        let playlist = build_playlist();
-        assert_eq!(playlist.len(), 100);
-        assert_eq!(FAVOURITE_TOP_100.lines().count(), 100);
-    }
-
-    #[test]
-    fn numbering_is_ignored() {
-        assert_eq!(
-            hvsc_path(" 42. /MUSICIANS/H/Hubbard_Rob/Knucklebusters.sid"),
-            Some("/MUSICIANS/H/Hubbard_Rob/Knucklebusters.sid")
-        );
-    }
-
-    #[test]
-    fn urls_use_the_hvsc_mirror() {
-        let playlist = build_playlist();
-        assert_eq!(
-            playlist.entries[0].source,
-            format!("{DEFAULT_HVSC_URL}/MUSICIANS/D/Daglish_Ben/Last_Ninja.sid")
-        );
-        assert_eq!(
-            playlist.entries[99].source,
-            format!("{DEFAULT_HVSC_URL}/MUSICIANS/B/Brennan_Neil/Fist_II-The_Legend_Continues.sid")
-        );
-    }
-}

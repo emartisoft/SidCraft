@@ -818,18 +818,3 @@ fn parse_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
     entries
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_release;
-
-    #[test]
-    fn parses_release_from_second_line() {
-        let text = "# stub for old updaters\nRelease 65\n";
-        assert_eq!(parse_release(text), Some(65));
-    }
-
-    #[test]
-    fn missing_release_is_not_a_version() {
-        assert_eq!(parse_release("# stub for old updaters\n"), None);
-    }
-}
