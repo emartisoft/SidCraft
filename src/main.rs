@@ -2423,10 +2423,65 @@ impl SidcraftApp {
     }
 }
 
+/// Selects the Linux display backend before winit creates the event loop.
+///
+/// winit prefers Wayland whenever `WAYLAND_DISPLAY` is set, even when XWayland
+/// is available. Wayland gives applications no way to read or set a toplevel's
+/// global position, so the full window and the mini player could not reopen
+/// where the user left them. X11 (including XWayland) supports both, so use it
+/// by default and let users opt into native Wayland in Settings.
+#[cfg(target_os = "linux")]
+fn select_linux_backend(prefer_wayland: bool) {
+    if prefer_wayland || !x11_display_available() {
+        return;
+    }
+    // SAFETY: this runs before the event loop, any window, or any spawned
+    // thread can read the environment.
+    unsafe {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("WAYLAND_SOCKET");
+    }
+}
+
+/// Returns whether `DISPLAY` points at an X server we can actually reach.
+///
+/// A stale `DISPLAY` would make winit fail to start once Wayland is disabled,
+/// so probe local displays through their Unix socket. Remote displays are
+/// trusted; there is no cheap way to check them here.
+#[cfg(target_os = "linux")]
+pub(crate) fn x11_display_available() -> bool {
+    use std::os::unix::net::UnixStream;
+
+    let Some(display) = std::env::var_os("DISPLAY") else {
+        return false;
+    };
+    let display = display.to_string_lossy();
+    if display.is_empty() {
+        return false;
+    }
+    let display = display.strip_prefix("unix:").unwrap_or(&display);
+    let Some(number) = display.strip_prefix(':') else {
+        // Remote/TCP display (`host:0`): assume the user configured it.
+        return true;
+    };
+    let number = number.split('.').next().unwrap_or(number);
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    UnixStream::connect(format!("/tmp/.X11-unix/X{number}")).is_ok()
+}
+
 fn main() -> eframe::Result<()> {
     // Must run before the window is created so the task bar button picks up
     // the right identity and icon.
     app_icon::set_app_user_model_id();
+
+    // Load the config before any background threads start. On Linux the
+    // backend choice below mutates the environment, which must happen while
+    // this is still the only thread.
+    let config = Config::load();
+    #[cfg(target_os = "linux")]
+    select_linux_backend(config.prefer_wayland);
 
     // On macOS the file from Finder arrives as an AppleEvent after launch;
     // the other platforms pass it on the command line.
@@ -2443,21 +2498,6 @@ fn main() -> eframe::Result<()> {
     // remove it now that the new build is running.
     update::cleanup_previous_install();
 
-    let config = Config::load();
-    // winit selects Wayland whenever WAYLAND_DISPLAY is present, even when an
-    // X server is available. Wayland gives applications no way to read or set
-    // a window's global position, so the full window and the mini player
-    // cannot have their positions remembered there. Let Linux users opt into
-    // X11 (XWayland works too) to get separate position persistence.
-    #[cfg(target_os = "linux")]
-    if config.prefer_x11 {
-        // SAFETY: this runs before the event loop, any window, or any spawned
-        // thread can read the environment.
-        unsafe {
-            std::env::remove_var("WAYLAND_DISPLAY");
-            std::env::remove_var("WAYLAND_SOCKET");
-        }
-    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SidCraft")
 		// On Wayland the app id is what ties the window to `sidcraft.desktop`,

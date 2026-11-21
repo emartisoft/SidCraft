@@ -3401,28 +3401,39 @@ impl SidcraftApp {
 
                         #[cfg(target_os = "linux")]
                         settings_card(ui, &t, "Window", |ui| {
-                            let mut prefer_x11 = self.config.prefer_x11;
-                            if ui
-                                .checkbox(
-                                    &mut prefer_x11,
-                                    "Use X11 backend (restore window position)",
-                                )
-                                .changed()
-                            {
-                                self.config.prefer_x11 = prefer_x11;
-                                self.config.save();
+                            if crate::x11_display_available() {
+                                let mut remember_positions = !self.config.prefer_wayland;
+                                if ui
+                                    .checkbox(&mut remember_positions, "Remember window positions")
+                                    .changed()
+                                {
+                                    self.config.prefer_wayland = !remember_positions;
+                                    self.config.save();
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "SidCraft uses X11 (XWayland works too) so the full \
+                                         window and the mini player each reopen where you left \
+                                         them. Native Wayland does not let applications read or \
+                                         set window positions; clear this only if you prefer \
+                                         Wayland and do not need position memory. Takes effect \
+                                         after restarting SidCraft.",
+                                    )
+                                    .font(theme::regular(11.5))
+                                    .color(t.text_faint),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "No X11/XWayland display was found, so the compositor \
+                                         places windows and SidCraft cannot remember their \
+                                         positions. Enable XWayland to restore separate \
+                                         positions for the full window and the mini player.",
+                                    )
+                                    .font(theme::regular(11.5))
+                                    .color(t.text_faint),
+                                );
                             }
-                            ui.label(
-                                RichText::new(
-                                    "Wayland does not let applications read or set window \
-                                     positions. Enable this (requires an X server; XWayland \
-                                     works) to remember separate positions for the full window \
-                                     and the mini player. Takes effect after restarting \
-                                     SidCraft.",
-                                )
-                                .font(theme::regular(11.5))
-                                .color(t.text_faint),
-                            );
                         });
 
                         settings_card(ui, &t, "Mini player", |ui| {

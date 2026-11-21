@@ -202,6 +202,11 @@ sudo apt install build-essential pkg-config libasound2-dev \
 
 - Then run `cargo build --release` from the repository root.
 
+On Wayland desktops SidCraft uses X11/XWayland by default, because native
+Wayland does not let applications read or set window positions. Settings →
+Window → "Remember window positions" can be cleared to use native Wayland
+instead; that choice takes effect after a restart.
+
 Output: `target/release/sidcraft`. To optionally create an AppImage, install
 Bun 1.4 or newer and run:
 
