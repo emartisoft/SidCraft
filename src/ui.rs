@@ -2667,8 +2667,12 @@ impl SidcraftApp {
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let title = match self.hvsc_browser.release {
+                    Some(release) => format!("High Voltage SID Collection #{release}"),
+                    None => "High Voltage SID Collection".to_string(),
+                };
                 ui.label(
-                    RichText::new("High Voltage SID Collection")
+                    RichText::new(title)
                         .font(theme::semibold(22.0))
                         .color(t.text),
                 );

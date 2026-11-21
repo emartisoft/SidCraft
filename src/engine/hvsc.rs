@@ -48,6 +48,30 @@ fn fetch_text(url: &str) -> io::Result<String> {
 /// Default HVSC mirror URL.
 pub const DEFAULT_HVSC_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music";
 
+/// Fetches the HVSC release number from `DOCUMENTS/hv_sids.txt`.
+///
+/// That file begins with a stub comment line and then a line such as
+/// `Release 85`, which is the collection version shown in the browser title.
+pub fn fetch_release(base_url: &str) -> io::Result<Option<u32>> {
+    let content = fetch_text(&format!("{base_url}/DOCUMENTS/hv_sids.txt"))?;
+    Ok(parse_release(&content))
+}
+
+/// Parses the release line, preferring the documented second line but falling
+/// back to any `Release N` line if the file gains a header.
+fn parse_release(content: &str) -> Option<u32> {
+    let from_second_line = content
+        .lines()
+        .nth(1)
+        .and_then(|line| line.trim().strip_prefix("Release"));
+    let from_any_line = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Release"));
+    from_second_line
+        .or(from_any_line)
+        .and_then(|rest| rest.trim().parse::<u32>().ok())
+}
+
 /// Returns the cache directory for crabsid, creating it if needed.
 fn cache_dir() -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("crabsid");
@@ -332,6 +356,8 @@ pub struct HvscBrowser {
     pub stil_error: Option<String>,
     /// Songlengths database for durations
     pub songlengths: Option<Arc<SonglengthsDatabase>>,
+    /// HVSC release number from `DOCUMENTS/hv_sids.txt`, when available.
+    pub release: Option<u32>,
     /// Lowercase "path\ntitle\nartist" haystack per SID, shared across clones.
     search_index: Arc<Vec<(String, String)>>,
     /// Loading state
@@ -459,22 +485,26 @@ impl HvscBrowser {
             stil: None,
             stil_error: None,
             songlengths: None,
+            release: None,
             search_index: Arc::new(Vec::new()),
             loading: false,
             error: None,
         }
     }
 
-    /// Fetches the STIL and Songlengths databases (from cache if available).
+    /// Fetches the STIL and Songlengths databases and the release number.
     pub fn load_stil(&mut self) {
-        // First-run fetch downloads ~10MB across two URLs; run in parallel to halve the hang.
+        // First-run fetch downloads ~10MB across two URLs; run them in parallel
+        // with the tiny release file so startup does not wait three times.
         let base_url = self.base_url.as_str();
-        let (stil_result, songlengths_result) = std::thread::scope(|s| {
+        let (stil_result, songlengths_result, release_result) = std::thread::scope(|s| {
             let stil = s.spawn(|| StilDatabase::fetch(base_url));
             let songlengths = s.spawn(|| SonglengthsDatabase::fetch(base_url));
+            let release = s.spawn(|| fetch_release(base_url));
             (
                 stil.join().expect("STIL thread"),
                 songlengths.join().expect("Songlengths thread"),
+                release.join().expect("HVSC release thread"),
             )
         });
 
@@ -485,6 +515,10 @@ impl HvscBrowser {
         // Songlengths errors are silently ignored - we just fall back to playtime
         if let Ok(db) = songlengths_result {
             self.songlengths = Some(Arc::new(db));
+        }
+        // A missing release file simply leaves the title without a version.
+        if let Ok(Some(version)) = release_result {
+            self.release = Some(version);
         }
         self.rebuild_search_index();
     }
@@ -504,6 +538,7 @@ impl HvscBrowser {
         self.stil = None;
         self.stil_error = None;
         self.songlengths = None;
+        self.release = None;
         self.search_index = Arc::new(Vec::new());
         self.load_stil();
     }
@@ -781,4 +816,20 @@ fn parse_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
 
     sort_entries(&mut entries);
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_release;
+
+    #[test]
+    fn parses_release_from_second_line() {
+        let text = "# stub for old updaters\nRelease 65\n";
+        assert_eq!(parse_release(text), Some(65));
+    }
+
+    #[test]
+    fn missing_release_is_not_a_version() {
+        assert_eq!(parse_release("# stub for old updaters\n"), None);
+    }
 }
