@@ -3399,6 +3399,32 @@ impl SidcraftApp {
                             }
                         });
 
+                        #[cfg(target_os = "linux")]
+                        settings_card(ui, &t, "Window", |ui| {
+                            let mut prefer_x11 = self.config.prefer_x11;
+                            if ui
+                                .checkbox(
+                                    &mut prefer_x11,
+                                    "Use X11 backend (restore window position)",
+                                )
+                                .changed()
+                            {
+                                self.config.prefer_x11 = prefer_x11;
+                                self.config.save();
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Wayland does not let applications read or set window \
+                                     positions. Enable this (requires an X server; XWayland \
+                                     works) to remember separate positions for the full window \
+                                     and the mini player. Takes effect after restarting \
+                                     SidCraft.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                        });
+
                         settings_card(ui, &t, "Mini player", |ui| {
                             ui.label(
                                 RichText::new("Opacity")

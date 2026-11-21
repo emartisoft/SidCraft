@@ -29,16 +29,23 @@ online HVSC mirror.
   double-click on the header. It has transport controls, an inline progress
   bar and a compact visualisation; double-click the visualisation to cycle to
   the next one. Drag the header to move it and the bottom-right corner to
-  resize it. Size and position are remembered, and Settings offers adjustable
-  opacity (64% by default) and a "Start in mini player" option.
+  resize it. Its size is remembered, and Settings offers adjustable
+  opacity (64% by default) and a "Start in mini player" option. Window position
+  is restored where the display server supports it (Windows and X11); Wayland
+  does not allow applications to query or set window positions, so there the
+  compositor decides where windows appear.
 - Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
   fade-out, sample rate, and master gain; mute individual voices.
 - Check GitHub for a newer stable release from Help, About or Settings, either
   automatically about 30 seconds after startup or on demand. The update is
   downloaded in the app after confirmation and verified against its SHA-256
   digest; Windows and Linux restart into the new version, macOS opens the DMG.
-- Choose system, light, or dark themes. Preferences such as window size and
-  position are saved in the application settings.
+- Choose system, light, or dark themes. Preferences such as window size are
+  saved in the application settings; window position is saved when the display
+  server makes it available (not on Wayland). On Linux, Settings → Window →
+  "Use X11 backend" switches SidCraft to X11 (XWayland works too) so the full
+  window and the mini player each keep their own position; it takes effect
+  after a restart.
 
 ![SidCraft-Player](docs/screenshots/player.png)
    

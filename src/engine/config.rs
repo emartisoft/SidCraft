@@ -85,6 +85,10 @@ pub struct Config {
     /// Open directly in the frameless mini player on launch.
     #[serde(default)]
     pub start_in_mini: bool,
+    /// Prefer the X11 backend on Linux so window positions can be saved.
+    /// Wayland does not expose window positions to applications at all.
+    #[serde(default)]
+    pub prefer_x11: bool,
 }
 
 impl Default for Config {
@@ -108,6 +112,7 @@ impl Default for Config {
             mini_height: None,
             mini_opacity: default_mini_opacity(),
             start_in_mini: false,
+            prefer_x11: false,
         }
     }
 }

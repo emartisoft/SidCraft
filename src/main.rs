@@ -2058,14 +2058,43 @@ impl SidcraftApp {
             .unwrap_or_default()
     }
 
+    /// Reads the current window geometry in a way that works on every backend.
+    ///
+    /// winit cannot report window positions on Wayland (`inner_position()` and
+    /// `outer_position()` both return `NotSupported`), so egui leaves
+    /// `ViewportInfo::inner_rect` and `outer_rect` as `None` there. The size is
+    /// still available through `InputState::screen_rect`, which eframe fills
+    /// from `Window::inner_size()`. Using that as a fallback keeps size
+    /// persistence working on Linux; the position stays unknown and is not saved.
+    fn viewport_geometry(
+        ctx: &egui::Context,
+    ) -> (
+        Option<egui::Vec2>,
+        Option<egui::Pos2>,
+        Option<bool>,
+        Option<bool>,
+    ) {
+        ctx.input(|i| {
+            let vp = i.viewport();
+            let size = vp.inner_rect.map(|rect| rect.size()).or_else(|| {
+                let screen = i.screen_rect;
+                (screen.is_finite() && screen.width() > 1.0 && screen.height() > 1.0)
+                    .then(|| screen.size())
+            });
+            (
+                size,
+                vp.outer_rect.map(|rect| rect.min),
+                vp.maximized,
+                vp.minimized,
+            )
+        })
+    }
+
     /// Remembers the OS window geometry so the next launch reopens at the same
     /// size and position. Writes are throttled to once a second while the user
     /// is resizing and flushed once the geometry settles.
     pub fn remember_window(&mut self, ctx: &egui::Context) {
-        let (inner, outer, maximized, minimized) = ctx.input(|i| {
-            let vp = i.viewport();
-            (vp.inner_rect, vp.outer_rect, vp.maximized, vp.minimized)
-        });
+        let (size, pos, maximized, minimized) = Self::viewport_geometry(ctx);
         // While minimized the OS reports bogus bounds; keep the last good ones.
         if minimized == Some(true) {
             return;
@@ -2079,10 +2108,10 @@ impl SidcraftApp {
         let ready = match self.pending_geometry.as_ref() {
             Some(pending) => {
                 let size_ok = pending.inner_size.map_or(true, |want| {
-                    inner.is_some_and(|r| (r.size() - want).abs().max_elem() < 2.0)
+                    size.is_some_and(|actual| (actual - want).abs().max_elem() < 2.0)
                 });
                 let pos_ok = pending.outer_pos.map_or(true, |want| {
-                    outer.is_some_and(|r| (r.min - want).abs().max_elem() < 2.0)
+                    pos.is_some_and(|actual| (actual - want).abs().max_elem() < 2.0)
                 });
                 let max_ok = pending
                     .maximized
@@ -2108,8 +2137,8 @@ impl SidcraftApp {
         let mut changed = false;
 
         if self.mini_mode {
-            if let Some(inner) = inner {
-                let (w, h) = (inner.width(), inner.height());
+            if let Some(size) = size {
+                let (w, h) = (size.x, size.y);
                 if self.config.mini_width.map_or(true, |v| (v - w).abs() > 0.5) {
                     self.config.mini_width = Some(w);
                     changed = true;
@@ -2119,8 +2148,8 @@ impl SidcraftApp {
                     changed = true;
                 }
             }
-            if let Some(outer) = outer {
-                let (x, y) = (outer.min.x, outer.min.y);
+            if let Some(pos) = pos {
+                let (x, y) = (pos.x, pos.y);
                 if self.config.mini_x.map_or(true, |v| (v - x).abs() > 0.5) {
                     self.config.mini_x = Some(x);
                     changed = true;
@@ -2131,8 +2160,8 @@ impl SidcraftApp {
                 }
             }
         } else {
-            if let Some(inner) = inner {
-                let (w, h) = (inner.width(), inner.height());
+            if let Some(size) = size {
+                let (w, h) = (size.x, size.y);
                 if self
                     .config
                     .window_width
@@ -2150,8 +2179,8 @@ impl SidcraftApp {
                     changed = true;
                 }
             }
-            if let Some(outer) = outer {
-                let (x, y) = (outer.min.x, outer.min.y);
+            if let Some(pos) = pos {
+                let (x, y) = (pos.x, pos.y);
                 if self.config.window_x.map_or(true, |v| (v - x).abs() > 0.5) {
                     self.config.window_x = Some(x);
                     changed = true;
@@ -2197,16 +2226,20 @@ impl SidcraftApp {
         if self.mini_mode {
             return;
         }
-        let (inner, outer, maximized) = ctx.input(|i| {
-            let vp = i.viewport();
-            (vp.inner_rect, vp.outer_rect, vp.maximized)
-        });
+        let (size, pos, maximized, _) = Self::viewport_geometry(ctx);
+        // On the first frame an X11 window can still report (0, 0) before the
+        // window manager places it. Prefer the last saved full-shell position
+        // in that case so leaving the mini player does not jump to 0, 0.
+        let full_pos = pos
+            .filter(|p| p.x > 0.0 || p.y > 0.0)
+            .or_else(|| match (self.config.window_x, self.config.window_y) {
+                (Some(x), Some(y)) => Some(egui::pos2(x, y)),
+                _ => None,
+            })
+            .unwrap_or(egui::pos2(80.0, 80.0));
         self.mini_restore = Some(MiniRestore {
-            inner_size: inner.map_or(
-                egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]),
-                |rect| rect.size(),
-            ),
-            outer_pos: outer.map_or(egui::pos2(80.0, 80.0), |rect| rect.min),
+            inner_size: size.unwrap_or(egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1])),
+            outer_pos: full_pos,
             maximized: maximized.unwrap_or(false),
         });
         self.mini_mode = true;
@@ -2237,8 +2270,10 @@ impl SidcraftApp {
 
         // Reopen where the mini player was last left. `remember_window` waits
         // for both this position and the size above before saving again.
+        // Wayland cannot report or set a global window position, so skip the
+        // position command (and the wait for it) when the backend has none.
         let saved_pos = match (self.config.mini_x, self.config.mini_y) {
-            (Some(x), Some(y)) => Some(egui::pos2(x, y)),
+            (Some(x), Some(y)) if pos.is_some() => Some(egui::pos2(x, y)),
             _ => None,
         };
         if let Some(pos) = saved_pos {
@@ -2261,10 +2296,14 @@ impl SidcraftApp {
         let restore = self.mini_restore.take();
         // Keep geometry recording suspended until the full shell's bounds are
         // actually reported; otherwise the mini size gets saved as the full
-        // window size (and the shell comes back at the wrong size).
+        // window size (and the shell comes back at the wrong size). On Wayland
+        // there is no outer position to wait for, so do not block on it.
+        let pos_supported = Self::viewport_geometry(ctx).1.is_some();
         self.pending_geometry = Some(PendingGeometry {
             inner_size: restore.filter(|r| !r.maximized).map(|r| r.inner_size),
-            outer_pos: restore.filter(|r| !r.maximized).map(|r| r.outer_pos),
+            outer_pos: restore
+                .filter(|r| !r.maximized && pos_supported)
+                .map(|r| r.outer_pos),
             maximized: restore.map(|r| r.maximized),
             at: Instant::now(),
         });
@@ -2283,7 +2322,9 @@ impl SidcraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(restore.inner_size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(restore.outer_pos));
+                if pos_supported {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(restore.outer_pos));
+                }
             }
         }
     }
@@ -2383,6 +2424,20 @@ fn main() -> eframe::Result<()> {
     update::cleanup_previous_install();
 
     let config = Config::load();
+    // winit selects Wayland whenever WAYLAND_DISPLAY is present, even when an
+    // X server is available. Wayland gives applications no way to read or set
+    // a window's global position, so the full window and the mini player
+    // cannot have their positions remembered there. Let Linux users opt into
+    // X11 (XWayland works too) to get separate position persistence.
+    #[cfg(target_os = "linux")]
+    if config.prefer_x11 {
+        // SAFETY: this runs before the event loop, any window, or any spawned
+        // thread can read the environment.
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            std::env::remove_var("WAYLAND_SOCKET");
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SidCraft")
 		// On Wayland the app id is what ties the window to `sidcraft.desktop`,
