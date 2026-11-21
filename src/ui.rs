@@ -3485,6 +3485,22 @@ impl SidcraftApp {
                             );
                         });
 
+                        settings_card(ui, &t, "Playlists", |ui| {
+                            let mut show = self.config.show_favourite_top_100;
+                            if ui.checkbox(&mut show, "Favourite Top 100 SIDs").changed() {
+                                self.config.show_favourite_top_100 = show;
+                                self.sync_favourite_playlist();
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Shows the Favourite Top 100 SIDs playlist in the playlist \
+                                     library. Turning it off removes its M3U file.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                        });
+
                         settings_card(ui, &t, "Playback", |ui| {
                             property_row(ui, &t, "SID chip", self.chip_label());
                             property_row(ui, &t, "Clock", self.clock_label());

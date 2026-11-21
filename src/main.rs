@@ -5,6 +5,7 @@
 
 mod app_icon;
 mod engine;
+mod favourites;
 mod startup;
 mod theme;
 mod ui;
@@ -438,6 +439,17 @@ fn default_playlist_path() -> PathBuf {
         .join("playlist.m3u")
 }
 
+/// Creates the default playlist when it is missing and returns its path.
+/// A fresh install therefore always has a playlist in the library, even when
+/// another playlist is selected.
+fn ensure_default_playlist(dir: &Path) -> PathBuf {
+    let path = dir.join("Default.m3u");
+    if !path.is_file() {
+        let _ = Playlist::empty().save(&path);
+    }
+    path
+}
+
 /// Resolves the playlist library at startup.
 ///
 /// Older versions kept a single `playlist.m3u` next to the config file. It is
@@ -460,17 +472,16 @@ fn startup_playlist(config: &Config) -> (Playlist, PathBuf) {
             }
         }
     }
+    let _ = ensure_default_playlist(&dir);
 
+    // The default playlist now always exists, so a stale config entry can
+    // safely fall back to it instead of creating a file elsewhere.
     let active = config
         .active_playlist
         .as_ref()
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .unwrap_or(default_path);
-
-    if !active.is_file() {
-        let _ = Playlist::empty().save(&active);
-    }
 
     let playlist = Playlist::load(&active).unwrap_or_else(|_| Playlist::empty());
     (playlist, active)
@@ -513,24 +524,32 @@ impl SidcraftApp {
         // when the user turned it on in Settings or the player panel.
         let ekv_filter = config.ekv_filter;
 
+        let mut startup_error = None;
+        // The library always contains a Default playlist, and the optional
+        // Favourite Top 100 file follows the saved setting before it is listed.
+        if let Err(e) = favourites::sync(config.show_favourite_top_100) {
+            eprintln!("Could not update favourite playlist: {e}");
+        }
+        let (mut playlist, mut playlist_path) = startup_playlist(&config);
+
         // A file named by the OS ("Open with", Finder, a file manager or the
         // shell) wins over the saved playlist. An M3U becomes the active
         // playlist; a SID is played directly and leaves the playlist alone.
-        let mut startup_error = None;
-        let (playlist, playlist_path) = match startup_path
+        if let Some(path) = startup_path
             .as_deref()
             .filter(|path| startup::is_playlist(path))
         {
-            Some(path) => match Playlist::load(path) {
-                Ok(playlist) => (playlist, path.to_path_buf()),
+            match Playlist::load(path) {
+                Ok(loaded) => {
+                    playlist = loaded;
+                    playlist_path = path.to_path_buf();
+                }
                 Err(e) => {
                     startup_error =
                         Some(format!("Could not open playlist {}: {e}", path.display()));
-                    startup_playlist(&config)
                 }
-            },
-            None => startup_playlist(&config),
-        };
+            }
+        }
 
         let mut playlist_files = playlist::list_playlists();
         if !playlist_files.contains(&playlist_path) && playlist_path.is_file() {
@@ -1423,6 +1442,36 @@ impl SidcraftApp {
         if !self.playlist_files.contains(&self.playlist_path) && self.playlist_path.is_file() {
             self.playlist_files.push(self.playlist_path.clone());
         }
+    }
+
+    /// Creates or removes the managed "Favourite Top 100 SIDs" M3U according
+    /// to the saved setting. If its file was the active playlist and is being
+    /// removed, the Default playlist becomes active instead.
+    pub fn sync_favourite_playlist(&mut self) {
+        let favourite_path = favourites::playlist_path();
+        let was_active = self.playlist_path == favourite_path;
+        let enabled = self.config.show_favourite_top_100;
+
+        if let Err(e) = favourites::sync(enabled) {
+            self.set_status(format!("Could not update favourite playlist: {e}"));
+            return;
+        }
+        self.config.save();
+
+        if !enabled && was_active {
+            let default_path = ensure_default_playlist(&playlist::playlists_dir());
+            self.playlist = Playlist::load(&default_path).unwrap_or_default();
+            self.playlist_path = default_path;
+            self.selected_playlist_idx = 0;
+            self.playlist_drag_from = None;
+            self.playlist_scroll_to_selected = false;
+            self.sync_config();
+        }
+        self.refresh_playlist_files();
+        self.set_status(format!(
+            "Favourite Top 100 SIDs playlist {}",
+            if enabled { "added" } else { "removed" }
+        ));
     }
 
     /// Creates an empty playlist in the library and makes it active.

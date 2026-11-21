@@ -48,6 +48,9 @@ pub struct Config {
     /// Whether SidCraft asks GitHub for a newer release shortly after startup.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Whether the "Favourite Top 100 SIDs" M3U is kept in the playlist library.
+    #[serde(default = "default_true")]
+    pub show_favourite_top_100: bool,
     /// Path of the playlist that was active when the app last closed.
     #[serde(default)]
     pub active_playlist: Option<String>,
@@ -101,6 +104,7 @@ impl Default for Config {
             viz_mode: default_viz_mode(),
             ekv_filter: false,
             check_updates: true,
+            show_favourite_top_100: true,
             active_playlist: None,
             window_width: None,
             window_height: None,
