@@ -24,7 +24,7 @@ use engine::playlist::{self, extract_filename, Playlist};
 use engine::sid_file::SidFile;
 use residfp::ChipModel;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -215,6 +215,15 @@ impl ConfirmAction {
     }
 }
 
+/// Summary of a multi-file drag-and-drop, shown in a modal dialog. A single
+/// dropped file is handled directly and reported in the status bar instead.
+pub struct DropReport {
+    /// Dialog title, which also tells whether the operation succeeded.
+    pub title: &'static str,
+    /// Result details: counts, skipped files and error messages.
+    pub message: String,
+}
+
 enum HvscAsyncMsg {
     EntriesLoaded {
         path: String,
@@ -353,6 +362,8 @@ pub struct SidcraftApp {
     /// Summary of a freshly created random playlist, shown in a confirmation
     /// dialog. Pressing "Ok" reveals the Playlist view.
     random_list_result: Option<String>,
+    /// Result of the last multi-file drag-and-drop, shown in a dialog.
+    drop_report: Option<DropReport>,
 
     // Update check and in-app download
     pub update_phase: UpdatePhase,
@@ -703,6 +714,7 @@ impl SidcraftApp {
             random_collections: HvscCollectionFilter::default(),
             random_list_error: None,
             random_list_result: None,
+            drop_report: None,
             update_phase: UpdatePhase::Idle,
             update_release: None,
             update_manual: false,
@@ -1123,6 +1135,260 @@ impl SidcraftApp {
         ctx.request_repaint();
     }
 
+    /// True when `path` has the `.sid` extension accepted from drag-and-drop.
+    ///
+    /// Drag-and-drop deliberately accepts only `.sid` and `.m3u`; other
+    /// extensions (including `.mus`, which the file dialog still opens) are
+    /// ignored without any feedback.
+    fn is_dropped_sid(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sid"))
+    }
+
+    /// Handles files dropped onto the main window or the mini player.
+    ///
+    /// - One SID: play it directly, leaving the playlist untouched.
+    /// - Several SIDs: add them to the active playlist.
+    /// - One M3U: make it the active playlist and start its first track.
+    /// - Several M3Us: copy every playlist into the playlist library.
+    /// - A mix of SID and M3U files: explain that only one type can be handled.
+    /// - Anything else: ignore the drop completely.
+    ///
+    /// Multi-file operations always end in a dialog that reports what happened.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+
+        let mut sid_paths = Vec::new();
+        let mut playlist_paths = Vec::new();
+        for path in dropped {
+            if !path.is_file() {
+                continue;
+            }
+            if startup::is_playlist(&path) {
+                if !playlist_paths.contains(&path) {
+                    playlist_paths.push(path);
+                }
+            } else if Self::is_dropped_sid(&path) && !sid_paths.contains(&path) {
+                sid_paths.push(path);
+            }
+        }
+
+        // Unsupported files alone produce no reaction at all.
+        if sid_paths.is_empty() && playlist_paths.is_empty() {
+            return;
+        }
+
+        if !sid_paths.is_empty() && !playlist_paths.is_empty() {
+            self.drop_report = Some(DropReport {
+                title: "Mixed file types",
+                message: format!(
+                    "You dropped {} SID file(s) and {} M3U playlist(s) together.\n\nOnly one file type can be processed at a time. Drop either SID files or M3U playlists.",
+                    sid_paths.len(),
+                    playlist_paths.len()
+                ),
+            });
+            return;
+        }
+
+        if !sid_paths.is_empty() {
+            if sid_paths.len() == 1 {
+                self.open_path(sid_paths.remove(0));
+            } else {
+                self.add_dropped_sids(&sid_paths);
+            }
+        } else if playlist_paths.len() == 1 {
+            let path = playlist_paths.remove(0);
+            if path == self.playlist_path {
+                // The dropped list is already active: (re)start it from the
+                // first track instead of ignoring the drop.
+                if self.playlist.is_empty() {
+                    self.set_status(format!(
+                        "Playlist “{}” is empty",
+                        playlist::playlist_display_name(&self.playlist_path)
+                    ));
+                } else {
+                    self.play_all();
+                    self.set_status(format!(
+                        "Playing playlist “{}” — {} tracks",
+                        playlist::playlist_display_name(&self.playlist_path),
+                        self.playlist.len()
+                    ));
+                }
+            } else {
+                self.switch_playlist(path);
+            }
+        } else {
+            self.add_dropped_playlists(&playlist_paths);
+        }
+    }
+
+    /// Adds dropped SID files to the active playlist and reports the result.
+    fn add_dropped_sids(&mut self, paths: &[PathBuf]) {
+        let mut added = 0usize;
+        let mut duplicates = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut first_added = None;
+
+        for path in paths {
+            let source = path.to_string_lossy().to_string();
+            match SidFile::load(path) {
+                Ok(_) => {
+                    if self.playlist.add(&source, None) {
+                        if first_added.is_none() {
+                            first_added = Some(self.playlist.len() - 1);
+                        }
+                        added += 1;
+                    } else {
+                        duplicates += 1;
+                    }
+                }
+                Err(error) => failed.push((
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    error.to_string(),
+                )),
+            }
+        }
+
+        if added > 0 {
+            self.save_playlist();
+            if let Some(index) = first_added {
+                self.selected_playlist_idx = index;
+                self.playlist_scroll_to_selected = true;
+            }
+        }
+
+        let playlist_name = playlist::playlist_display_name(&self.playlist_path);
+        let mut message = format!(
+            "Added {added} of {} SID file(s) to the playlist “{playlist_name}”.",
+            paths.len()
+        );
+        if duplicates > 0 {
+            message.push_str(&format!("\n{duplicates} already in the playlist."));
+        }
+        if !failed.is_empty() {
+            message.push_str(&format!("\n{} could not be loaded:", failed.len()));
+            for (name, error) in failed.iter().take(5) {
+                message.push_str(&format!("\n• {name}: {error}"));
+            }
+            if failed.len() > 5 {
+                message.push_str(&format!("\n…and {} more.", failed.len() - 5));
+            }
+        }
+
+        self.set_status(if added > 0 {
+            format!("Added {added} SID file(s) to the playlist")
+        } else {
+            "No new SID files were added".to_string()
+        });
+        self.drop_report = Some(DropReport {
+            title: if added > 0 {
+                "SID files added"
+            } else {
+                "No SID files added"
+            },
+            message,
+        });
+    }
+
+    /// Copies dropped M3U playlists into the playlist library and reports the
+    /// result. Existing library files are left in place and not duplicated.
+    fn add_dropped_playlists(&mut self, paths: &[PathBuf]) {
+        let library = playlist::playlists_dir();
+        if let Err(error) = fs::create_dir_all(&library) {
+            let message = format!(
+                "Could not create the playlist folder {}: {error}",
+                library.display()
+            );
+            self.set_status(&message);
+            self.drop_report = Some(DropReport {
+                title: "Playlists not added",
+                message,
+            });
+            return;
+        }
+
+        let mut added = 0usize;
+        let mut existing = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+
+        for path in paths {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Playlist".to_string());
+            let stem = playlist::sanitize_playlist_name(&stem);
+            let destination = library.join(format!("{stem}.m3u"));
+
+            // A playlist dropped from the library itself, or one whose name is
+            // already used there, is skipped. Drag-and-drop must not create a
+            // duplicate copy under a different name.
+            if path.parent() == Some(library.as_path()) || destination.exists() {
+                existing += 1;
+                continue;
+            }
+
+            match Playlist::load(path) {
+                Ok(list) => match list.save(&destination) {
+                    Ok(()) => added += 1,
+                    Err(error) => failed.push((name, error.to_string())),
+                },
+                Err(error) => failed.push((name, error.to_string())),
+            }
+        }
+
+        self.refresh_playlist_files();
+
+        let mut message = format!(
+            "Added {added} of {} playlist(s) to the playlist library.",
+            paths.len()
+        );
+        if existing > 0 {
+            message.push_str(&format!("\n{existing} skipped: already in the library."));
+        }
+        if !failed.is_empty() {
+            message.push_str(&format!("\n{} could not be added:", failed.len()));
+            for (name, error) in failed.iter().take(5) {
+                message.push_str(&format!("\n• {name}: {error}"));
+            }
+            if failed.len() > 5 {
+                message.push_str(&format!("\n…and {} more.", failed.len() - 5));
+            }
+        }
+
+        self.set_status(if added > 0 {
+            format!("Added {added} playlist(s) to the library")
+        } else {
+            "No new playlists were added".to_string()
+        });
+        self.drop_report = Some(DropReport {
+            title: if added > 0 {
+                "Playlists added"
+            } else {
+                "No playlists added"
+            },
+            message,
+        });
+    }
+
     /// Makes `path` the active playlist, loading its entries and starting the
     /// first track. An empty playlist leaves whatever is playing untouched.
     pub fn switch_playlist(&mut self, path: PathBuf) {
@@ -1462,16 +1728,24 @@ impl SidcraftApp {
     /// Opens the OS file manager on the playlist library folder.
     pub fn open_playlist_folder(&mut self) {
         let dir = playlist::playlists_dir();
-        let _ = fs::create_dir_all(&dir);
+        if let Err(error) = fs::create_dir_all(&dir) {
+            self.set_status(format!("Could not create playlist folder: {error}"));
+            return;
+        }
+
+        // macOS has no `xdg-open`: Finder is launched through `/usr/bin/open`.
+        // Windows uses Explorer, and other desktops use the freedesktop helper.
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("/usr/bin/open").arg(&dir).spawn();
         #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        let result = std::process::Command::new("explorer").arg(&dir).spawn();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let result = std::process::Command::new("xdg-open").arg(&dir).spawn();
+
+        match result {
+            Ok(_) => self.set_status(format!("Opening playlist folder {}", dir.display())),
+            Err(error) => self.set_status(format!("Could not open playlist folder: {error}")),
         }
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
-        }
-        self.set_status(format!("Opening playlist folder {}", dir.display()));
     }
 
     /// Saves the active playlist to a user-chosen location ("Save As"). A copy

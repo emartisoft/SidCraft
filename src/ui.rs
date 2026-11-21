@@ -47,6 +47,7 @@ impl eframe::App for SidcraftApp {
         }
 
         self.handle_open_requests(ctx);
+        self.handle_dropped_files(ctx);
         self.handle_async_hvsc();
         self.handle_seek();
         self.handle_update_async();
@@ -188,6 +189,12 @@ impl eframe::App for SidcraftApp {
             if self.show_update_dialog {
                 self.update_window(ctx);
             }
+        }
+
+        // Drag-and-drop results are shown in both the full shell and the mini
+        // player, since a drop can happen in either window.
+        if self.drop_report.is_some() {
+            self.drop_report_window(ctx);
         }
 
         // Repaint only as fast as needed: real-time visuals/timing while playing
@@ -3748,6 +3755,49 @@ impl SidcraftApp {
         } else if !open {
             // Closing with the window button or Escape leaves the view alone.
             self.random_list_result = None;
+        }
+    }
+
+    /// Reports the result of a multi-file drag-and-drop. The dialog is shown in
+    /// both the full shell and the mini player; it only reports the outcome and
+    /// never changes the current view.
+    fn drop_report_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let Some(report) = self.drop_report.as_ref() else {
+            return;
+        };
+        let mut open = true;
+        let mut acknowledged = false;
+
+        egui::Window::new(report.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(16)),
+            )
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    RichText::new(&report.message)
+                        .font(theme::regular(11.5))
+                        .color(t.text_muted),
+                );
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if primary_button(ui, &t, "Ok").clicked() {
+                        acknowledged = true;
+                    }
+                });
+            });
+
+        if acknowledged || !open {
+            self.drop_report = None;
         }
     }
 

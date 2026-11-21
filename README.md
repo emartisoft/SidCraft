@@ -12,6 +12,11 @@ online HVSC mirror.
   manager or the command line); without a file argument the active playlist
   is used. Only one instance runs: opening another file replaces the tune in
   the window that is already playing.
+- Drag and drop files onto the main window or the mini player: a single SID
+  file plays directly, several SID files are added to the active playlist, a
+  single M3U playlist starts playing, and several M3U playlists are added to
+  the playlist library (names already in the library are skipped). Mixed
+  SID/M3U drops are rejected with a notice.
 - Emulate and play C64 SID audio, including tunes that use one, two, or three
   SID chips.
 - Configure the SID chip model and the EKV transistor filter for the MOS 6581;
