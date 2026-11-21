@@ -24,6 +24,8 @@ serde_json = "1"
 sha2 = "0.10"
 # Random playlist generation from the loaded HVSC index.
 rand = "0.9"
+# Native window handle used for OS-level mini-player opacity.
+raw-window-handle = "0.6"
 
 # Embeds icon/sidcraft.ico into the Windows executable so Explorer, the task
 # bar and Alt+Tab show the application icon.
@@ -33,7 +35,11 @@ winres = "0.1"
 # Lets the process set an explicit AppUserModelID, so Windows shows the
 # SidCraft icon (and not a generic one) on the task bar button.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # Windows update archives are distributed as ZIP files.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 

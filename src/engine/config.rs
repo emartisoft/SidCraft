@@ -23,6 +23,10 @@ fn default_viz_mode() -> String {
     "scope".to_string()
 }
 
+const fn default_mini_opacity() -> f32 {
+    0.64
+}
+
 /// User configuration stored in config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -62,6 +66,25 @@ pub struct Config {
     /// Whether the window was maximized when the app last closed.
     #[serde(default)]
     pub window_maximized: bool,
+    /// Last mini-player x position in points.
+    #[serde(default)]
+    pub mini_x: Option<f32>,
+    /// Last mini-player y position in points.
+    #[serde(default)]
+    pub mini_y: Option<f32>,
+    /// Last mini-player width in points.
+    #[serde(default)]
+    pub mini_width: Option<f32>,
+    /// Last mini-player height in points.
+    #[serde(default)]
+    pub mini_height: Option<f32>,
+    /// Mini-player window opacity, from 0.25 (translucent) to 1.0 (opaque).
+    /// Fresh installs start at 0.64 (64%); existing saved values are kept.
+    #[serde(default = "default_mini_opacity")]
+    pub mini_opacity: f32,
+    /// Open directly in the frameless mini player on launch.
+    #[serde(default)]
+    pub start_in_mini: bool,
 }
 
 impl Default for Config {
@@ -79,6 +102,12 @@ impl Default for Config {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            mini_x: None,
+            mini_y: None,
+            mini_width: None,
+            mini_height: None,
+            mini_opacity: default_mini_opacity(),
+            start_in_mini: false,
         }
     }
 }

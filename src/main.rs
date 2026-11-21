@@ -10,6 +10,7 @@ mod theme;
 mod ui;
 mod update;
 mod visuals;
+mod window_alpha;
 
 use eframe::egui;
 use engine::audio::AudioOutput;
@@ -160,6 +161,36 @@ pub enum RepeatMode {
     One,
     /// Restart the playlist from its first track when it ends.
     All,
+}
+
+/// Smallest size of the full shell window.
+const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 520.0];
+/// Effectively unconstrained maximum while the full shell is open.
+const FULL_MAX_SIZE: [f32; 2] = [16384.0, 16384.0];
+/// Size used the first time the mini player is opened.
+const MINI_DEFAULT_SIZE: [f32; 2] = [400.0, 300.0];
+/// Limits the user can resize the mini player to: large enough for the
+/// visualiser and controls, but small enough never to take over the desktop.
+const MINI_MIN_SIZE: [f32; 2] = [320.0, 200.0];
+const MINI_MAX_SIZE: [f32; 2] = [640.0, 480.0];
+
+/// Full-shell geometry saved while the mini player is active, so leaving it
+/// restores the window the user came from.
+#[derive(Clone, Copy)]
+struct MiniRestore {
+    inner_size: egui::Vec2,
+    outer_pos: egui::Pos2,
+    maximized: bool,
+}
+
+/// Viewport bounds just sent to the OS during a mini/full switch. Until the
+/// viewport reports them back, the values still belong to the old mode and
+/// must not be written into the new mode's saved geometry.
+struct PendingGeometry {
+    inner_size: Option<egui::Vec2>,
+    outer_pos: Option<egui::Pos2>,
+    maximized: Option<bool>,
+    at: Instant,
 }
 
 /// Destructive playlist operation waiting for a Yes/No confirmation.
@@ -345,9 +376,29 @@ pub struct SidcraftApp {
     applied_theme: Option<theme::ThemeKind>,
     /// Last title sent to the OS title bar, so it is only updated on change.
     window_title: String,
+    /// Native handle used to apply OS-level mini-player opacity.
+    #[cfg(not(target_arch = "wasm32"))]
+    window_handle: Option<raw_window_handle::RawWindowHandle>,
+    /// Last alpha actually sent to the OS, to avoid redundant Win32 calls.
+    #[cfg(not(target_arch = "wasm32"))]
+    last_window_alpha: Option<u8>,
     pub viz_mode: VizMode,
     pub left_open: bool,
     pub right_open: bool,
+    /// Frameless compact player; the shell is hidden while it is active.
+    mini_mode: bool,
+    /// Mini-player window opacity, applied to its framebuffer on all platforms.
+    pub mini_opacity: f32,
+    /// Open in mini mode on the first rendered frame, then clear the request.
+    mini_start_pending: bool,
+    /// Open directly in the mini player on every launch.
+    pub start_in_mini: bool,
+    /// Full-shell geometry saved when the mini player was entered.
+    mini_restore: Option<MiniRestore>,
+    /// Geometry just sent to the OS while switching between mini and full.
+    /// Until it lands (or a short grace period passes) the viewport still
+    /// reports the old mode's bounds, so geometry recording is suspended.
+    pending_geometry: Option<PendingGeometry>,
     pub show_about: bool,
     pub global_search: String,
     config: Config,
@@ -656,9 +707,19 @@ impl SidcraftApp {
             },
             applied_theme: None,
             window_title: "SidCraft".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            window_handle: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_window_alpha: None,
             viz_mode: VizMode::from_config(&config.viz_mode),
             left_open: config.left_panel,
             right_open: config.right_panel,
+            mini_mode: false,
+            mini_opacity: config.mini_opacity.clamp(0.25, 1.0),
+            mini_start_pending: config.start_in_mini,
+            start_in_mini: config.start_in_mini,
+            mini_restore: None,
+            pending_geometry: None,
             show_about: false,
             global_search: String::new(),
             config,
@@ -675,6 +736,12 @@ impl SidcraftApp {
             export_output_dir: None,
             export_last_path: None,
         };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use raw_window_handle::HasWindowHandle;
+            app.window_handle = cc.window_handle().ok().map(|h| h.as_raw().clone());
+        }
 
         if !sid_file.name.is_empty() {
             app.load_sid_direct(sid_file, Some(initial_song), initial_source);
@@ -716,6 +783,8 @@ impl SidcraftApp {
             || self.config.viz_mode != viz
             || self.config.ekv_filter != self.ekv_filter
             || self.config.active_playlist.as_deref() != Some(active.as_str())
+            || (self.config.mini_opacity - self.mini_opacity).abs() > 0.001
+            || self.config.start_in_mini != self.start_in_mini
         {
             self.config.theme = theme.to_string();
             self.config.left_panel = self.left_open;
@@ -723,6 +792,8 @@ impl SidcraftApp {
             self.config.viz_mode = viz.to_string();
             self.config.ekv_filter = self.ekv_filter;
             self.config.active_playlist = Some(active);
+            self.config.mini_opacity = self.mini_opacity;
+            self.config.start_in_mini = self.start_in_mini;
             self.config.save();
         }
     }
@@ -1999,43 +2070,103 @@ impl SidcraftApp {
         if minimized == Some(true) {
             return;
         }
+
+        // A mode switch changes decorations, size and position asynchronously.
+        // Until the viewport matches what we requested, its bounds still
+        // describe the previous mode; recording them would overwrite the saved
+        // geometry with stale values (the window then "grows" next switch).
+        let mut clear_pending = false;
+        let ready = match self.pending_geometry.as_ref() {
+            Some(pending) => {
+                let size_ok = pending.inner_size.map_or(true, |want| {
+                    inner.is_some_and(|r| (r.size() - want).abs().max_elem() < 2.0)
+                });
+                let pos_ok = pending.outer_pos.map_or(true, |want| {
+                    outer.is_some_and(|r| (r.min - want).abs().max_elem() < 2.0)
+                });
+                let max_ok = pending
+                    .maximized
+                    .map_or(true, |want| maximized.is_some_and(|v| v == want));
+                if (size_ok && pos_ok && max_ok)
+                    || pending.at.elapsed() >= Duration::from_millis(1000)
+                {
+                    clear_pending = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        };
+        if clear_pending {
+            self.pending_geometry = None;
+        }
+        if !ready {
+            return;
+        }
+
         let mut changed = false;
 
-        if let Some(inner) = inner {
-            let (w, h) = (inner.width(), inner.height());
-            if self
-                .config
-                .window_width
-                .map_or(true, |v| (v - w).abs() > 0.5)
+        if self.mini_mode {
+            if let Some(inner) = inner {
+                let (w, h) = (inner.width(), inner.height());
+                if self.config.mini_width.map_or(true, |v| (v - w).abs() > 0.5) {
+                    self.config.mini_width = Some(w);
+                    changed = true;
+                }
+                if self.config.mini_height.map_or(true, |v| (v - h).abs() > 0.5) {
+                    self.config.mini_height = Some(h);
+                    changed = true;
+                }
+            }
+            if let Some(outer) = outer {
+                let (x, y) = (outer.min.x, outer.min.y);
+                if self.config.mini_x.map_or(true, |v| (v - x).abs() > 0.5) {
+                    self.config.mini_x = Some(x);
+                    changed = true;
+                }
+                if self.config.mini_y.map_or(true, |v| (v - y).abs() > 0.5) {
+                    self.config.mini_y = Some(y);
+                    changed = true;
+                }
+            }
+        } else {
+            if let Some(inner) = inner {
+                let (w, h) = (inner.width(), inner.height());
+                if self
+                    .config
+                    .window_width
+                    .map_or(true, |v| (v - w).abs() > 0.5)
+                {
+                    self.config.window_width = Some(w);
+                    changed = true;
+                }
+                if self
+                    .config
+                    .window_height
+                    .map_or(true, |v| (v - h).abs() > 0.5)
+                {
+                    self.config.window_height = Some(h);
+                    changed = true;
+                }
+            }
+            if let Some(outer) = outer {
+                let (x, y) = (outer.min.x, outer.min.y);
+                if self.config.window_x.map_or(true, |v| (v - x).abs() > 0.5) {
+                    self.config.window_x = Some(x);
+                    changed = true;
+                }
+                if self.config.window_y.map_or(true, |v| (v - y).abs() > 0.5) {
+                    self.config.window_y = Some(y);
+                    changed = true;
+                }
+            }
+            if let Some(maximized) = maximized
+                && maximized != self.config.window_maximized
             {
-                self.config.window_width = Some(w);
+                self.config.window_maximized = maximized;
                 changed = true;
             }
-            if self
-                .config
-                .window_height
-                .map_or(true, |v| (v - h).abs() > 0.5)
-            {
-                self.config.window_height = Some(h);
-                changed = true;
-            }
-        }
-        if let Some(outer) = outer {
-            let (x, y) = (outer.min.x, outer.min.y);
-            if self.config.window_x.map_or(true, |v| (v - x).abs() > 0.5) {
-                self.config.window_x = Some(x);
-                changed = true;
-            }
-            if self.config.window_y.map_or(true, |v| (v - y).abs() > 0.5) {
-                self.config.window_y = Some(y);
-                changed = true;
-            }
-        }
-        if let Some(maximized) = maximized
-            && maximized != self.config.window_maximized
-        {
-            self.config.window_maximized = maximized;
-            changed = true;
         }
 
         if changed {
@@ -2049,6 +2180,111 @@ impl SidcraftApp {
             self.config.save();
             self.geometry_dirty = false;
             self.geometry_saved_at = Some(Instant::now());
+        }
+    }
+
+    /// Apply OS-level opacity where available. `255` means fully opaque.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_window_alpha(&self, alpha: u8, previous: Option<u8>) {
+        if let Some(handle) = &self.window_handle {
+            window_alpha::set_alpha(handle, alpha, previous);
+        }
+    }
+
+    /// Switches to the compact, frameless player. The current window size and
+    /// position are saved so [`Self::exit_mini_mode`] can restore them.
+    pub fn enter_mini_mode(&mut self, ctx: &egui::Context) {
+        if self.mini_mode {
+            return;
+        }
+        let (inner, outer, maximized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.inner_rect, vp.outer_rect, vp.maximized)
+        });
+        self.mini_restore = Some(MiniRestore {
+            inner_size: inner.map_or(
+                egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]),
+                |rect| rect.size(),
+            ),
+            outer_pos: outer.map_or(egui::pos2(80.0, 80.0), |rect| rect.min),
+            maximized: maximized.unwrap_or(false),
+        });
+        self.mini_mode = true;
+
+        let min_size = egui::vec2(MINI_MIN_SIZE[0], MINI_MIN_SIZE[1]);
+        let max_size = egui::vec2(MINI_MAX_SIZE[0], MINI_MAX_SIZE[1]);
+        let size = match (self.config.mini_width, self.config.mini_height) {
+            (Some(w), Some(h)) => egui::vec2(
+                w.clamp(MINI_MIN_SIZE[0], MINI_MAX_SIZE[0]),
+                h.clamp(MINI_MIN_SIZE[1], MINI_MAX_SIZE[1]),
+            ),
+            _ => egui::vec2(MINI_DEFAULT_SIZE[0], MINI_DEFAULT_SIZE[1]),
+        };
+        if self.mini_restore.map_or(false, |restore| restore.maximized) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        // Remove the frame *before* setting InnerSize. On Windows a style
+        // change preserves the outer rect, so resizing first would let the
+        // freed title bar/border enlarge the frameless client area.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        // The full shell has a 760x520 minimum; lower it before resizing or
+        // the OS clamps the mini window back to the large size. The upper
+        // bound keeps the compact player from covering the desktop.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(max_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+
+        // Reopen where the mini player was last left. `remember_window` waits
+        // for both this position and the size above before saving again.
+        let saved_pos = match (self.config.mini_x, self.config.mini_y) {
+            (Some(x), Some(y)) => Some(egui::pos2(x, y)),
+            _ => None,
+        };
+        if let Some(pos) = saved_pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
+        self.pending_geometry = Some(PendingGeometry {
+            inner_size: Some(size),
+            outer_pos: saved_pos,
+            maximized: Some(false),
+            at: Instant::now(),
+        });
+    }
+
+    /// Leaves the mini player and restores the full shell window.
+    pub fn exit_mini_mode(&mut self, ctx: &egui::Context) {
+        if !self.mini_mode {
+            return;
+        }
+        self.mini_mode = false;
+        let restore = self.mini_restore.take();
+        // Keep geometry recording suspended until the full shell's bounds are
+        // actually reported; otherwise the mini size gets saved as the full
+        // window size (and the shell comes back at the wrong size).
+        self.pending_geometry = Some(PendingGeometry {
+            inner_size: restore.filter(|r| !r.maximized).map(|r| r.inner_size),
+            outer_pos: restore.filter(|r| !r.maximized).map(|r| r.outer_pos),
+            maximized: restore.map(|r| r.maximized),
+            at: Instant::now(),
+        });
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            MIN_WINDOW_SIZE[0],
+            MIN_WINDOW_SIZE[1],
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+            FULL_MAX_SIZE[0],
+            FULL_MAX_SIZE[1],
+        )));
+        if let Some(restore) = restore {
+            if restore.maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(restore.inner_size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(restore.outer_pos));
+            }
         }
     }
 
@@ -2157,7 +2393,10 @@ fn main() -> eframe::Result<()> {
             config.window_width.unwrap_or(1180.0),
             config.window_height.unwrap_or(760.0),
         ])
-        .with_min_inner_size([760.0, 520.0]);
+        .with_min_inner_size(MIN_WINDOW_SIZE)
+        // Required for the mini player's opacity setting: the OpenGL surface
+        // needs an alpha channel. The full shell still clears to opaque.
+        .with_transparent(true);
     if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
         viewport = viewport.with_position([x, y]);
     }

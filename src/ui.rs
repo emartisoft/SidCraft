@@ -30,6 +30,22 @@ use crate::{ConfirmAction, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode};
 
 impl eframe::App for SidcraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // winit rewrites the extended window style when it applies viewport
+        // commands, which drops WS_EX_LAYERED. Re-assert the OS-level alpha on
+        // every mini frame so the opacity setting cannot be undone by that.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = if self.mini_mode {
+                (self.mini_opacity * 255.0).round() as u8
+            } else {
+                255
+            };
+            if self.mini_mode || self.last_window_alpha != Some(target) {
+                self.apply_window_alpha(target, self.last_window_alpha);
+                self.last_window_alpha = Some(target);
+            }
+        }
+
         self.handle_open_requests(ctx);
         self.handle_async_hvsc();
         self.handle_seek();
@@ -116,6 +132,13 @@ impl eframe::App for SidcraftApp {
             Tokens::store(ctx, Tokens::for_kind(kind));
         }
 
+        // Do this once the first viewport info is available, so the full-shell
+        // geometry stored for the later exit is the real one, not a fallback.
+        if self.mini_start_pending {
+            self.mini_start_pending = false;
+            self.enter_mini_mode(ctx);
+        }
+
         self.keyboard_shortcuts(ctx);
         self.sync_config();
         self.remember_window(ctx);
@@ -134,33 +157,37 @@ impl eframe::App for SidcraftApp {
             self.window_title = title;
         }
 
-        self.mode_bar(ctx);
-        self.status_bar(ctx);
-        self.right_rail(ctx);
-        if self.right_open {
-            self.right_panel(ctx);
-        }
-        if self.left_open {
-            self.left_panel(ctx);
-        }
-        self.central(ctx);
-        if self.show_about {
-            self.about_window(ctx);
-        }
-        if self.show_new_playlist {
-            self.new_playlist_window(ctx);
-        }
-        if self.show_rename_playlist {
-            self.rename_playlist_window(ctx);
-        }
-        if self.confirm_action.is_some() {
-            self.confirm_window(ctx);
-        }
-        if self.random_list_result.is_some() {
-            self.random_list_result_window(ctx);
-        }
-        if self.show_update_dialog {
-            self.update_window(ctx);
+        if self.mini_mode {
+            self.mini_player(ctx);
+        } else {
+            self.mode_bar(ctx);
+            self.status_bar(ctx);
+            self.right_rail(ctx);
+            if self.right_open {
+                self.right_panel(ctx);
+            }
+            if self.left_open {
+                self.left_panel(ctx);
+            }
+            self.central(ctx);
+            if self.show_about {
+                self.about_window(ctx);
+            }
+            if self.show_new_playlist {
+                self.new_playlist_window(ctx);
+            }
+            if self.show_rename_playlist {
+                self.rename_playlist_window(ctx);
+            }
+            if self.confirm_action.is_some() {
+                self.confirm_window(ctx);
+            }
+            if self.random_list_result.is_some() {
+                self.random_list_result_window(ctx);
+            }
+            if self.show_update_dialog {
+                self.update_window(ctx);
+            }
         }
 
         // Repaint only as fast as needed: real-time visuals/timing while playing
@@ -182,9 +209,249 @@ impl eframe::App for SidcraftApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
     }
+
+    /// Renderer-level transparency. The viewport is created with an alpha
+    /// channel, so the mini player's clear colour can be faded to let the
+    /// desktop show through; the full shell clears fully opaque.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let alpha = if self.mini_mode { self.mini_opacity } else { 1.0 };
+        egui::Color32::from_rgba_unmultiplied(
+            12,
+            12,
+            12,
+            (alpha * 255.0).round() as u8,
+        )
+        .to_normalized_gamma_f32()
+    }
 }
 
 impl SidcraftApp {
+    // ── mini player ─────────────────────────────────────────────────────────
+
+    /// Draws the compact frameless player. The OS title bar is removed by
+    /// `enter_mini_mode`; the header strip drags the window and the button in
+    /// its corner returns to the full shell.
+    fn mini_player(&mut self, ctx: &egui::Context) {
+        // Apply the opacity to the local token copy only; the rest of the
+        // shell keeps its normal palette.
+        let alpha = (self.mini_opacity * 255.0).round() as u8;
+        let t = Tokens::get(ctx).with_opacity(alpha);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .inner_margin(Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let content_h = ui.available_height();
+
+                // ── title block, also the window drag handle ────────────────
+                let (header_rect, header) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), 44.0),
+                    Sense::click_and_drag(),
+                );
+                let expand_rect = Rect::from_min_size(
+                    pos2(header_rect.right() - 26.0, header_rect.top() + 1.0),
+                    Vec2::splat(24.0),
+                );
+                let pointer = ui.ctx().pointer_latest_pos();
+                let over_expand = pointer.is_some_and(|p| expand_rect.contains(p));
+                let text_w = (header_rect.width() - 32.0).max(1.0);
+
+                let title = self.track_title();
+                paint_text_elided(
+                    ui,
+                    pos2(header_rect.left(), header_rect.top() + 2.0),
+                    Align2::LEFT_TOP,
+                    &title,
+                    theme::semibold(14.5),
+                    t.text,
+                    text_w,
+                );
+                let author = if self.sid_file.author.is_empty() {
+                    "Unknown author".to_string()
+                } else if self.sid_file.released.is_empty() {
+                    self.sid_file.author.clone()
+                } else {
+                    format!("{}  ·  {}", self.sid_file.author, self.sid_file.released)
+                };
+                paint_text_elided(
+                    ui,
+                    pos2(header_rect.left(), header_rect.top() + 23.0),
+                    Align2::LEFT_TOP,
+                    &author,
+                    theme::regular(11.5),
+                    t.text_muted,
+                    text_w,
+                );
+
+                let expand = {
+                    let resp =
+                        ui.interact(expand_rect, ui.id().with("mini-expand"), Sense::click());
+                    if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(expand_rect, CornerRadius::same(6), t.hover);
+                    }
+                    paint_icon(
+                        ui.painter(),
+                        expand_rect.shrink(5.0),
+                        "maximize",
+                        if resp.hovered() { t.accent } else { t.text_muted },
+                        1.5,
+                    );
+                    theme::hand(resp)
+                        .on_hover_text("Exit mini player")
+                        .clicked()
+                };
+
+                if header.drag_started() && !over_expand {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if header.double_clicked() && !over_expand {
+                    self.exit_mini_mode(ctx);
+                    return;
+                }
+                if header.hovered() && !over_expand {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                }
+                if expand {
+                    self.exit_mini_mode(ctx);
+                    return;
+                }
+
+                // ── visualiser, between the track info and the buttons ─────
+                // The full player's display has a large clock and ticker; the
+                // compact variant draws only the selected visualiser in a
+                // small framed area that fits the remaining space.
+                const TRANSPORT_H: f32 = 40.0;
+                const ROW_GAP: f32 = 4.0;
+                let viz_h = (content_h - 44.0 - TRANSPORT_H - ROW_GAP * 2.0).max(60.0);
+                ui.add_space(ROW_GAP);
+                let (viz_rect, viz) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), viz_h), Sense::click());
+                match self.viz_mode {
+                    VizMode::Scope => self.paint_scope(ui, &t, viz_rect, true),
+                    VizMode::Vu => self.paint_display_vu(ui, &t, viz_rect, true),
+                    VizMode::Spectrum => self.paint_spectrum(ui, &t, viz_rect, true),
+                    VizMode::Spectrogram => self.paint_spectrogram(ui, &t, viz_rect, true),
+                    VizMode::Oscilloscope => self.paint_oscilloscope(ui, &t, viz_rect, true),
+                    VizMode::PianoRoll => self.paint_piano_roll(ui, &t, viz_rect, true),
+                    VizMode::Filter => self.paint_filter(ui, &t, viz_rect, true),
+                    VizMode::Adsr => self.paint_adsr(ui, &t, viz_rect, true),
+                }
+                // Mini-only shortcut: double-click the visualiser to cycle to
+                // the next one, without opening the full shell's selector.
+                if self.mini_mode && viz.double_clicked() {
+                    let next = VizMode::ALL
+                        .iter()
+                        .position(|mode| *mode == self.viz_mode)
+                        .map_or(0, |i| (i + 1) % VizMode::ALL.len());
+                    self.viz_mode = VizMode::ALL[next];
+                }
+                let _ = viz.on_hover_text("Double-click for next visualisation");
+
+                // ── transport and seek bar share the same row ──────────────
+                ui.add_space(ROW_GAP);
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), TRANSPORT_H),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        const PREV_SIZE: f32 = 30.0;
+                        const PLAY_SIZE: f32 = 40.0;
+                        const NEXT_SIZE: f32 = 30.0;
+                        const GAP: f32 = 10.0;
+                        if transport_button(
+                            ui,
+                            &t,
+                            "prev",
+                            PREV_SIZE,
+                            false,
+                            "Previous track",
+                        )
+                        .clicked()
+                        {
+                            self.prev_track();
+                        }
+                        ui.add_space(GAP);
+                        if transport_button(
+                            ui,
+                            &t,
+                            if self.paused { "play" } else { "pause" },
+                            PLAY_SIZE,
+                            true,
+                            "Play / pause",
+                        )
+                        .clicked()
+                        {
+                            self.toggle_pause();
+                        }
+                        ui.add_space(GAP);
+                        if transport_button(ui, &t, "next", NEXT_SIZE, false, "Next track").clicked()
+                        {
+                            self.next_track();
+                        }
+                        // A short gap before the bar, then leave room in the
+                        // corner for the resize grip.
+                        ui.add_space(12.0);
+                        let elapsed = self.current_elapsed();
+                        let total = self.song_timeout;
+                        let fraction =
+                            (elapsed.as_secs_f32() / total.as_secs_f32().max(1.0)).clamp(0.0, 1.0);
+                        let bar_w = (ui.available_width() - 18.0).max(40.0);
+                        ui.allocate_ui_with_layout(
+                            vec2(bar_w, TRANSPORT_H),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                if let Some(f) = seek_bar(ui, &t, fraction) {
+                                    self.seek_to_fraction(f);
+                                }
+                            },
+                        );
+                    },
+                );
+
+                // Frameless windows have no native sizing border, so the OS
+                // cannot resize them by dragging an edge. Put the grip in the
+                // actual window corner; the panel margin clips interactions,
+                // so widen the clip rect while the handle is registered.
+                let screen = ctx.screen_rect();
+                let grip_rect = Rect::from_min_size(
+                    pos2(screen.right() - 18.0, screen.bottom() - 18.0),
+                    Vec2::splat(18.0),
+                );
+                let clip = ui.clip_rect();
+                ui.set_clip_rect(clip.expand(12.0));
+                let grip = ui.interact(
+                    grip_rect,
+                    ui.id().with("mini-resize"),
+                    Sense::click_and_drag(),
+                );
+                if grip.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                        egui::ResizeDirection::SouthEast,
+                    ));
+                }
+                if grip.hovered() {
+                    ctx.set_cursor_icon(CursorIcon::ResizeNwSe);
+                }
+                // Inset the strokes slightly so they stay visible at the corner.
+                let anchor = pos2(grip_rect.right() - 6.0, grip_rect.bottom() - 6.0);
+                let grip_color = if grip.hovered() { t.accent } else { t.text_faint };
+                for i in 0..3 {
+                    let len = 4.0 + i as f32 * 4.0;
+                    ui.painter().line_segment(
+                        [pos2(anchor.x - len, anchor.y), pos2(anchor.x, anchor.y - len)],
+                        Stroke::new(1.5_f32, grip_color),
+                    );
+                }
+                ui.set_clip_rect(clip);
+            });
+    }
+
     // ── keyboard ────────────────────────────────────────────────────────────
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
@@ -202,6 +469,13 @@ impl SidcraftApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
             self.open_file_dialog();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::M) && i.modifiers.command) {
+            if self.mini_mode {
+                self.exit_mini_mode(ctx);
+            } else {
+                self.enter_mini_mode(ctx);
+            }
         }
     }
 
@@ -259,7 +533,11 @@ impl SidcraftApp {
                         // The bar also holds the panel toggles, the theme
                         // switch and About, so let the search field shrink on
                         // narrow windows instead of pushing them out of view.
-                        let search_width = (ui.available_width() - 165.0).clamp(110.0, 240.0);
+                        let search_width = (ui.available_width() - 200.0).clamp(110.0, 240.0);
+                        if icon_button(ui, &t, "mini", 32.0, false, "Mini player (Ctrl+M)").clicked()
+                        {
+                            self.enter_mini_mode(ui.ctx());
+                        }
                         if icon_button(ui, &t, "panel-right", 32.0, self.right_open, "Toggle inspector")
                             .clicked()
                         {
@@ -1086,18 +1364,18 @@ impl SidcraftApp {
 
                                 let (display_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 276.0), Sense::hover());
                                 match self.viz_mode {
-                                    VizMode::Scope => self.paint_scope(ui, &t, display_rect),
-                                    VizMode::Vu => self.paint_display_vu(ui, &t, display_rect),
-                                    VizMode::Spectrum => self.paint_spectrum(ui, &t, display_rect),
+                                    VizMode::Scope => self.paint_scope(ui, &t, display_rect, false),
+                                    VizMode::Vu => self.paint_display_vu(ui, &t, display_rect, false),
+                                    VizMode::Spectrum => self.paint_spectrum(ui, &t, display_rect, false),
                                     VizMode::Spectrogram => {
-                                        self.paint_spectrogram(ui, &t, display_rect);
+                                        self.paint_spectrogram(ui, &t, display_rect, false);
                                     }
                                     VizMode::Oscilloscope => {
-                                        self.paint_oscilloscope(ui, &t, display_rect);
+                                        self.paint_oscilloscope(ui, &t, display_rect, false);
                                     }
-                                    VizMode::PianoRoll => self.paint_piano_roll(ui, &t, display_rect),
-                                    VizMode::Filter => self.paint_filter(ui, &t, display_rect),
-                                    VizMode::Adsr => self.paint_adsr(ui, &t, display_rect),
+                                    VizMode::PianoRoll => self.paint_piano_roll(ui, &t, display_rect, false),
+                                    VizMode::Filter => self.paint_filter(ui, &t, display_rect, false),
+                                    VizMode::Adsr => self.paint_adsr(ui, &t, display_rect, false),
                                 }
 
                                 ui.add_space(10.0);
@@ -1299,12 +1577,29 @@ impl SidcraftApp {
 
     /// Shared LCD chrome: dark panel, status strip and bottom ticker.
     /// Returns the content rectangle the visualisers draw in.
-    fn display_chrome(&self, ui: &egui::Ui, rect: Rect) -> Rect {
+    fn display_chrome(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) -> Rect {
         let painter = ui.painter();
+        if compact {
+            // The mini player only needs the visualiser itself: the large
+            // clock, ticker and status strip of the full display would swamp
+            // a small panel, so draw a plain framed drawing area instead.
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(6),
+                theme::with_alpha(Color32::from_rgb(0x0F, 0x10, 0x14), t.accent.a()),
+            );
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(6),
+                Stroke::new(1.0_f32, Color32::from_white_alpha(22)),
+                StrokeKind::Inside,
+            );
+            return rect.shrink(6.0);
+        }
         painter.rect_filled(
             rect,
             CornerRadius::same(10),
-            Color32::from_rgb(0x0F, 0x10, 0x14),
+            theme::with_alpha(Color32::from_rgb(0x0F, 0x10, 0x14), t.accent.a()),
         );
         painter.rect_stroke(
             rect,
@@ -1359,8 +1654,8 @@ impl SidcraftApp {
         Rect::from_min_max(rect.min + vec2(14.0, 46.0), rect.max - vec2(14.0, 34.0))
     }
 
-    fn paint_scope(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_scope(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
         for i in 1..4 {
             let y = inner.top() + inner.height() * i as f32 / 4.0;
@@ -1404,8 +1699,8 @@ impl SidcraftApp {
         }
     }
 
-    fn paint_display_vu(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_display_vu(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
         let bars = Rect::from_min_max(inner.min, pos2(inner.right(), inner.bottom() - 10.0));
         let count = self.vu_meter.voice_count().max(1);
@@ -1436,8 +1731,8 @@ impl SidcraftApp {
         }
     }
 
-    fn paint_spectrum(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_spectrum(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
 
         for step in 1..4 {
@@ -1499,8 +1794,8 @@ impl SidcraftApp {
         }
     }
 
-    fn paint_spectrogram(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_spectrogram(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
         let columns = self.spectrogram.columns.len();
         if columns == 0 {
@@ -1554,8 +1849,8 @@ impl SidcraftApp {
         );
     }
 
-    fn paint_oscilloscope(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_oscilloscope(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
 
         for step in 1..4 {
@@ -1619,8 +1914,8 @@ impl SidcraftApp {
         painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, color)));
     }
 
-    fn paint_piano_roll(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_piano_roll(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
         let history = &self.note_history;
         if history.is_empty() {
@@ -1684,17 +1979,19 @@ impl SidcraftApp {
                     i += 1;
                     continue;
                 }
-                let note = sample.note;
+                // SID frequency registers can encode notes above the drawn
+                // range; clamping keeps the bar inside the black LCD rect.
+                let note = sample.note.clamp(MIN_NOTE as u8, MAX_NOTE as u8);
                 let mut j = i + 1;
                 while j < n && samples[j].gate && samples[j].note == note {
                     j += 1;
                 }
                 let x0 = inner.left() + inner.width() * i as f32 / n as f32;
                 let x1 = (inner.left() + inner.width() * j as f32 / n as f32).max(x0 + 1.5);
-                let y = top
-                    + usable
-                    - (note as f32 - MIN_NOTE) / (MAX_NOTE - MIN_NOTE) * usable;
                 let h = (usable / (MAX_NOTE - MIN_NOTE) * 1.6).max(1.5);
+                let y = (top + usable
+                    - (note as f32 - MIN_NOTE) / (MAX_NOTE - MIN_NOTE) * usable)
+                    .clamp(top + h / 2.0, top + usable - h / 2.0);
                 painter.rect_filled(
                     Rect::from_min_max(pos2(x0, y - h / 2.0), pos2(x1, y + h / 2.0)),
                     CornerRadius::same(1),
@@ -1705,8 +2002,8 @@ impl SidcraftApp {
         }
     }
 
-    fn paint_filter(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_filter(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
         let infos = &self.filter_infos;
         if infos.is_empty() {
@@ -1911,8 +2208,8 @@ impl SidcraftApp {
         }
     }
 
-    fn paint_adsr(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let inner = self.display_chrome(ui, rect);
+    fn paint_adsr(&self, ui: &egui::Ui, t: &Tokens, rect: Rect, compact: bool) {
+        let inner = self.display_chrome(ui, t, rect, compact);
         let painter = ui.painter();
 
         let curves = &self.envelope_curves;
@@ -3100,6 +3397,44 @@ impl SidcraftApp {
                             if mode != self.viz_mode {
                                 self.viz_mode = mode;
                             }
+                        });
+
+                        settings_card(ui, &t, "Mini player", |ui| {
+                            ui.label(
+                                RichText::new("Opacity")
+                                    .font(theme::medium(12.5))
+                                    .color(t.text),
+                            );
+                            let mut opacity = self.mini_opacity;
+                            ui.add(
+                                egui::Slider::new(&mut opacity, 0.25..=1.0)
+                                    .text("")
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                            );
+                            if (opacity - self.mini_opacity).abs() > 0.001 {
+                                self.mini_opacity = opacity;
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Transparency is drawn by SidCraft and works on Windows, \
+                                     macOS and Linux desktops.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                            ui.add_space(8.0);
+                            let mut start = self.start_in_mini;
+                            if ui.checkbox(&mut start, "Start in mini player").changed() {
+                                self.start_in_mini = start;
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Opens the frameless player on launch. Return to the full \
+                                     shell with the expand button or Ctrl+M.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
                         });
 
                         settings_card(ui, &t, "Playback", |ui| {
@@ -5466,6 +5801,30 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             painter.circle_stroke(c, s * 0.34, stroke);
             line(pos2(r.right() - s * 0.2, r.top() + s * 0.1), pos2(r.right() - s * 0.12, r.top() + s * 0.26));
             line(pos2(r.right() - s * 0.2, r.top() + s * 0.1), pos2(r.right() - s * 0.36, r.top() + s * 0.14));
+        }
+        "mini" => {
+            // A small player frame sitting inside the full shell.
+            let outer = r.shrink(s * 0.08);
+            painter.rect_stroke(outer, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            let inner = Rect::from_min_size(
+                pos2(
+                    outer.left() + outer.width() * 0.14,
+                    outer.bottom() - outer.height() * 0.54,
+                ),
+                vec2(outer.width() * 0.54, outer.height() * 0.38),
+            );
+            painter.rect_filled(inner, CornerRadius::same(1), color);
+        }
+        "maximize" => {
+            // Four outward corners: leave the compact player.
+            let b = r.shrink(s * 0.1);
+            let arm = s * 0.22;
+            for (x, sx) in [(b.left(), 1.0), (b.right(), -1.0)] {
+                for (y, sy) in [(b.top(), 1.0), (b.bottom(), -1.0)] {
+                    line(pos2(x + sx * arm, y), pos2(x, y));
+                    line(pos2(x, y), pos2(x, y + sy * arm));
+                }
+            }
         }
         _ => {
             painter.circle_stroke(c, s * 0.32, stroke);

@@ -57,6 +57,16 @@ impl ThemePreference {
     }
 }
 
+/// Scale a colour's alpha by `alpha` (0..=255), preserving its RGB channels.
+pub fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        ((color.a() as u16 * alpha as u16) / 255) as u8,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens {
     pub kind: ThemeKind,
@@ -148,6 +158,32 @@ impl Tokens {
             .unwrap_or_else(|| Self::for_kind(ThemeKind::Dark))
     }
 
+    /// Scale every token alpha by `alpha` (0..=255), keeping the same palette.
+    /// Used by the frameless mini player to apply its opacity setting without
+    /// changing the tokens stored for the rest of the shell.
+    pub fn with_opacity(mut self, alpha: u8) -> Self {
+        self.titlebar = with_alpha(self.titlebar, alpha);
+        self.chrome = with_alpha(self.chrome, alpha);
+        self.panel = with_alpha(self.panel, alpha);
+        self.pasteboard = with_alpha(self.pasteboard, alpha);
+        self.card = with_alpha(self.card, alpha);
+        self.border = with_alpha(self.border, alpha);
+        self.divider = with_alpha(self.divider, alpha);
+        self.text = with_alpha(self.text, alpha);
+        self.text_muted = with_alpha(self.text_muted, alpha);
+        self.text_faint = with_alpha(self.text_faint, alpha);
+        self.icon = with_alpha(self.icon, alpha);
+        self.hover = with_alpha(self.hover, alpha);
+        self.pressed = with_alpha(self.pressed, alpha);
+        self.selected = with_alpha(self.selected, alpha);
+        self.accent = with_alpha(self.accent, alpha);
+        self.accent_text = with_alpha(self.accent_text, alpha);
+        self.accent_soft = with_alpha(self.accent_soft, alpha);
+        self.field = with_alpha(self.field, alpha);
+        self.page_shadow = with_alpha(self.page_shadow, alpha);
+        self
+    }
+
     pub fn dark(&self) -> bool {
         self.kind == ThemeKind::Dark
     }
@@ -170,7 +206,9 @@ impl Tokens {
         if index == 0 {
             self.accent
         } else {
-            VOICES[index % VOICES.len()]
+            // `accent.a()` carries the mini player's opacity after
+            // `with_opacity`, so the fixed voice colours follow it too.
+            with_alpha(VOICES[index % VOICES.len()], self.accent.a())
         }
     }
 }
