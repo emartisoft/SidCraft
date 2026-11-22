@@ -156,15 +156,19 @@ impl VizMode {
     }
 }
 
-/// How the player reacts when the end of a track is reached.
+/// Whether the player restarts the current tune when it reaches the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepeatMode {
-    /// Keep playing the next track in the playlist (default).
+    /// Advance to the next subsong/track (default).
     Off,
-    /// Restart the current track when it ends.
+    /// Restart the current subsong when it ends.
     One,
-    /// Restart the playlist from its first track when it ends.
-    All,
+}
+
+impl RepeatMode {
+    pub fn is_active(self) -> bool {
+        self == Self::One
+    }
 }
 
 /// Smallest size of the full shell window.
@@ -1403,12 +1407,45 @@ impl SidcraftApp {
         }
     }
 
-    pub fn next_track(&mut self) {
+    /// Restarts the current tune, whether or not it came from a playlist.
+    fn restart_current_song(&mut self) {
+        if self.current_song >= 1 {
+            self.change_subsong(self.current_song);
+        } else if !self.playlist.is_empty() {
+            self.play_playlist_index(self.selected_playlist_idx);
+        }
+    }
+
+    /// Handles the song-length deadline: repeat, next subsong, or next track.
+    pub fn handle_track_end(&mut self) {
+        self.track_gap_until = None;
+        if self.repeat_mode.is_active() {
+            self.restart_current_song();
+            return;
+        }
+        if self.current_song < self.total_songs {
+            self.change_subsong(self.current_song + 1);
+            return;
+        }
         if !self.playlist.is_empty() {
-            let next = if self.repeat_mode == RepeatMode::One {
-                // Repeat one: replay the current track.
-                self.selected_playlist_idx
-            } else if self.shuffle && self.playlist.len() > 1 {
+            // 1 second silence between playlist track transitions.
+            self.track_gap_until = Some(Instant::now() + Duration::from_secs(1));
+            self.paused = true;
+            self.song_elapsed = self.song_timeout;
+            if let Ok(mut p) = self.player.lock() {
+                if !p.is_paused() {
+                    p.toggle_pause();
+                }
+            }
+            return;
+        }
+        self.next_track();
+    }
+
+    pub fn next_track(&mut self) {
+        self.track_gap_until = None;
+        if !self.playlist.is_empty() {
+            let next = if self.shuffle && self.playlist.len() > 1 {
                 let len = self.playlist.len();
                 let mut idx = self.random_playlist_index(len, self.selected_playlist_idx);
                 if idx == self.selected_playlist_idx {
@@ -1425,15 +1462,7 @@ impl SidcraftApp {
     }
 
     pub fn prev_track(&mut self) {
-        if self.repeat_mode == RepeatMode::One {
-            // Repeat one: restart the current track.
-            if !self.playlist.is_empty() {
-                self.play_playlist_index(self.selected_playlist_idx);
-            } else if self.current_song > 1 {
-                self.change_subsong(self.current_song - 1);
-            }
-            return;
-        }
+        self.track_gap_until = None;
         if !self.playlist.is_empty() {
             let prev = if self.selected_playlist_idx == 0 {
                 self.playlist.len().saturating_sub(1)
@@ -1467,12 +1496,11 @@ impl SidcraftApp {
         idx
     }
 
-    /// Cycles the repeat mode: off -> one -> all -> off.
-    pub fn cycle_repeat(&mut self) {
+    /// Toggles repeat-one for the currently playing tune.
+    pub fn toggle_repeat(&mut self) {
         self.repeat_mode = match self.repeat_mode {
             RepeatMode::Off => RepeatMode::One,
-            RepeatMode::One => RepeatMode::All,
-            RepeatMode::All => RepeatMode::Off,
+            RepeatMode::One => RepeatMode::Off,
         };
     }
 

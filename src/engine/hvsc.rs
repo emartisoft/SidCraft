@@ -693,8 +693,11 @@ impl HvscBrowser {
     /// Returns song duration for given MD5 and subsong (1-indexed), if available.
     pub fn song_duration(&self, md5: &str, subsong: u16) -> Option<std::time::Duration> {
         let durations = self.songlengths.as_ref()?.get(md5)?;
-        // Subsongs are 1-indexed, array is 0-indexed
-        durations.get(subsong.saturating_sub(1) as usize).copied()
+        // Subsongs are 1-indexed, array is 0-indexed.
+        let duration = durations.get(subsong.saturating_sub(1) as usize).copied()?;
+        // HVSC contains a few 00:00 entries. A zero deadline never satisfies the
+        // player's end-of-track check, so surface/play those as one-second tunes.
+        Some(duration.max(std::time::Duration::from_secs(1)))
     }
 
     /// Returns true if we can navigate up.
@@ -1034,6 +1037,34 @@ fn parse_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_song_lengths_are_clamped_to_one_second() {
+        let mut browser = HvscBrowser::new(DEFAULT_HVSC_URL);
+        let mut database = SonglengthsDatabase::default();
+        database.entries.insert(
+            "abc123".to_string(),
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(2),
+            ],
+        );
+        browser.songlengths = Some(Arc::new(database));
+
+        assert_eq!(
+            browser.song_duration("abc123", 1),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            browser.song_duration("abc123", 2),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            browser.song_duration("abc123", 3),
+            Some(std::time::Duration::from_secs(2))
+        );
+    }
 
     #[test]
     fn mirror_urls_handle_both_built_in_styles() {

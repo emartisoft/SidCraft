@@ -27,7 +27,7 @@ use crate::engine::playlist::playlist_display_name;
 use crate::theme::{self, AccentColor, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
 use crate::{
-    ConfirmAction, PlaylistDownloadProgress, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode,
+    ConfirmAction, PlaylistDownloadProgress, SidcraftApp, UpdatePhase, View, VizMode,
 };
 
 impl eframe::App for SidcraftApp {
@@ -104,25 +104,10 @@ impl eframe::App for SidcraftApp {
             let elapsed = self.current_elapsed();
             if !self.paused
                 && !self.seeking
-                && self.song_timeout.as_secs() > 0
+                && !self.song_timeout.is_zero()
                 && elapsed >= self.song_timeout
             {
-                if self.current_song < self.total_songs {
-                    self.change_subsong(self.current_song + 1);
-                } else if !self.playlist.is_empty() {
-                    // 1 second silence between playlist track transitions.
-                    self.track_gap_until = Some(Instant::now() + Duration::from_secs(1));
-                    self.paused = true;
-                    self.song_elapsed = self.song_timeout;
-                    if let Ok(mut p) = self.player.lock() {
-                        if !p.is_paused() {
-                            p.toggle_pause();
-                        }
-                    }
-                } else {
-                    // No playlist: keep previous behavior.
-                    self.next_track();
-                }
+                self.handle_track_end();
             }
         }
 
@@ -1511,8 +1496,8 @@ impl SidcraftApp {
                                             self.shuffle = !self.shuffle;
                                         }
                                         ui.add_space(TRANSPORT_GAP);
-                                        if icon_button_glyph(ui, &t, "repeat", TOGGLE_SIZE, 20.0, 1.9, self.repeat_mode != RepeatMode::Off, "Repeat").clicked() {
-                                            self.cycle_repeat();
+                                        if icon_button_glyph(ui, &t, "repeat", TOGGLE_SIZE, 20.0, 1.9, self.repeat_mode.is_active(), "Repeat").clicked() {
+                                            self.toggle_repeat();
                                         }
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                             ui.add_sized(
