@@ -57,7 +57,7 @@ Examples:
 | File | Description |
 | --- | --- |
 | `dist/SidCraft.app` | macOS application bundle |
-| `dist/SidCraft-<version>.dmg` | The version number is read from `Cargo.toml` |
+| `dist/SidCraft-<version>-macos.dmg` | The version number is read from `Cargo.toml` |
 
 The `.app` bundle contains:
 

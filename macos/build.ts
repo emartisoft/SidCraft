@@ -15,9 +15,9 @@ type Command = "all" | "app" | "dmg" | "help";
 const HELP = `Usage: bun macos/build.ts <command> [options]
 
 Commands:
-  all    Build ${APP_NAME}.app and ${APP_NAME}-<version>.dmg (default)
+  all    Build ${APP_NAME}.app and ${APP_NAME}-<version>-macos.dmg (default)
   app    Build only ${APP_NAME}.app
-  dmg    Build ${APP_NAME}.app and ${APP_NAME}-<version>.dmg
+  dmg    Build ${APP_NAME}.app and ${APP_NAME}-<version>-macos.dmg
   help   Show this help
 
 Options:
@@ -220,7 +220,7 @@ async function buildApp(version: string, sign: boolean): Promise<string> {
 
 async function buildDmg(appDir: string, version: string): Promise<string> {
   const stage = join(DIST, ".dmg-stage");
-  const dmg = join(DIST, `${APP_NAME}-${version}.dmg`);
+  const dmg = join(DIST, `${APP_NAME}-${version}-macos.dmg`);
 
   rmSync(stage, { recursive: true, force: true });
   rmSync(dmg, { force: true });

@@ -23,7 +23,7 @@ export interface BuildOptions {
  *   2. generate the hicolor icon set with Bun.Image
  *   3. assemble target/appimage/SidCraft.AppDir
  *   4. fetch appimagetool if missing
- *   5. write SidCraft-<version>-<arch>.AppImage to dist/
+ *   5. write SidCraft-<version>-linux-<arch>.AppImage to dist/
  */
 export async function build(options: BuildOptions = {}): Promise<string> {
   if (!options.skipBuild) {
@@ -47,7 +47,7 @@ export async function build(options: BuildOptions = {}): Promise<string> {
 
   const version = await projectVersion();
   const arch = appImageArch();
-  const output = join(DIST_DIR, `SidCraft-${version}-${arch}.AppImage`);
+  const output = join(DIST_DIR, `SidCraft-${version}-linux-${arch}.AppImage`);
 
   await mkdir(DIST_DIR, { recursive: true });
 

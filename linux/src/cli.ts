@@ -17,7 +17,7 @@ Ornekler:
   bun run appimage build
   bun run appimage build --skip-build
   bun run appimage install
-  bun run appimage install ../dist/SidCraft-0.1.0-x86_64.AppImage
+  bun run appimage install ../dist/SidCraft-0.1.0-linux-x86_64.AppImage
   bun run appimage uninstall
 
 Notlar:

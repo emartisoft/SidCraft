@@ -28,7 +28,7 @@ bun run appimage build --skip-build
 bun run appimage install
 
 # Install a specific AppImage
-bun run appimage install ../dist/SidCraft-0.1.0-x86_64.AppImage
+bun run appimage install ../dist/SidCraft-0.1.0-linux-x86_64.AppImage
 
 # Uninstall
 bun run appimage uninstall
@@ -53,7 +53,7 @@ bun linux/src/cli.ts uninstall
 ## What does it produce?
 
 ```
-dist/SidCraft-<version>-<arch>.AppImage   # in the repository root
+dist/SidCraft-<version>-linux-<arch>.AppImage  # in the repository root
 target/appimage/SidCraft.AppDir/          # intermediate AppDir
 icon/hicolor/<size>/apps/sidcraft.png
 ```
