@@ -19,6 +19,10 @@ fn default_theme() -> String {
     "system".to_string()
 }
 
+fn default_accent() -> String {
+    "blue".to_string()
+}
+
 fn default_viz_mode() -> String {
     "scope".to_string()
 }
@@ -33,6 +37,9 @@ pub struct Config {
     /// Theme preference: `system`, `light` or `dark`.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Accent hue: `blue`, `red`, `green`, `yellow`, `orange` or `turquoise`.
+    #[serde(default = "default_accent")]
+    pub accent_color: String,
     /// Whether the left tool panel is open.
     #[serde(default = "default_true")]
     pub left_panel: bool,
@@ -99,6 +106,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            accent_color: default_accent(),
             left_panel: true,
             right_panel: true,
             viz_mode: default_viz_mode(),

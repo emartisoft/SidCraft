@@ -24,7 +24,7 @@ use residfp::ChipModel;
 
 use crate::engine::export::ExportFormat;
 use crate::engine::playlist::playlist_display_name;
-use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
+use crate::theme::{self, AccentColor, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
 use crate::{
     ConfirmAction, PlaylistDownloadProgress, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode,
@@ -125,15 +125,16 @@ impl eframe::App for SidcraftApp {
             }
         }
 
-        // Resolve the saved system/light/dark preference and install the same
-        // design tokens and egui style as the rest of the Craft desktop suite.
+        // Resolve the saved system/light/dark preference and accent hue, then
+        // install the matching design tokens and egui style for this frame.
         let system_dark = ctx.system_theme().map(|t| t == egui::Theme::Dark);
         let kind = self.theme_pref.resolve(system_dark, ThemeKind::Light);
-        if self.applied_theme != Some(kind) {
-            theme::apply(ctx, kind);
-            self.applied_theme = Some(kind);
+        let applied = Some((kind, self.accent));
+        if self.applied_theme != applied {
+            theme::apply(ctx, kind, self.accent);
+            self.applied_theme = applied;
         } else {
-            Tokens::store(ctx, Tokens::for_kind(kind));
+            Tokens::store(ctx, Tokens::for_kind_with_accent(kind, self.accent));
         }
 
         // Do this once the first viewport info is available, so the full-shell
@@ -3513,6 +3514,20 @@ impl SidcraftApp {
                                     .font(theme::regular(11.5))
                                     .color(t.text_faint),
                             );
+                            ui.add_space(14.0);
+                            ui.label(
+                                RichText::new("Accent colour")
+                                    .font(theme::medium(12.5))
+                                    .color(t.text),
+                            );
+                            if let Some(accent) = accent_picker(ui, &t, self.accent) {
+                                self.accent = accent;
+                            }
+                            ui.label(
+                                RichText::new("Changes buttons, selected rows, tabs and other active controls.")
+                                    .font(theme::regular(11.5))
+                                    .color(t.text_faint),
+                            );
                             ui.add_space(8.0);
                             ui.label(
                                 RichText::new("Visualiser")
@@ -4648,7 +4663,7 @@ fn primary_icon_button(
         ui.painter(),
         Rect::from_center_size(rect.center(), Vec2::splat(glyph)),
         icon,
-        Color32::WHITE,
+        t.on_accent,
         (size * 0.07).clamp(1.2, 1.9),
     );
     theme::hand(resp).on_hover_text(tip)
@@ -4736,7 +4751,7 @@ fn transport_button(
         };
         ui.painter().circle_filled(rect.center(), size * 0.5, fill);
         let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size * 0.44));
-        paint_icon(ui.painter(), icon_rect, icon, Color32::WHITE, 1.8);
+        paint_icon(ui.painter(), icon_rect, icon, t.on_accent, 1.8);
     } else {
         if resp.hovered() || resp.is_pointer_button_down_on() {
             ui.painter().rect_filled(rect, CornerRadius::same(8), t.hover);
@@ -5079,7 +5094,7 @@ fn primary_button(ui: &mut egui::Ui, t: &Tokens, label: &str) -> Response {
         Align2::CENTER_CENTER,
         label,
         font,
-        Color32::WHITE,
+        t.on_accent,
     );
     theme::hand(resp)
 }
@@ -5172,6 +5187,61 @@ fn segmented(
                 }
             });
         });
+    chosen
+}
+
+/// Six labelled colour chips. The swatch shows the actual hue; the selected
+/// chip is outlined with the live accent so the choice is visible immediately.
+fn accent_picker(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    current: AccentColor,
+) -> Option<AccentColor> {
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+        for accent in AccentColor::ALL {
+            let font = theme::medium(11.5);
+            let label = accent.label();
+            let dot = 12.0;
+            let width = 12.0 + 6.0 + text_width(ui, label, &font) + 16.0;
+            let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
+            let selected = accent == current;
+            let fill = if selected {
+                t.accent_soft
+            } else if resp.hovered() {
+                t.hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            if fill != Color32::TRANSPARENT {
+                ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
+            }
+            if selected {
+                ui.painter().rect_stroke(
+                    rect,
+                    CornerRadius::same(7),
+                    Stroke::new(1.0_f32, t.accent),
+                    StrokeKind::Inside,
+                );
+            }
+            ui.painter().circle_filled(
+                pos2(rect.left() + 12.0, rect.center().y),
+                dot * 0.5,
+                accent.swatch(),
+            );
+            ui.painter().text(
+                pos2(rect.left() + 12.0 + 6.0 + dot, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font,
+                if selected { t.accent_text } else { t.text_muted },
+            );
+            if theme::hand(resp).clicked() {
+                chosen = Some(accent);
+            }
+        }
+    });
     chosen
 }
 

@@ -466,7 +466,9 @@ pub struct SidcraftApp {
     // Shell state
     pub view: View,
     pub theme_pref: theme::ThemePreference,
-    applied_theme: Option<theme::ThemeKind>,
+    /// User-chosen highlight hue, applied to every accent token.
+    pub accent: theme::AccentColor,
+    applied_theme: Option<(theme::ThemeKind, theme::AccentColor)>,
     /// Last title sent to the OS title bar, so it is only updated on change.
     window_title: String,
     /// Native handle used to apply OS-level mini-player opacity.
@@ -834,6 +836,7 @@ impl SidcraftApp {
                 "dark" => theme::ThemePreference::Dark,
                 _ => theme::ThemePreference::System,
             },
+            accent: theme::AccentColor::from_config(&config.accent_color),
             applied_theme: None,
             window_title: "SidCraft".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -904,9 +907,11 @@ impl SidcraftApp {
             theme::ThemePreference::Light => "light",
             theme::ThemePreference::Dark => "dark",
         };
+        let accent = self.accent.config_key();
         let viz = self.viz_mode.config_key();
         let active = self.playlist_path.to_string_lossy().to_string();
         if self.config.theme != theme
+            || self.config.accent_color != accent
             || self.config.left_panel != self.left_open
             || self.config.right_panel != self.right_open
             || self.config.viz_mode != viz
@@ -916,6 +921,7 @@ impl SidcraftApp {
             || self.config.start_in_mini != self.start_in_mini
         {
             self.config.theme = theme.to_string();
+            self.config.accent_color = accent.to_string();
             self.config.left_panel = self.left_open;
             self.config.right_panel = self.right_open;
             self.config.viz_mode = viz.to_string();
