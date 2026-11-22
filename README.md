@@ -1,51 +1,21 @@
 # ![SidCraft](icon/sidcraft-header.png) SidCraft
 
-SidCraft is a desktop player for Commodore 64 SID music files in PSID and RSID
-formats, written in Rust. It emulates SID audio, so an internet connection is
-not required to play local files. The built-in HVSC browser connects to an
-online HVSC mirror.
+SidCraft is a Rust-based desktop player for Commodore 64 SID music files in PSID and RSID formats. Because it emulates the SID chip's audio itself, local files can be played without an internet connection. The built-in HVSC browser, however, requires a connection to an online HVSC mirror.
 
 ## Features
 
-- Open SID files and switch between the tunes (subsongs) included in a file.
-- Open SID files with SidCraft from the OS ("Open with", Finder, a file
-  manager or the command line); without a file argument the active playlist
-  is used. Only one instance runs: opening another file replaces the tune in
-  the window that is already playing.
-- Drag and drop files onto the main window or the mini player: a single SID
-  file plays directly, several SID files are added to the active playlist, a
-  single M3U playlist starts playing, and several M3U playlists are added to
-  the playlist library (names already in the library are skipped). Mixed
-  SID/M3U drops are rejected with a notice.
-- Emulate and play C64 SID audio, including tunes that use one, two, or three
-  SID chips.
-- Configure the SID chip model and the EKV transistor filter for the MOS 6581;
-  the EKV/standard filter choice is remembered between sessions.
-- Play, pause, stop, and seek within a tune.
-- Create, manage, and save M3U playlists; shuffle and repeat playback.
-- Browse folders and search by title, author, or path in an HVSC mirror.
-  Tunes can be downloaded from the browser and played.
-- Generate random playlists from the HVSC index: choose 5–100 tracks and one
-  or more collections (Demos, Games, Musicians), then save the result as a
-  named M3U playlist in the library.
-- Choose from eight visualisations: envelope, VU meter, spectrum,
-  spectrogram, oscilloscope, piano roll, filter, and ADSR.
-- Switch to a frameless mini player with Ctrl+M, the mini button, or a
-  double-click on the header. It has transport controls, an inline progress
-  bar and a compact visualisation; double-click the visualisation to cycle to
-  the next one. Drag the header to move it and the bottom-right corner to
-  resize it. Its size is remembered, and Settings offers adjustable
-  opacity (64% by default) and a "Start in mini player" option. The full window
-  and the mini player each remember their own position. 
-- Export a SID tune to WAV, FLAC, or MP3. Configure the export duration,
-  fade-out, sample rate, and master gain; mute individual voices.
-- Check GitHub for a newer stable release from Help, About or Settings, either
-  automatically about 30 seconds after startup or on demand. The update is
-  downloaded in the app after confirmation and verified against its SHA-256
-  digest; Windows and Linux restart into the new version, macOS opens the DMG.
-- Choose system, light, or dark themes. Preferences such as window size are
-  saved in the application settings; the full window and the mini player each
-  keep their own position on Windows, macOS, and Linux/X11.
+- Open SID files, switch between subsongs, and open files from the OS (Open with, Finder, file manager, or command line). Only one instance runs: opening another file replaces the tune in the open window.
+- Drag and drop SID files or M3U playlists onto the main window or mini player. Mixed SID/M3U drops are rejected.
+- Emulate C64 SID audio, including tunes that use one, two, or three SID chips. Choose the SID model and the EKV or standard MOS 6581 filter, which is remembered between sessions.
+- Play, pause, stop, and seek. Shuffle and repeat playback.
+- Create, manage, and save M3U playlists.
+- Browse and search an HVSC mirror by title, author, or path. Download tunes from the browser and play them.
+- Generate random playlists from the HVSC index (5–100 tracks, from Demos, Games, and/or Musicians) and save them to the library.
+- Choose from eight visualisations: envelope, VU meter, spectrum, spectrogram, oscilloscope, piano roll, filter, and ADSR.
+- Use a frameless mini player (Ctrl+M) with transport controls, a progress bar, and a compact visualisation. Resize it, adjust its opacity, or set it to start on launch.
+- Export tunes to WAV, FLAC, or MP3, with control over duration, fade-out, sample rate, and gain. Mute individual voices.
+- Check for updates from GitHub, automatically or on demand. Updates are verified with SHA-256 before installation.
+- Choose system, light, or dark theme.
 
 ![SidCraft-Player](docs/screenshots/player.png)
    
