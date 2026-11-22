@@ -5,10 +5,11 @@
 // Copyright (c) 2026 Mikael Lund, licensed under the MIT License.
 // See licenses/MIT-crabsid.txt for the original license text.
 
-//! Emulated C64 memory map: RAM, banked KERNAL stub, SID chips, CIA1.
+//! Emulated C64 memory map: RAM, banked KERNAL stub, SID chips, CIA1, VIC-II.
 
 use crate::engine::cia::Cia1;
 use crate::engine::sid_file::PRIMARY_SID_ADDRESS;
+use crate::engine::vic::Vic;
 use mos6502::memory::Bus;
 use residfp::{ChipModel, Sid};
 
@@ -17,6 +18,10 @@ const ZEROPAGE_AND_STACK_END: usize = 0x0200;
 const SID_REGISTER_COUNT: u16 = 0x20;
 const SID_RANGE_START: u16 = 0xD400;
 const SID_RANGE_END: u16 = 0xD800;
+
+// VIC-II register window ($D000..$D400, mirrored every 64 bytes).
+const VIC_BASE: u16 = 0xD000;
+const VIC_END: u16 = 0xD400;
 
 // Banking control registers in zero page.
 const BANK_DATA_DIR_ADDR: u16 = 0x0000;
@@ -37,6 +42,11 @@ const KERNAL_SIZE: usize = 0x2000;
 // Stub-internal addresses where we patch specific opcodes/vectors.
 const KERNAL_IRQ_ENTRY: u16 = 0xFF48;
 const KERNAL_IRQ_EXIT: u16 = 0xFF8E;
+/// Standard KERNAL IRQ-exit entry points. Many RSID handlers finish with
+/// `JMP $EA31` (full keyboard scan) or `JMP $EA7E`/`$EA81` (skip scan) and
+/// expect the KERNAL to restore registers and `RTI`. The stub turns all three
+/// into a plain `RTI`; SID playback does not need the keyboard scan.
+const KERNAL_IRQ_EXITS: [u16; 3] = [0xEA31, 0xEA7E, 0xEA81];
 const HW_IRQ_VECTOR_LO: u16 = 0xFFFE;
 const HW_IRQ_VECTOR_HI: u16 = 0xFFFF;
 const HW_NMI_VECTOR_LO: u16 = 0xFFFA;
@@ -57,13 +67,9 @@ const OPCODE_RTS: u8 = 0x60;
 const CIA1_BASE: u16 = 0xDC00;
 const CIA1_END: u16 = 0xDD00;
 
-// Out-of-scope hardware: VIC raster IRQ and CIA2 NMI. Reads return floating bus,
-// writes are recorded so the player can refuse to play the file.
-const VIC_IRQ_FLAG: u16 = 0xD019;
-const VIC_IRQ_MASK: u16 = 0xD01A;
-const CIA2_ICR: u16 = 0xDD0D;
-const CIA2_CRA: u16 = 0xDD0E;
-const FLOATING_BUS: u8 = 0xFF;
+// CIA2 register window (mirrored across $DD00..=$DDFF).
+const CIA2_BASE: u16 = 0xDD00;
+const CIA2_END: u16 = 0xDE00;
 
 const KERNAL_STUB: [u8; KERNAL_SIZE] = build_kernel_stub();
 
@@ -87,6 +93,15 @@ const fn build_kernel_stub() -> [u8; KERNAL_SIZE] {
 
     // $FF8E: RTI — exit point for handlers that JMP here to return.
     stub[(KERNAL_IRQ_EXIT - KERNAL_BASE) as usize] = OPCODE_RTI;
+
+    // Standard KERNAL IRQ exits: let handlers that JMP into the ROM finish the
+    // interrupt instead of executing the stub's default RTS and losing the
+    // interrupt frame.
+    let mut i = 0;
+    while i < KERNAL_IRQ_EXITS.len() {
+        stub[(KERNAL_IRQ_EXITS[i] - KERNAL_BASE) as usize] = OPCODE_RTI;
+        i += 1;
+    }
 
     stub
 }
@@ -170,20 +185,19 @@ impl SidChip {
 
 /// Emulated C64 memory map.
 ///
-/// Hosts 64KB RAM, 1-3 SID chips, CIA1 (Timer A + ICR), an 8KB KERNAL stub, and
-/// `$00/$01` HIRAM banking. CIA2 / VIC raster IRQ are out of scope: writes to
-/// their interrupt-control registers are recorded in `unsupported_hardware` so
-/// the player can refuse the file rather than play it silently broken.
+/// Hosts 64KB RAM, 1-3 SID chips, CIA1 (Timer A + ICR), VIC-II (raster IRQ), CIA2 registers,
+/// an 8KB KERNAL stub, and `$00/$01` HIRAM banking.
 pub struct C64Memory {
     ram: Box<[u8]>,
     pub sids: Vec<SidChip>,
-    cia1: Cia1,
+    pub cia1: Cia1,
+    pub vic: Vic,
+    cia2_regs: [u8; 16],
     bank_config: u8,
-    unsupported_hardware: Vec<u16>,
-    /// Whether CIA1's IRQ line is routed to the CPU. Off by default so PSID
-    /// tunes (frame or CIA-poll) never have mos6502 service spurious IRQs;
+    /// Whether hardware IRQ lines (CIA1 or VIC-II) are routed to the CPU. Off by default
+    /// so PSID tunes (frame or CIA-poll) never have mos6502 service spurious IRQs;
     /// `Player` flips it on for RSID-style tunes that expect vector dispatch.
-    cia_irq_routed: bool,
+    irq_routed: bool,
 }
 
 impl C64Memory {
@@ -193,9 +207,10 @@ impl C64Memory {
             ram: vec![0; RAM_SIZE].into_boxed_slice(),
             sids: vec![SidChip::new(chip_model, PRIMARY_SID_ADDRESS)],
             cia1: Cia1::new(),
+            vic: Vic::default(),
+            cia2_regs: [0; 16],
             bank_config: BANK_DEFAULT,
-            unsupported_hardware: Vec::new(),
-            cia_irq_routed: false,
+            irq_routed: false,
         };
         mem.init_zeropage_defaults();
         mem
@@ -217,13 +232,14 @@ impl C64Memory {
         self.ram[start..end].copy_from_slice(&data[..end - start]);
     }
 
-    /// Resets zero page + stack and re-arms banking, CIA1, and the IRQ vector.
+    /// Resets zero page + stack and re-arms banking, CIA1, VIC-II, and the IRQ vector.
     /// Called between songs so init starts from a clean machine state.
     pub fn clear_zeropage_and_stack(&mut self) {
         self.ram[..ZEROPAGE_AND_STACK_END].fill(0);
         self.bank_config = BANK_DEFAULT;
         self.cia1 = Cia1::new();
-        self.unsupported_hardware.clear();
+        self.vic.reset();
+        self.cia2_regs.fill(0);
         self.init_zeropage_defaults();
     }
 
@@ -263,9 +279,15 @@ impl C64Memory {
         }
     }
 
-    /// Advances per-cycle peripherals (CIA1) by `cycles`.
+    /// Advances per-cycle peripherals (CIA1, VIC-II) by `cycles`.
     pub fn tick(&mut self, cycles: u64) {
         self.cia1.tick(cycles);
+        self.vic.tick(cycles);
+    }
+
+    /// Configures the video standard for VIC-II (PAL vs NTSC).
+    pub fn set_pal(&mut self, is_pal: bool) {
+        self.vic.set_pal(is_pal);
     }
 
     /// PSID-CIA poll: did Timer A underflow since last call? Clears the flag.
@@ -273,11 +295,16 @@ impl C64Memory {
         self.cia1.take_timer_a_underflow()
     }
 
-    /// Toggles whether CIA1's IRQ line drives `Bus::irq_pending`. Only RSID-style
-    /// tunes want this — PSID-CIA polls the underflow flag directly via
+    /// Toggles whether hardware IRQ lines (CIA1 or VIC-II) drive `Bus::irq_pending`.
+    /// Only RSID-style tunes want this — PSID-CIA polls the underflow flag directly via
     /// `cia1_take_timer_a_underflow` and would be disrupted by mos6502 servicing.
+    pub fn set_irq_routed(&mut self, routed: bool) {
+        self.irq_routed = routed;
+    }
+
+    /// Backward compatibility alias for [`set_irq_routed`].
     pub fn set_cia_irq_routed(&mut self, routed: bool) {
-        self.cia_irq_routed = routed;
+        self.set_irq_routed(routed);
     }
 
     /// Forces the `$01` banking byte. Used by the player to apply the PSID-driver
@@ -285,12 +312,6 @@ impl C64Memory {
     /// or BASIC ROM area execute from RAM instead of the banked-in stub.
     pub const fn set_bank_config(&mut self, value: u8) {
         self.bank_config = value;
-    }
-
-    /// Returns the addresses where init wrote to out-of-scope hardware (VIC raster
-    /// IRQ or CIA2 NMI), if any. Player aborts loading on a non-empty list.
-    pub fn unsupported_hardware(&self) -> &[u16] {
-        &self.unsupported_hardware
     }
 
     fn kernal_banked_in(&self) -> bool {
@@ -306,13 +327,9 @@ impl Bus for C64Memory {
         if addr >= KERNAL_BASE && self.kernal_banked_in() {
             return KERNAL_STUB[(addr - KERNAL_BASE) as usize];
         }
-        if (CIA1_BASE..CIA1_END).contains(&addr) {
+        if (VIC_BASE..VIC_END).contains(&addr) {
             #[allow(clippy::cast_possible_truncation)]
-            return self.cia1.read_register((addr & 0x0F) as u8);
-        }
-        // VIC IRQ + CIA2 reads return floating-bus so polling tunes don't loop forever.
-        if matches!(addr, VIC_IRQ_FLAG | VIC_IRQ_MASK | CIA2_ICR | CIA2_CRA) {
-            return FLOATING_BUS;
+            return self.vic.read_register((addr & 0x3F) as u8);
         }
         if (SID_RANGE_START..SID_RANGE_END).contains(&addr) {
             for sid_chip in &mut self.sids {
@@ -322,6 +339,17 @@ impl Bus for C64Memory {
                 }
             }
         }
+        if (CIA1_BASE..CIA1_END).contains(&addr) {
+            #[allow(clippy::cast_possible_truncation)]
+            return self.cia1.read_register((addr & 0x0F) as u8);
+        }
+        if (CIA2_BASE..CIA2_END).contains(&addr) {
+            let reg = (addr & 0x0F) as usize;
+            if reg == 0x0D {
+                return 0x00; // CIA2 ICR read returns 0 (no pending NMIs)
+            }
+            return self.cia2_regs[reg];
+        }
         self.ram[addr as usize]
     }
 
@@ -330,31 +358,105 @@ impl Bus for C64Memory {
             self.bank_config = val;
             return;
         }
-        if (CIA1_BASE..CIA1_END).contains(&addr) {
+        if (VIC_BASE..VIC_END).contains(&addr) {
             #[allow(clippy::cast_possible_truncation)]
-            self.cia1.write_register((addr & 0x0F) as u8, val);
-            return;
-        }
-        if matches!(addr, VIC_IRQ_FLAG | VIC_IRQ_MASK | CIA2_ICR | CIA2_CRA) {
-            // Record the trap, then fall through to RAM so the value is observable.
-            self.unsupported_hardware.push(addr);
-            self.ram[addr as usize] = val;
+            self.vic.write_register((addr & 0x3F) as u8, val);
             return;
         }
         if (SID_RANGE_START..SID_RANGE_END).contains(&addr) {
             for sid_chip in &mut self.sids {
                 if sid_chip.contains(addr) {
                     #[allow(clippy::cast_possible_truncation)]
-                    sid_chip
-                        .write((addr - sid_chip.base_address) as u8, val);
+                    sid_chip.write((addr - sid_chip.base_address) as u8, val);
                     return;
                 }
             }
+        }
+        if (CIA1_BASE..CIA1_END).contains(&addr) {
+            #[allow(clippy::cast_possible_truncation)]
+            self.cia1.write_register((addr & 0x0F) as u8, val);
+            return;
+        }
+        if (CIA2_BASE..CIA2_END).contains(&addr) {
+            self.cia2_regs[(addr & 0x0F) as usize] = val;
+            return;
         }
         self.ram[addr as usize] = val;
     }
 
     fn irq_pending(&mut self) -> bool {
-        self.cia_irq_routed && self.cia1.irq_line()
+        self.irq_routed && (self.cia1.irq_line() || self.vic.irq_line())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory() -> C64Memory {
+        C64Memory::new(ChipModel::Mos6581)
+    }
+
+    #[test]
+    fn cia2_register_writes_are_harmless() {
+        let mut mem = memory();
+        // These are the registers that used to make tunes fail to load.
+        mem.set_byte(0xDD0D, 0x81); // ICR / NMI flag
+        mem.set_byte(0xDD0E, 0x01); // Timer A control
+        assert_eq!(mem.get_byte(0xDD0D), 0x00, "no pending NMIs are reported");
+        assert_eq!(
+            mem.get_byte(0xDD0E),
+            0x01,
+            "other CIA2 registers still store writes"
+        );
+    }
+
+    #[test]
+    fn irq_is_not_reported_until_routed() {
+        let mut mem = memory();
+        // The VIC raises the raster IRQ when the beam crosses the compare line.
+        mem.set_byte(0xD012, 1);
+        mem.set_byte(0xD01A, 0x01);
+        mem.tick(64);
+        assert!(mem.vic.irq_line());
+        assert!(!mem.irq_pending(), "PSID must not see hardware IRQs");
+
+        mem.set_irq_routed(true);
+        assert!(mem.irq_pending(), "RSID must see the VIC raster IRQ");
+    }
+
+    #[test]
+    fn vic_and_cia1_both_feed_irq_pending() {
+        let mut mem = memory();
+        mem.set_irq_routed(true);
+        assert!(!mem.irq_pending());
+
+        // CIA1 Timer A underflow raises its IRQ line.
+        mem.set_byte(0xDC04, 1);
+        mem.set_byte(0xDC05, 0);
+        mem.set_byte(0xDC0E, 0x11); // force-load latch and start Timer A
+        mem.set_byte(0xDC0D, 0x81); // enable the Timer A IRQ mask
+        mem.tick(2);
+        assert!(mem.cia1.irq_line());
+        assert!(mem.irq_pending());
+
+        // Reading ICR clears the pending flag, as a real handler does.
+        mem.get_byte(0xDC0D);
+        assert!(!mem.cia1.irq_line());
+        assert!(!mem.irq_pending());
+
+        mem.set_byte(0xD012, 1);
+        mem.set_byte(0xD01A, 0x01);
+        mem.tick(64);
+        assert!(mem.vic.irq_line());
+        assert!(mem.irq_pending());
+    }
+
+    #[test]
+    fn kernal_irq_exits_return_with_rti() {
+        let mut mem = memory();
+        for addr in [0xEA31, 0xEA7E, 0xEA81] {
+            assert_eq!(mem.get_byte(addr), OPCODE_RTI, "exit at ${addr:04X}");
+        }
     }
 }

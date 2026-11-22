@@ -7,3 +7,4 @@ pub mod memory;
 pub mod player;
 pub mod playlist;
 pub mod sid_file;
+pub mod vic;

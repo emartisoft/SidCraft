@@ -221,9 +221,6 @@ pub struct Player {
 pub enum PlayerError {
     /// The init routine never returned before the step limit.
     InitTimeout { steps: u32, address: u16 },
-    /// Init wrote to hardware we don't emulate (VIC raster IRQ, CIA2 NMI).
-    /// The tune may technically be playable but our minimal emulator can't drive it.
-    UnsupportedHardware { addresses: Vec<u16> },
 }
 
 impl fmt::Display for PlayerError {
@@ -233,18 +230,6 @@ impl fmt::Display for PlayerError {
                 write!(
                     f,
                     "SID init routine at ${address:04X} exceeded {steps} steps"
-                )
-            }
-            Self::UnsupportedHardware { addresses } => {
-                let list = addresses
-                    .iter()
-                    .map(|a| format!("${a:04X}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(
-                    f,
-                    "Tune writes to unsupported hardware ({list}) — likely needs \
-                    VIC raster IRQ or CIA2 NMI emulation"
                 )
             }
         }
@@ -294,7 +279,6 @@ impl Player {
             sid_file.init_address,
             sid_file.is_interrupt_driven(),
         )?;
-        check_supported_hardware(&cpu)?;
 
         let voice_count = chip_models.len() * 3;
         let envelope_history = (0..voice_count)
@@ -473,17 +457,30 @@ impl Player {
                 .status
                 .contains(Status::PS_DISABLE_INTERRUPTS);
 
-        let elapsed = if irq_at_sentinel {
+        let prev_cycles = self.cpu.cycles;
+        let mut elapsed = if irq_at_sentinel {
             // Manually vector — single-stepping the RTS at $0000 would pop garbage.
             self.force_irq_service();
             IRQ_ENTRY_CYCLES
         } else if at_sentinel {
             1
         } else {
-            let prev = self.cpu.cycles;
+            // `single_step` already advances `cpu.cycles`; the manual paths above
+            // do not, so reconcile the counter with the charged delta below.
             self.cpu.single_step();
-            self.cpu.cycles - prev
+            0
         };
+        if elapsed == 0 {
+            // WAI/STP (or an undecodable opcode) completes without consuming a
+            // cycle in mos6502. Charge one idle cycle anyway so the audio loop
+            // makes progress and the VIC/CIA can eventually raise the interrupt
+            // that wakes the CPU instead of spinning here forever.
+            elapsed = self.cpu.cycles - prev_cycles;
+            if elapsed == 0 {
+                elapsed = 1;
+            }
+            self.cpu.cycles = prev_cycles.saturating_add(elapsed);
+        }
 
         // Frame-mode tunes never observe CIA1, so skip the timer arithmetic entirely.
         if self.drive_mode != DriveMode::Frame {
@@ -770,6 +767,7 @@ impl Player {
         self.chip_models = sid_file.preferred_chip_models(None);
         let sid_configs = build_sid_configs(sid_file, &self.chip_models);
         self.cpu.memory.configure_sids(&sid_configs);
+        self.cpu.memory.set_pal(sid_file.is_pal());
 
         for sid_chip in &mut self.cpu.memory.sids {
             sid_chip
@@ -828,7 +826,6 @@ impl Player {
         let init_returned =
             run_init(&mut self.cpu, self.init_address, self.is_interrupt_driven)?;
         self.free_running = !init_returned;
-        check_supported_hardware(&self.cpu)?;
 
         // Drive mode is per-song (PSID `speed` is a 32-bit-per-song bitmap), so
         // re-derive even for an in-file song change.
@@ -954,9 +951,13 @@ impl Player {
 /// I/O at `$D000-$DFFF` stays mapped except when the tune itself sits there.
 const fn psid_iomap(addr: u16) -> u8 {
     match addr {
+        // $C000-$CFFF is plain RAM on the C64, so both ROMs can stay banked in.
+        // Banking the KERNAL out here would replace its IRQ trampoline at
+        // $FFFE/$FFFF with uninitialised RAM, breaking tunes that only install
+        // their handler through the KERNAL's $0314 vector.
         0x0000..=0x9FFF => 0x37, // C64 default: BASIC + KERNAL + I/O all in
         0xA000..=0xBFFF => 0x36, // BASIC out (tune lives in BASIC ROM space)
-        0xC000..=0xCFFF => 0x35, // BASIC + KERNAL out
+        0xC000..=0xCFFF => 0x37, // plain RAM; KERNAL can stay banked in
         0xD000..=0xDFFF => 0x34, // BASIC + KERNAL + I/O out (tune in I/O area)
         0xE000..=0xFFFF => 0x35, // BASIC + KERNAL out, I/O in
     }
@@ -1007,8 +1008,13 @@ fn bootstrap_cpu(
     }
 
     memory.load(sid_file.load_address, &sid_file.data);
+    memory.set_pal(sid_file.is_pal());
 
     let mut cpu = CPU::new(memory, Nmos6502);
+    // mos6502 boots with the I flag set. On a real C64 the KERNAL clears it before
+    // handing control to a tune; do the same here or RSID raster/CIA IRQs can
+    // never be serviced on the first song. `load_song` already resets this.
+    cpu.registers.status = Status::empty();
     setup_stack_for_rts(&mut cpu);
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1096,18 +1102,6 @@ fn run_routine(
     Err(timeout_err)
 }
 
-/// Refuses tunes whose init touched VIC raster IRQ or CIA2 NMI registers.
-fn check_supported_hardware(cpu: &CPU<C64Memory, Nmos6502>) -> PlayerResult<()> {
-    let traps = cpu.memory.unsupported_hardware();
-    if traps.is_empty() {
-        Ok(())
-    } else {
-        Err(PlayerError::UnsupportedHardware {
-            addresses: traps.to_vec(),
-        })
-    }
-}
-
 /// Thread-safe handle for sharing the player between audio and UI threads.
 pub type SharedPlayer = Arc<Mutex<Player>>;
 
@@ -1121,4 +1115,171 @@ pub fn create_shared_player(
 ) -> PlayerResult<SharedPlayer> {
     Player::new(sid_file, song, sample_rate, chip_override, sampling_method)
         .map(|p| Arc::new(Mutex::new(p)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a tiny tune loaded at $0800 with the given entry points and machine code.
+    fn synthetic_sid(magic: &str, init: u16, play: u16, data: Vec<u8>) -> SidFile {
+        SidFile {
+            magic: magic.to_string(),
+            version: 2,
+            data_offset: 0x76,
+            load_address: 0x0800,
+            init_address: init,
+            play_address: play,
+            songs: 1,
+            start_song: 1,
+            speed: 0,
+            name: "test".to_string(),
+            author: "test".to_string(),
+            released: "test".to_string(),
+            flags: 0, // PAL
+            data,
+            md5: String::new(),
+            second_sid_address: None,
+            third_sid_address: None,
+        }
+    }
+
+    /// A do-nothing PSID tune: both init and play are a single RTS at $0800.
+    fn frame_psid() -> SidFile {
+        synthetic_sid("PSID", 0x0800, 0x0800, vec![RTS_OPCODE])
+    }
+
+    #[test]
+    fn zero_cycle_instruction_still_advances_clock() {
+        let sid = frame_psid();
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+
+        // JAM halts mos6502: the opcode itself costs 2 cycles, but every later
+        // single_step() costs 0. `advance_one_step` must still charge a cycle so
+        // the audio loop cannot spin forever waiting for the VIC/CIA to tick.
+        p.cpu.memory.set_byte(0x0900, 0x02);
+        p.cpu.registers.program_counter = 0x0900;
+        assert!(p.cpu.single_step(), "JAM should execute once");
+        let before = p.cpu.cycles;
+        assert!(p.advance_one_step());
+        assert_eq!(p.cpu.cycles, before + 1);
+    }
+
+    #[test]
+    fn rsid_vic_irq_handler_is_dispatched() {
+        // Init at $0800 installs a VIC raster IRQ handler through the KERNAL user
+        // vector and arms $D012/$D01A. The handler at $0820 acknowledges the IRQ,
+        // opens SID voice 1 and RTIs back to the sentinel.
+        #[rustfmt::skip]
+        let mut data = vec![
+            0xA9, 0x20,       // LDA #$20
+            0x8D, 0x14, 0x03, // STA $0314
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x15, 0x03, // STA $0315
+            0xA9, 0x00,       // LDA #$00
+            0x8D, 0x12, 0xD0, // STA $D012  (raster compare = line 0)
+            0xA9, 0x01,       // LDA #$01
+            0x8D, 0x1A, 0xD0, // STA $D01A  (enable raster IRQ)
+            0x60,             // RTS
+        ];
+        data.resize(0x20, 0); // handler starts at $0820
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200  (count handler entries)
+            0xA9, 0x01, // LDA #$01
+            0x8D, 0x19, 0xD0, // STA $D019  (acknowledge raster IRQ)
+            0xA9, 0x21, // LDA #$21
+            0x8D, 0x00, 0xD4, // STA $D400  (voice 1 frequency low)
+            0xA9, 0x11, // LDA #$11
+            0x8D, 0x04, 0xD4, // STA $D404  (gate + triangle)
+            0x40, // RTI
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        assert_eq!(p.drive_mode, DriveMode::Interrupt);
+        assert!(!p.free_running, "init should have returned to the sentinel");
+        assert_eq!(
+            p.cpu.memory.get_byte(0xD01A) & 0x01,
+            1,
+            "raster IRQ should be enabled"
+        );
+
+        let mut buffer = [0.0f32; 1024];
+        for _ in 0..4 {
+            p.fill_buffer(&mut buffer);
+            assert!(p.playback_error.is_none(), "{:?}", p.playback_error);
+        }
+
+        let entries = p.cpu.memory.get_byte(0x0200);
+        assert!(entries > 0, "VIC IRQ handler never ran");
+        let state = p.cpu.memory.sids[0].sid.read_state();
+        assert_eq!(
+            state.sid_register[0x04] & 0x11,
+            0x11,
+            "IRQ handler did not open a SID voice"
+        );
+    }
+
+    #[test]
+    fn rewriting_the_current_raster_line_does_not_double_play_calls() {
+        // Real VIC-II evaluates the raster compare once per line. A handler that
+        // ACKs $D019 and then writes the *same* $D012 value must not re-trigger
+        // itself before RTI — doing so ran the sequencer 2-3x per frame in some
+        // RSID tunes (e.g. Myth and Arkanoid).
+        #[rustfmt::skip]
+        let mut data = vec![
+            0xA9, 0x20,       // LDA #$20
+            0x8D, 0x14, 0x03, // STA $0314
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x15, 0x03, // STA $0315
+            0xA9, 0x00,       // LDA #$00
+            0x8D, 0x12, 0xD0, // STA $D012  (raster compare = line 0)
+            0xA9, 0x01,       // LDA #$01
+            0x8D, 0x1A, 0xD0, // STA $D01A  (enable raster IRQ)
+            0x60,             // RTS
+        ];
+        data.resize(0x20, 0);
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200  (count handler entries)
+            0xA9, 0x01, // LDA #$01
+            0x8D, 0x19, 0xD0, // STA $D019  (acknowledge raster IRQ)
+            0xA9, 0x00, // LDA #$00
+            0x8D, 0x12, 0xD0, // STA $D012  (rewrite the current compare line)
+            0x40, // RTI
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+
+        let frames = 3u32;
+        let target = PAL_FRAME_CYCLES * frames;
+        while p.frame_cycle_count < target {
+            assert!(p.advance_one_step(), "{:?}", p.playback_error);
+        }
+
+        let entries = p.cpu.memory.get_byte(0x0200);
+        assert!(
+            (1..=frames as u8 + 1).contains(&entries),
+            "expected about one play call per frame, got {entries} in {frames} frames"
+        );
+    }
+
+    #[test]
+    fn cia2_and_vic_register_writes_during_init_do_not_fail_load() {
+        #[rustfmt::skip]
+        let data = vec![
+            0xA9, 0x80,       // LDA #$80
+            0x8D, 0x0D, 0xDD, // STA $DD0D  (CIA2 ICR)
+            0xA9, 0x01,       // LDA #$01
+            0x8D, 0x0E, 0xDD, // STA $DD0E  (CIA2 CRA)
+            0x8D, 0x1A, 0xD0, // STA $D01A  (VIC IMR)
+            0x8D, 0x19, 0xD0, // STA $D019  (VIC flag/ack)
+            0x60,             // RTS
+        ];
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        // Before the VIC/CIA2 support this returned UnsupportedHardware.
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        assert_eq!(p.cpu.memory.get_byte(0xDD0D), 0x00);
+        assert_eq!(p.cpu.memory.get_byte(0xDD0E), 0x01);
+    }
 }
