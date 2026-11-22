@@ -5838,24 +5838,21 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             painter.rect_stroke(label, CornerRadius::same(1), stroke, StrokeKind::Inside);
         }
         "download" => {
-            // Down arrow landing on a tray, for saving a SID file to disk.
-            line(pos2(c.x, r.top() + s * 0.06), pos2(c.x, c.y + s * 0.14));
+            // Down arrow hovering just above a baseline: the classic download
+            // glyph. The tip stops short of the line so they never intersect.
+            let line_y = r.bottom() - s * 0.1;
+            line(
+                pos2(r.left() + s * 0.12, line_y),
+                pos2(r.right() - s * 0.12, line_y),
+            );
+            let tip_y = line_y - s * 0.12;
+            let base_y = tip_y - s * 0.2;
+            line(pos2(c.x, r.top() + s * 0.06), pos2(c.x, base_y));
             poly(vec![
-                pos2(c.x - s * 0.17, c.y + s * 0.06),
-                pos2(c.x + s * 0.17, c.y + s * 0.06),
-                pos2(c.x, c.y + s * 0.32),
+                pos2(c.x - s * 0.17, base_y),
+                pos2(c.x + s * 0.17, base_y),
+                pos2(c.x, tip_y),
             ]);
-            painter.add(egui::Shape::line(
-                vec![
-                    pos2(r.left() + s * 0.06, r.bottom() - s * 0.06),
-                    pos2(c.x - s * 0.16, r.bottom() - s * 0.06),
-                    pos2(c.x - s * 0.16, r.bottom() - s * 0.18),
-                    pos2(c.x + s * 0.16, r.bottom() - s * 0.18),
-                    pos2(c.x + s * 0.16, r.bottom() - s * 0.06),
-                    pos2(r.right() - s * 0.06, r.bottom() - s * 0.06),
-                ],
-                stroke,
-            ));
         }
         "file" => {
             let body = Rect::from_min_max(
