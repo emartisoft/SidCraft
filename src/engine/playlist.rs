@@ -5,10 +5,10 @@
 // Copyright (c) 2026 Mikael Lund, licensed under the MIT License.
 // See licenses/MIT-crabsid.txt for the original license text.
 
-use crate::engine::hvsc::DEFAULT_HVSC_URL;
+use crate::engine::hvsc::{self, DEFAULT_HVSC_URL};
 use crate::engine::sid_file::SidFile;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// A single entry in a playlist, representing a SID tune source.
@@ -51,24 +51,35 @@ impl PlaylistEntry {
     /// HVSC-relative path such as `/MUSICIANS/E/Emarti/Tune.sid`. Those are not
     /// local files, so a failed local load falls back to the HVSC mirror.
     pub fn load(&self) -> io::Result<SidFile> {
-        if self.is_url() {
-            return load_from_url(&self.source);
-        }
-        match SidFile::load(&self.source) {
-            Ok(sid) => Ok(sid),
-            Err(err) => {
-                if let Some(relative) = hvsc_relative_path(&self.source) {
-                    load_from_url(&format!("{DEFAULT_HVSC_URL}{relative}")).map_err(|fallback| {
-                        io::Error::new(
-                            fallback.kind(),
-                            format!("{err} (HVSC fallback: {fallback})"),
-                        )
-                    })
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        SidFile::parse(&fetch_sid_bytes(&self.source)?)
+    }
+}
+
+/// Fetches the original SID file bytes for a playlist source.
+///
+/// Supports local paths, `file://` URLs, http(s) URLs and the HVSC-relative
+/// paths used by older playlists. Used by both playback and the download
+/// buttons so saving a tune yields the very same bytes the player loaded.
+pub fn fetch_sid_bytes(source: &str) -> io::Result<Vec<u8>> {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("file://")
+    {
+        return hvsc::fetch_bytes(source);
+    }
+    match fs::read(source) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => match hvsc_relative_path(source) {
+            Some(relative) => hvsc::fetch_bytes(&format!("{DEFAULT_HVSC_URL}{relative}")).map_err(
+                |fallback| {
+                    io::Error::new(
+                        fallback.kind(),
+                        format!("{err} (HVSC fallback: {fallback})"),
+                    )
+                },
+            ),
+            None => Err(err),
+        },
     }
 }
 
@@ -105,18 +116,6 @@ fn parse_subsong(s: &str) -> (&str, Option<u16>) {
 /// Extracts filename from path or URL. Handles both unix and windows separators.
 pub(crate) fn extract_filename(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
-}
-
-/// Fetches and parses a SID file from a URL.
-fn load_from_url(url: &str) -> io::Result<SidFile> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut bytes = Vec::new();
-    response.into_body().into_reader().read_to_end(&mut bytes)?;
-
-    SidFile::parse(&bytes)
 }
 
 /// A playlist of SID tunes loaded from an m3u file.

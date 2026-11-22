@@ -24,11 +24,12 @@ use engine::player::{
 use engine::playlist::{self, extract_filename, Playlist};
 use engine::sid_file::SidFile;
 use residfp::ChipModel;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use update::ReleaseInfo;
@@ -239,6 +240,58 @@ enum HvscAsyncMsg {
     Error(String),
 }
 
+/// Progress of a batch job saving every SID file of a playlist to one folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaylistDownloadProgress {
+    /// No batch job is active and no result is waiting to be acknowledged.
+    Idle,
+    /// The worker is downloading/writing tunes. `done` includes failures.
+    Running {
+        done: usize,
+        total: usize,
+        current: String,
+        failed: usize,
+    },
+    /// The worker finished; the dialog stays open until acknowledged.
+    Finished { total: usize, failed: usize },
+}
+
+enum PlaylistDownloadMsg {
+    Progress {
+        done: usize,
+        total: usize,
+        current: String,
+        failed: usize,
+    },
+    Finished {
+        total: usize,
+        failed: usize,
+    },
+}
+
+/// Turns a playlist display name into a safe SID filename for saving.
+fn sid_download_filename(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
+        "tune.sid".to_string()
+    } else if cleaned.to_ascii_lowercase().ends_with(".sid") {
+        cleaned.to_string()
+    } else {
+        format!("{cleaned}.sid")
+    }
+}
+
 /// Where the in-app update flow currently is. The release itself is kept
 /// separately in [`SidcraftApp::update_release`] so retries do not lose it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,6 +394,10 @@ pub struct SidcraftApp {
     pub rename_playlist_name: String,
     rename_playlist_error: Option<String>,
     pub confirm_action: Option<ConfirmAction>,
+    /// Progress of the "download all playlist SID files" worker, shown in a dialog.
+    pub playlist_download: PlaylistDownloadProgress,
+    /// Receives updates from the batch download worker while it is running.
+    playlist_download_rx: Option<Receiver<PlaylistDownloadMsg>>,
 
     // Playback behaviour
     pub shuffle: bool,
@@ -719,6 +776,8 @@ impl SidcraftApp {
             rename_playlist_name: String::new(),
             rename_playlist_error: None,
             confirm_action: None,
+            playlist_download: PlaylistDownloadProgress::Idle,
+            playlist_download_rx: None,
             shuffle: false,
             repeat_mode: RepeatMode::Off,
             hvsc_browser,
@@ -1609,6 +1668,170 @@ impl SidcraftApp {
         if self.playlist.add(&source, Some(self.current_song)) {
             self.save_playlist();
             self.set_status(format!("Added “{}” to the playlist", self.sid_file.name));
+        }
+    }
+
+    /// Fetches a SID file and writes it to a destination chosen by the user.
+    /// The dialog starts with `suggested_name` so the user only has to pick a folder.
+    pub fn download_sid_to_file(&mut self, source: &str, suggested_name: &str) {
+        let filename = sid_download_filename(suggested_name);
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&filename)
+            .add_filter("SID Files", &["sid", "mus"])
+            .save_file()
+        else {
+            return;
+        };
+        match playlist::fetch_sid_bytes(source) {
+            Ok(bytes) => match fs::write(&path, &bytes) {
+                Ok(()) => self.set_status(format!("Saved “{filename}” to {}", path.display())),
+                Err(e) => self.set_status(format!("Could not save SID file: {e}")),
+            },
+            Err(e) => self.set_status(format!("Could not download SID file: {e}")),
+        }
+    }
+
+    /// Saves the currently playing SID file, including when it came from HVSC.
+    pub fn download_current_sid(&mut self) {
+        let Some(source) = self.current_source.clone() else {
+            self.set_status("No tune source to save");
+            return;
+        };
+        let suggested = if self.sid_file.name.trim().is_empty() {
+            extract_filename(&source)
+        } else {
+            self.sid_file.name.clone()
+        };
+        self.download_sid_to_file(&source, &suggested);
+    }
+
+    /// Saves the selected playlist entry's SID file.
+    pub fn download_selected_playlist_sid(&mut self) {
+        let Some(entry) = self.playlist.entries.get(self.selected_playlist_idx).cloned() else {
+            self.set_status("Select a track to download");
+            return;
+        };
+        self.download_sid_to_file(&entry.source, &entry.display_name);
+    }
+
+    /// Downloads every SID file of the active playlist into a folder chosen by
+    /// the user. Progress is reported on a channel and shown in a dialog.
+    pub fn download_all_playlist_sids(&mut self) {
+        if matches!(self.playlist_download, PlaylistDownloadProgress::Running { .. }) {
+            return;
+        }
+        if self.playlist.is_empty() {
+            self.set_status("Playlist is empty");
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+
+        // Give each file a distinct name: m3u entries may share a display name.
+        let mut used = HashSet::new();
+        let mut jobs: Vec<(String, String)> = Vec::with_capacity(self.playlist.len());
+        for entry in &self.playlist.entries {
+            let mut name = sid_download_filename(&entry.display_name);
+            if !used.insert(name.clone()) {
+                let stem = name.strip_suffix(".sid").unwrap_or(&name);
+                let mut n = 2;
+                loop {
+                    let candidate = format!("{stem}_{n}.sid");
+                    if used.insert(candidate.clone()) {
+                        name = candidate;
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            jobs.push((entry.source.clone(), name));
+        }
+
+        let total = jobs.len();
+        let (tx, rx) = channel();
+        self.playlist_download_rx = Some(rx);
+        self.playlist_download = PlaylistDownloadProgress::Running {
+            done: 0,
+            total,
+            current: jobs[0].1.clone(),
+            failed: 0,
+        };
+        self.set_status(format!("Saving {total} SID files to {}…", dir.display()));
+
+        std::thread::spawn(move || {
+            let mut failed = 0usize;
+            for (index, (source, name)) in jobs.iter().enumerate() {
+                let result = playlist::fetch_sid_bytes(source)
+                    .and_then(|bytes| fs::write(dir.join(name), bytes));
+                if result.is_err() {
+                    failed += 1;
+                }
+                let _ = tx.send(PlaylistDownloadMsg::Progress {
+                    done: index + 1,
+                    total,
+                    current: name.clone(),
+                    failed,
+                });
+            }
+            let _ = tx.send(PlaylistDownloadMsg::Finished { total, failed });
+        });
+    }
+
+    /// Drains batch download progress messages so the dialog can show a bar.
+    fn handle_playlist_download_progress(&mut self) {
+        let Some(rx) = self.playlist_download_rx.as_ref() else {
+            return;
+        };
+        let mut finished = None;
+        let mut last = None;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(PlaylistDownloadMsg::Progress {
+                    done,
+                    total,
+                    current,
+                    failed,
+                }) => {
+                    last = Some((done, total, failed));
+                    self.playlist_download = PlaylistDownloadProgress::Running {
+                        done,
+                        total,
+                        current,
+                        failed,
+                    };
+                }
+                Ok(PlaylistDownloadMsg::Finished { total, failed }) => finished = Some((total, failed)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if let Some((total, failed)) = finished {
+            self.playlist_download_rx = None;
+            self.playlist_download = PlaylistDownloadProgress::Finished { total, failed };
+            if failed == 0 {
+                self.set_status(format!("Saved {total} SID files"));
+            } else {
+                self.set_status(format!(
+                    "Saved {} of {total} SID files ({failed} failed)",
+                    total - failed
+                ));
+            }
+        } else if disconnected {
+            // The worker exited without reporting a result (e.g. panicked).
+            self.playlist_download_rx = None;
+            if let Some((done, total, failed)) = last {
+                self.playlist_download = PlaylistDownloadProgress::Finished {
+                    total,
+                    failed: failed + total.saturating_sub(done),
+                };
+            } else {
+                self.playlist_download = PlaylistDownloadProgress::Idle;
+            }
         }
     }
 
@@ -2859,4 +3082,36 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(SidcraftApp::new(cc, startup_path)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sid_download_filename;
+    use crate::engine::playlist::fetch_sid_bytes;
+
+    #[test]
+    fn download_filename_is_safe_and_keeps_sid_extension() {
+        assert_eq!(sid_download_filename("Tune: One?.sid"), "Tune_ One_.sid");
+        assert_eq!(sid_download_filename("A/B\\C.sid"), "A_B_C.sid");
+        assert_eq!(sid_download_filename(" Tune. "), "Tune.sid");
+        assert_eq!(sid_download_filename(""), "tune.sid");
+    }
+
+    #[test]
+    fn playlist_sources_can_be_fetched_from_local_paths_and_file_urls() {
+        let path = std::env::temp_dir().join(format!(
+            "sidcraft-download-test-{}-{}.sid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = b"PSID original bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        assert_eq!(fetch_sid_bytes(&path_string).unwrap(), bytes);
+        assert_eq!(fetch_sid_bytes(&format!("file://{path_string}")).unwrap(), bytes);
+        std::fs::remove_file(&path).unwrap();
+    }
 }

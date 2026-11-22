@@ -26,7 +26,9 @@ use crate::engine::export::ExportFormat;
 use crate::engine::playlist::playlist_display_name;
 use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
-use crate::{ConfirmAction, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode};
+use crate::{
+    ConfirmAction, PlaylistDownloadProgress, RepeatMode, SidcraftApp, UpdatePhase, View, VizMode,
+};
 
 impl eframe::App for SidcraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -49,6 +51,7 @@ impl eframe::App for SidcraftApp {
         self.handle_open_requests(ctx);
         self.handle_dropped_files(ctx);
         self.handle_async_hvsc();
+        self.handle_playlist_download_progress();
         self.handle_seek();
         self.handle_update_async();
         self.maybe_auto_check_updates();
@@ -196,6 +199,9 @@ impl eframe::App for SidcraftApp {
         if self.drop_report.is_some() {
             self.drop_report_window(ctx);
         }
+        if !matches!(self.playlist_download, PlaylistDownloadProgress::Idle) {
+            self.playlist_download_window(ctx);
+        }
 
         // Repaint only as fast as needed: real-time visuals/timing while playing
         // or seeking, a precise wake-up for the inter-track gap, otherwise idle.
@@ -205,7 +211,14 @@ impl eframe::App for SidcraftApp {
         } else if (!self.paused && self.sid_file.name.is_empty() == false) || self.seeking {
             // ~40 FPS for smooth meters, scopes and elapsed time while playing.
             ctx.request_repaint_after(Duration::from_millis(25));
-        } else if self.hvsc_loading || self.export_progress.is_some() || self.update_busy() {
+        } else if self.hvsc_loading
+            || self.export_progress.is_some()
+            || self.update_busy()
+            || matches!(
+                self.playlist_download,
+                PlaylistDownloadProgress::Running { .. }
+            )
+        {
             // Keep the loading state responsive without running at full rate.
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
@@ -871,6 +884,20 @@ impl SidcraftApp {
                             {
                                 self.add_current_to_playlist();
                             }
+                            if icon_button_glyph(
+                                ui,
+                                &t,
+                                "download",
+                                height,
+                                (height * 0.8).min(21.0),
+                                1.6,
+                                false,
+                                "Download current SID file…",
+                            )
+                            .clicked()
+                            {
+                                self.download_current_sid();
+                            }
                         });
                     });
             });
@@ -1533,6 +1560,20 @@ impl SidcraftApp {
                                         .clicked()
                                         {
                                             self.add_current_to_playlist();
+                                        }
+                                        if icon_button_glyph(
+                                            ui,
+                                            &t,
+                                            "download",
+                                            40.0,
+                                            21.0,
+                                            1.6,
+                                            false,
+                                            "Download current SID file…",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.download_current_sid();
                                         }
                                         // Kept in the same right-to-left row so the
                                         // volume slider stays pinned to the right.
@@ -2410,6 +2451,18 @@ impl SidcraftApp {
                     if icon_button(ui, &t, "save", 34.0, false, "Save playlist as…").clicked() {
                         self.save_playlist_as();
                     }
+                    if icon_button(
+                        ui,
+                        &t,
+                        "download",
+                        34.0,
+                        false,
+                        "Download all playlist SID files…",
+                    )
+                    .clicked()
+                    {
+                        self.download_all_playlist_sids();
+                    }
                 });
 
                 let summary = format!(
@@ -2503,6 +2556,21 @@ impl SidcraftApp {
                         self.move_selected_track_to_bottom();
                     }
                     ui.add_space(6.0);
+                    let has_selection = selected < track_count;
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "download",
+                        34.0,
+                        false,
+                        has_selection,
+                        "Download selected SID file…",
+                    )
+                    .clicked()
+                        && has_selection
+                    {
+                        self.download_selected_playlist_sid();
+                    }
                     if icon_button(ui, &t, "play", 34.0, false, "Play all").clicked() {
                         self.play_all();
                         self.view = View::Player;
@@ -3818,6 +3886,98 @@ impl SidcraftApp {
 
         if acknowledged || !open {
             self.drop_report = None;
+        }
+    }
+
+    /// Progress dialog for saving every SID file of a playlist to one folder.
+    fn playlist_download_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let state = self.playlist_download.clone();
+        let (title, done, total, detail, finished) = match &state {
+            PlaylistDownloadProgress::Running {
+                done,
+                total,
+                current,
+                failed,
+            } => {
+                let failures = if *failed > 0 {
+                    format!(" ({failed} failed so far)")
+                } else {
+                    String::new()
+                };
+                (
+                    "Saving playlist SID files",
+                    *done,
+                    *total,
+                    format!("Saving {current}…{failures}"),
+                    false,
+                )
+            }
+            PlaylistDownloadProgress::Finished { total, failed } => {
+                let detail = if *failed == 0 {
+                    format!("Saved all {total} SID files.")
+                } else {
+                    format!(
+                        "Saved {} of {total} SID files; {failed} failed.",
+                        total - failed
+                    )
+                };
+                ("Playlist download complete", *total, *total, detail, true)
+            }
+            PlaylistDownloadProgress::Idle => return,
+        };
+        let fraction = if total == 0 {
+            1.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+
+        let mut open = true;
+        let mut acknowledged = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(16)),
+            )
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.label(
+                    RichText::new(detail)
+                        .font(theme::regular(12.0))
+                        .color(t.text),
+                );
+                ui.add_space(10.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .show_percentage()
+                        .desired_width(ui.available_width()),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{done} / {total} files"))
+                        .font(theme::regular(11.0))
+                        .color(t.text_muted),
+                );
+                if finished {
+                    ui.add_space(12.0);
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if primary_button(ui, &t, "Ok").clicked() {
+                            acknowledged = true;
+                        }
+                    });
+                }
+            });
+
+        // A running job cannot be dismissed: the dialog reappears until it ends.
+        if acknowledged || (!open && finished) {
+            self.playlist_download = PlaylistDownloadProgress::Idle;
         }
     }
 
@@ -5676,6 +5836,26 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
                 pos2(body.right() - s * 0.18, body.bottom() - s * 0.05),
             );
             painter.rect_stroke(label, CornerRadius::same(1), stroke, StrokeKind::Inside);
+        }
+        "download" => {
+            // Down arrow landing on a tray, for saving a SID file to disk.
+            line(pos2(c.x, r.top() + s * 0.06), pos2(c.x, c.y + s * 0.14));
+            poly(vec![
+                pos2(c.x - s * 0.17, c.y + s * 0.06),
+                pos2(c.x + s * 0.17, c.y + s * 0.06),
+                pos2(c.x, c.y + s * 0.32),
+            ]);
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(r.left() + s * 0.06, r.bottom() - s * 0.06),
+                    pos2(c.x - s * 0.16, r.bottom() - s * 0.06),
+                    pos2(c.x - s * 0.16, r.bottom() - s * 0.18),
+                    pos2(c.x + s * 0.16, r.bottom() - s * 0.18),
+                    pos2(c.x + s * 0.16, r.bottom() - s * 0.06),
+                    pos2(r.right() - s * 0.06, r.bottom() - s * 0.06),
+                ],
+                stroke,
+            ));
         }
         "file" => {
             let body = Rect::from_min_max(

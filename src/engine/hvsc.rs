@@ -15,17 +15,22 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Fetches bytes from a URL (http/https) or local path (file://).
-fn fetch_bytes(url: &str) -> io::Result<Vec<u8>> {
-    if let Some(path) = url.strip_prefix("file://") {
+/// Fetches bytes from a URL (http/https), a `file://` URL or a plain local path.
+///
+/// Shared with the download buttons so a playlist entry can be saved as the
+/// original SID file regardless of whether it came from disk or HVSC.
+pub fn fetch_bytes(source: &str) -> io::Result<Vec<u8>> {
+    if let Some(path) = source.strip_prefix("file://") {
         std::fs::read(Path::new(path))
-    } else {
-        let response = ureq::get(url)
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        let response = ureq::get(source)
             .call()
             .map_err(|e| io::Error::other(e.to_string()))?;
         let mut bytes = Vec::new();
         response.into_body().into_reader().read_to_end(&mut bytes)?;
         Ok(bytes)
+    } else {
+        std::fs::read(source)
     }
 }
 
