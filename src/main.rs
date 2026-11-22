@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod csdb;
 mod engine;
 mod favourites;
 mod startup;
@@ -13,6 +14,7 @@ mod update;
 mod visuals;
 mod window_alpha;
 
+use csdb::SidRelease;
 use eframe::egui;
 use engine::audio::AudioOutput;
 use engine::config::Config;
@@ -235,6 +237,35 @@ pub struct HvscMirrorEditor {
     pub location: String,
 }
 
+/// State behind the "Releases Using This SID" dialog.
+#[derive(Clone, Debug)]
+pub struct CsdbReleasesDialog {
+    /// HVSC path sent to CSDb, e.g. `/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid`.
+    pub sid_path: String,
+    pub releases: Vec<SidRelease>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+enum CsdbAsyncMsg {
+    Loaded {
+        generation: u64,
+        releases: Vec<SidRelease>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+impl CsdbAsyncMsg {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Loaded { generation, .. } | Self::Error { generation, .. } => *generation,
+        }
+    }
+}
+
 enum HvscAsyncMsg {
     EntriesLoaded {
         generation: u64,
@@ -339,6 +370,31 @@ fn sid_download_filename(name: &str) -> String {
         cleaned.to_string()
     } else {
         format!("{cleaned}.sid")
+    }
+}
+
+/// Extracts the HVSC-relative SID path CSDb expects from a tune source.
+///
+/// Accepts plain HVSC paths as well as HTTP(S), `file://` and local paths that
+/// contain `/MUSICIANS/…`, and drops an optional `@subsong` suffix.
+fn hvsc_sid_path(source: &str) -> Option<String> {
+    let normalized = source.trim().replace('\\', "/");
+    let without_subsong = match normalized.rfind('@') {
+        Some(at) if normalized[at + 1..].parse::<u16>().is_ok() => &normalized[..at],
+        _ => normalized.as_str(),
+    };
+    let start = without_subsong.find("/MUSICIANS/")?;
+    let mut path = without_subsong[start..].to_string();
+    if let Some(end) = path.find(['?', '#']) {
+        path.truncate(end);
+    }
+    while path.ends_with([' ', '.']) {
+        path.pop();
+    }
+    if path.to_ascii_lowercase().ends_with(".sid") {
+        Some(path)
+    } else {
+        None
     }
 }
 
@@ -468,6 +524,12 @@ pub struct SidcraftApp {
     /// Incremented whenever the selected mirror changes so in-flight results
     /// from the previous mirror can be ignored.
     hvsc_generation: Arc<AtomicU64>,
+
+    // CSDb "Releases using this SID" lookup
+    csdb_releases: Option<CsdbReleasesDialog>,
+    csdb_async_tx: Sender<CsdbAsyncMsg>,
+    csdb_async_rx: Receiver<CsdbAsyncMsg>,
+    csdb_generation: Arc<AtomicU64>,
 
     // Random List panel
     random_playlist_name: String,
@@ -772,9 +834,11 @@ impl SidcraftApp {
         hvsc_browser.load_stil();
 
         let (hvsc_async_tx, hvsc_async_rx) = channel();
+        let (csdb_async_tx, csdb_async_rx) = channel();
         let (seek_tx, seek_rx) = channel();
         let (update_async_tx, update_async_rx) = channel();
         let hvsc_generation = Arc::new(AtomicU64::new(0));
+        let csdb_generation = Arc::new(AtomicU64::new(0));
 
         // Initial fetch of HVSC root directory
         let tx = hvsc_async_tx.clone();
@@ -859,6 +923,10 @@ impl SidcraftApp {
             hvsc_async_tx,
             hvsc_async_rx,
             hvsc_generation,
+            csdb_releases: None,
+            csdb_async_tx,
+            csdb_async_rx,
+            csdb_generation,
             random_playlist_name: String::new(),
             random_track_count: 25,
             random_collections: HvscCollectionFilter::default(),
@@ -2592,6 +2660,93 @@ impl SidcraftApp {
         }
     }
 
+    /// HVSC SID path for the tune this lookup applies to.
+    ///
+    /// While a tune is playing, only its own source is considered so a local
+    /// file can never fall back to an unrelated HVSC selection. With no tune
+    /// playing, an explicitly selected playlist/HVSC entry may still be used.
+    pub fn active_sid_hvsc_path(&self) -> Option<String> {
+        if let Some(source) = self.current_source.as_deref() {
+            return hvsc_sid_path(source);
+        }
+        self.playlist
+            .entries
+            .get(self.selected_playlist_idx)
+            .and_then(|entry| hvsc_sid_path(&entry.source))
+            .or_else(|| {
+                self.hvsc_browser
+                    .entries
+                    .get(self.hvsc_browser.selected)
+                    .filter(|entry| !entry.is_dir)
+                    .and_then(|entry| hvsc_sid_path(&entry.path))
+            })
+    }
+
+    /// Opens the CSDb release dialog for the active HVSC SID.
+    pub fn fetch_sid_releases(&mut self) {
+        if self
+            .csdb_releases
+            .as_ref()
+            .is_some_and(|dialog| dialog.loading)
+        {
+            return;
+        }
+        let Some(sid_path) = self.active_sid_hvsc_path() else {
+            self.set_status("Play an HVSC SID file first");
+            return;
+        };
+
+        self.csdb_releases = Some(CsdbReleasesDialog {
+            sid_path: sid_path.clone(),
+            releases: Vec::new(),
+            loading: true,
+            error: None,
+        });
+        self.set_status(format!("Fetching CSDb releases for {sid_path}…"));
+        let generation = self.csdb_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let tx = self.csdb_async_tx.clone();
+        std::thread::spawn(move || {
+            let message = match csdb::fetch_releases(&sid_path) {
+                Ok(releases) => CsdbAsyncMsg::Loaded {
+                    generation,
+                    releases,
+                },
+                Err(message) => CsdbAsyncMsg::Error {
+                    generation,
+                    message,
+                },
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn handle_csdb_async(&mut self) {
+        while let Ok(message) = self.csdb_async_rx.try_recv() {
+            if message.generation() != self.csdb_generation.load(Ordering::SeqCst) {
+                continue;
+            }
+            let mut status = None;
+            if let Some(dialog) = self.csdb_releases.as_mut() {
+                match message {
+                    CsdbAsyncMsg::Loaded { releases, .. } => {
+                        dialog.loading = false;
+                        dialog.error = None;
+                        status = Some(format!("Found {} CSDb releases", releases.len()));
+                        dialog.releases = releases;
+                    }
+                    CsdbAsyncMsg::Error { message, .. } => {
+                        dialog.loading = false;
+                        dialog.error = Some(message.clone());
+                        status = Some(format!("CSDb error: {message}"));
+                    }
+                }
+            }
+            if let Some(status) = status {
+                self.set_status(status);
+            }
+        }
+    }
+
     /// Runs the startup check 30 seconds after launch, once per session.
     fn maybe_auto_check_updates(&mut self) {
         if self.update_checked_once || !self.config.check_updates {
@@ -3412,7 +3567,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{playlist_search_indices, sid_download_filename};
+    use super::{hvsc_sid_path, playlist_search_indices, sid_download_filename};
     use crate::engine::playlist::{PlaylistEntry, fetch_sid_bytes};
 
     #[test]
@@ -3421,6 +3576,28 @@ mod tests {
         assert_eq!(sid_download_filename("A/B\\C.sid"), "A_B_C.sid");
         assert_eq!(sid_download_filename(" Tune. "), "Tune.sid");
         assert_eq!(sid_download_filename(""), "tune.sid");
+    }
+
+    #[test]
+    fn hvsc_sid_path_accepts_hvsc_http_local_and_subsong_sources() {
+        let expected = "/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid";
+        assert_eq!(hvsc_sid_path(expected), Some(expected.to_string()));
+        assert_eq!(
+            hvsc_sid_path(
+                "https://hvsc.brona.dk/HVSC/C64Music/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid"
+            ),
+            Some(expected.to_string())
+        );
+        assert_eq!(
+            hvsc_sid_path("file://C:/HVSC/C64Music/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid@2"),
+            Some(expected.to_string())
+        );
+        assert_eq!(
+            hvsc_sid_path("C:\\HVSC\\C64Music\\MUSICIANS\\T\\Tel_Jeroen\\RoboCop_3.sid"),
+            Some(expected.to_string())
+        );
+        assert_eq!(hvsc_sid_path("/home/me/tunes/RoboCop_3.sid"), None);
+        assert_eq!(hvsc_sid_path("/MUSICIANS/T/Tel_Jeroen/"), None);
     }
 
     #[test]

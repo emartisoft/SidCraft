@@ -51,6 +51,7 @@ impl eframe::App for SidcraftApp {
         self.handle_open_requests(ctx);
         self.handle_dropped_files(ctx);
         self.handle_async_hvsc();
+        self.handle_csdb_async();
         self.handle_playlist_download_progress();
         self.handle_seek();
         self.handle_update_async();
@@ -187,6 +188,9 @@ impl eframe::App for SidcraftApp {
             if self.show_hvsc_mirror_editor {
                 self.hvsc_mirror_window(ctx);
             }
+            if self.csdb_releases.is_some() {
+                self.csdb_releases_window(ctx);
+            }
             if self.confirm_action.is_some() {
                 self.confirm_window(ctx);
             }
@@ -216,6 +220,7 @@ impl eframe::App for SidcraftApp {
             // ~40 FPS for smooth meters, scopes and elapsed time while playing.
             ctx.request_repaint_after(Duration::from_millis(25));
         } else if self.hvsc_loading
+            || self.csdb_releases.as_ref().is_some_and(|dialog| dialog.loading)
             || self.export_progress.is_some()
             || self.update_busy()
             || matches!(
@@ -1065,6 +1070,29 @@ impl SidcraftApp {
                                     &format!("${load:04X}-${init:04X}-${play:04X}"),
                                 );
                                 property_row_right(ui, &t, "Filter", if self.ekv_filter { "EKV on" } else { "Standard" });
+
+                                if self.active_sid_hvsc_path().is_some() {
+                                    ui.add_space(16.0);
+                                    section_title(ui, &t, "Releases Using This SID");
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(14.0);
+                                        let fetch = ui.add(
+                                            egui::Label::new(
+                                                RichText::new("Fetch Releases")
+                                                    .font(theme::regular(12.0))
+                                                    .color(t.accent_text)
+                                                    .underline(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        let fetch =
+                                            fetch.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if fetch.clicked() {
+                                            self.fetch_sid_releases();
+                                        }
+                                    });
+                                }
 
                                 ui.add_space(16.0);
                                 section_title(ui, &t, "Voices");
@@ -3987,6 +4015,136 @@ impl SidcraftApp {
             self.show_hvsc_mirror_editor = false;
             self.hvsc_mirror_editor_error = None;
         }
+    }
+
+    /// CSDb release list for the SID selected in the Now playing panel.
+    fn csdb_releases_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let Some(dialog) = self.csdb_releases.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+
+        egui::Window::new("Releases Using This SID")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(vec2(640.0, 520.0))
+            .min_size(vec2(420.0, 320.0))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(18)),
+            )
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(ui.available_width());
+                let count = dialog.releases.len();
+                let title = if dialog.loading || dialog.error.is_some() {
+                    "Releases Using This SID".to_string()
+                } else {
+                    format!(
+                        "{count} Release{} Using This SID",
+                        if count == 1 { "" } else { "s" }
+                    )
+                };
+                ui.label(
+                    RichText::new(title)
+                        .font(theme::semibold(16.0))
+                        .color(t.text),
+                );
+                ui.label(
+                    RichText::new(&dialog.sid_path)
+                        .font(theme::regular(11.0))
+                        .color(t.text_faint),
+                );
+                ui.add_space(8.0);
+
+                if dialog.loading {
+                    ui.label(
+                        RichText::new("Fetching releases from CSDb…")
+                            .font(theme::regular(12.0))
+                            .color(t.text_muted),
+                    );
+                }
+                if let Some(error) = &dialog.error {
+                    ui.label(
+                        RichText::new(error)
+                            .font(theme::regular(12.0))
+                            .color(t.accent_text),
+                    );
+                }
+                if !dialog.loading && dialog.error.is_none() && count == 0 {
+                    ui.label(
+                        RichText::new("No releases were found for this SID.")
+                            .font(theme::regular(12.0))
+                            .color(t.text_muted),
+                    );
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        let index_width = count.to_string().len();
+                        for (index, release) in dialog.releases.iter().enumerate() {
+                            if index > 0 {
+                                ui.separator();
+                            }
+                            ui.horizontal(|ui| {
+                                let number = format!("{:>width$}.", index + 1, width = index_width);
+                                ui.label(
+                                    RichText::new(number)
+                                        .font(theme::semibold(16.0))
+                                        .color(t.text),
+                                );
+                                ui.vertical(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    let response = ui.add(egui::Link::new(&release.release));
+                                    if response.clicked() {
+                                        open_url(&crate::csdb::url_for(&release.release_path));
+                                    }
+                                    ui.horizontal_wrapped(|ui| {
+                                        if !release.author.is_empty() {
+                                            ui.label(RichText::new("by").color(t.text_muted));
+                                            let response = ui.add(egui::Link::new(&release.author));
+                                            if response.clicked() {
+                                                open_url(&crate::csdb::url_for(
+                                                    &release.author_path,
+                                                ));
+                                            }
+                                            if !release.info.is_empty() {
+                                                ui.label(RichText::new(",").color(t.text_muted));
+                                            }
+                                        }
+                                        if !release.info.is_empty() {
+                                            ui.label(
+                                                RichText::new(&release.info)
+                                                    .font(theme::regular(11.0))
+                                                    .color(t.text_muted),
+                                            );
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if secondary_button(ui, &t, "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if !open || close {
+            return;
+        }
+        self.csdb_releases = Some(dialog);
     }
 
     fn confirm_window(&mut self, ctx: &egui::Context) {
