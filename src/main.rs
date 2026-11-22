@@ -269,6 +269,26 @@ enum PlaylistDownloadMsg {
     },
 }
 
+/// Indices of playlist entries matching `query`, in playlist order.
+///
+/// Matches against both the display name and the original source path, so a
+/// user can find a tune by title or by its HVSC/folder location.
+fn playlist_search_indices(entries: &[playlist::PlaylistEntry], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.display_name.to_lowercase().contains(&needle)
+                || entry.source.to_lowercase().contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// Turns a playlist display name into a safe SID filename for saving.
 fn sid_download_filename(name: &str) -> String {
     let cleaned: String = name
@@ -386,6 +406,10 @@ pub struct SidcraftApp {
     playlist_drag_from: Option<usize>,
     /// Scroll the selected playlist row into view on the next render.
     playlist_scroll_to_selected: bool,
+    /// Text filter for the playlist track list.
+    pub playlist_search: String,
+    /// Cursor within the current search matches.
+    playlist_search_match: usize,
     playlist_files: Vec<PathBuf>,
     pub show_new_playlist: bool,
     pub new_playlist_name: String,
@@ -768,6 +792,8 @@ impl SidcraftApp {
             selected_playlist_idx: 0,
             playlist_drag_from: None,
             playlist_scroll_to_selected: false,
+            playlist_search: String::new(),
+            playlist_search_match: 0,
             playlist_files,
             show_new_playlist: false,
             new_playlist_name: String::new(),
@@ -1480,6 +1506,8 @@ impl SidcraftApp {
                 self.selected_playlist_idx = 0;
                 self.playlist_drag_from = None;
                 self.playlist_scroll_to_selected = false;
+                self.playlist_search.clear();
+                self.playlist_search_match = 0;
                 self.refresh_playlist_files();
                 if !self.playlist.is_empty() {
                     self.play_playlist_index(0);
@@ -1833,6 +1861,35 @@ impl SidcraftApp {
                 self.playlist_download = PlaylistDownloadProgress::Idle;
             }
         }
+    }
+
+    /// Playlist indices currently matching the search box.
+    pub fn playlist_search_matches(&self) -> Vec<usize> {
+        playlist_search_indices(&self.playlist.entries, &self.playlist_search)
+    }
+
+    /// Keeps the search cursor aligned when a row is selected directly.
+    pub fn sync_playlist_search_cursor(&mut self) {
+        let matches = self.playlist_search_matches();
+        if let Some(pos) = matches
+            .iter()
+            .position(|&idx| idx == self.selected_playlist_idx)
+        {
+            self.playlist_search_match = pos;
+        }
+    }
+
+    /// Selects a search match and scrolls the playlist to that index.
+    pub fn goto_playlist_search_match(&mut self, cursor: usize) {
+        let matches = self.playlist_search_matches();
+        if matches.is_empty() {
+            self.playlist_search_match = 0;
+            return;
+        }
+        let cursor = cursor.min(matches.len() - 1);
+        self.playlist_search_match = cursor;
+        self.selected_playlist_idx = matches[cursor];
+        self.playlist_scroll_to_selected = true;
     }
 
     /// Starts playback of the whole active playlist from its first track.
@@ -3086,8 +3143,8 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sid_download_filename;
-    use crate::engine::playlist::fetch_sid_bytes;
+    use super::{playlist_search_indices, sid_download_filename};
+    use crate::engine::playlist::{PlaylistEntry, fetch_sid_bytes};
 
     #[test]
     fn download_filename_is_safe_and_keeps_sid_extension() {
@@ -3095,6 +3152,32 @@ mod tests {
         assert_eq!(sid_download_filename("A/B\\C.sid"), "A_B_C.sid");
         assert_eq!(sid_download_filename(" Tune. "), "Tune.sid");
         assert_eq!(sid_download_filename(""), "tune.sid");
+    }
+
+    #[test]
+    fn playlist_search_matches_names_and_sources_case_insensitively() {
+        let entries = vec![
+            PlaylistEntry {
+                source: "/MUSICIANS/T/Tel_Jeroen/Myth.sid".to_string(),
+                display_name: "Myth.sid".to_string(),
+                subsong: None,
+            },
+            PlaylistEntry {
+                source: "/MUSICIANS/G/Galway_Martin/Arkanoid.sid".to_string(),
+                display_name: "Arkanoid.sid".to_string(),
+                subsong: None,
+            },
+            PlaylistEntry {
+                source: "/MUSICIANS/M/Martin/Games.sid".to_string(),
+                display_name: "Mythological.sid".to_string(),
+                subsong: Some(2),
+            },
+        ];
+        assert_eq!(playlist_search_indices(&entries, ""), Vec::<usize>::new());
+        assert_eq!(playlist_search_indices(&entries, "MYTH"), vec![0, 2]);
+        assert_eq!(playlist_search_indices(&entries, "tel_jeroen"), vec![0]);
+        assert_eq!(playlist_search_indices(&entries, "  arkanoid  "), vec![1]);
+        assert!(playlist_search_indices(&entries, "missing").is_empty());
     }
 
     #[test]

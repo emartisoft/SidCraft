@@ -873,20 +873,6 @@ impl SidcraftApp {
                             if icon_button_glyph(
                                 ui,
                                 &t,
-                                "plus",
-                                height,
-                                (height * 0.8).min(21.0),
-                                1.6,
-                                false,
-                                "Add current track to playlist",
-                            )
-                            .clicked()
-                            {
-                                self.add_current_to_playlist();
-                            }
-                            if icon_button_glyph(
-                                ui,
-                                &t,
                                 "download",
                                 height,
                                 (height * 0.8).min(21.0),
@@ -897,6 +883,20 @@ impl SidcraftApp {
                             .clicked()
                             {
                                 self.download_current_sid();
+                            }
+                            if icon_button_glyph(
+                                ui,
+                                &t,
+                                "plus",
+                                height,
+                                (height * 0.8).min(21.0),
+                                1.6,
+                                false,
+                                "Add current track to playlist",
+                            )
+                            .clicked()
+                            {
+                                self.add_current_to_playlist();
                             }
                         });
                     });
@@ -2463,6 +2463,10 @@ impl SidcraftApp {
                     {
                         self.download_all_playlist_sids();
                     }
+                    if icon_button(ui, &t, "play", 34.0, false, "Play all").clicked() {
+                        self.play_all();
+                        self.view = View::Player;
+                    }
                 });
 
                 let summary = format!(
@@ -2483,9 +2487,6 @@ impl SidcraftApp {
 
                 ui.add_space(8.0);
                 let track_count = self.playlist.len();
-                let selected = self.selected_playlist_idx;
-                let can_move_up = selected > 0 && selected < track_count;
-                let can_move_down = selected + 1 < track_count;
                 ui.horizontal_wrapped(|ui| {
                     if primary_icon_button(ui, &t, "file-plus", 34.0, "Add files").clicked() {
                         self.add_files_dialog();
@@ -2498,7 +2499,36 @@ impl SidcraftApp {
                     {
                         self.confirm_action = Some(ConfirmAction::RemoveTrack);
                     }
+                    let has_selection = self.selected_playlist_idx < track_count;
                     ui.add_space(6.0);
+                    if icon_button_enabled(
+                        ui,
+                        &t,
+                        "download",
+                        34.0,
+                        false,
+                        has_selection,
+                        "Download selected SID file…",
+                    )
+                    .clicked()
+                        && has_selection
+                    {
+                        self.download_selected_playlist_sid();
+                    }
+                });
+
+                // Track reordering and search share the row below the actions.
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Move Track")
+                            .font(theme::semibold(11.5))
+                            .color(t.text_muted),
+                    );
+                    ui.add_space(2.0);
+                    let selected = self.selected_playlist_idx;
+                    let can_move_up = selected > 0 && selected < track_count;
+                    let can_move_down = selected + 1 < track_count;
                     if icon_button_enabled(
                         ui,
                         &t,
@@ -2555,25 +2585,48 @@ impl SidcraftApp {
                     {
                         self.move_selected_track_to_bottom();
                     }
-                    ui.add_space(6.0);
-                    let has_selection = selected < track_count;
-                    if icon_button_enabled(
-                        ui,
-                        &t,
-                        "download",
-                        34.0,
-                        false,
-                        has_selection,
-                        "Download selected SID file…",
-                    )
-                    .clicked()
-                        && has_selection
-                    {
-                        self.download_selected_playlist_sid();
+
+                    // A 3-4 item-spacing gap separates move from search.
+                    ui.add_space(ui.spacing().item_spacing.x * 4.0);
+
+                    let mut query = self.playlist_search.clone();
+                    search_box(ui, &t, &mut query, 170.0, "Search tracks…");
+                    if query != self.playlist_search {
+                        self.playlist_search = query;
+                        self.goto_playlist_search_match(0);
                     }
-                    if icon_button(ui, &t, "play", 34.0, false, "Play all").clicked() {
-                        self.play_all();
-                        self.view = View::Player;
+                    if !self.playlist_search.trim().is_empty() {
+                        let matches = self.playlist_search_matches();
+                        let count = matches.len();
+                        let cursor = self.playlist_search_match.min(count.saturating_sub(1));
+                        let summary = if count == 0 {
+                            "No matches".to_string()
+                        } else {
+                            format!("{}/{}", cursor + 1, count)
+                        };
+                        ui.label(
+                            RichText::new(summary)
+                                .font(theme::regular(11.0))
+                                .color(t.text_muted),
+                        );
+                        let can_prev = count > 0 && cursor > 0;
+                        let can_next = count > 0 && cursor + 1 < count;
+                        if icon_button_enabled(
+                            ui, &t, "up", 26.0, false, can_prev, "Previous match",
+                        )
+                        .clicked()
+                            && can_prev
+                        {
+                            self.goto_playlist_search_match(cursor - 1);
+                        }
+                        if icon_button_enabled(
+                            ui, &t, "down", 26.0, false, can_next, "Next match",
+                        )
+                        .clicked()
+                            && can_next
+                        {
+                            self.goto_playlist_search_match(cursor + 1);
+                        }
                     }
                 });
                 ui.add_space(12.0);
@@ -2700,6 +2753,7 @@ impl SidcraftApp {
                 if ui.input(|i| i.pointer.primary_released()) {
                     if let Some(from) = drag_from {
                         self.selected_playlist_idx = from;
+                        self.sync_playlist_search_cursor();
                         if let Some(insert) = drop_insert {
                             let to = if insert > from { insert - 1 } else { insert };
                             if to != from && to < self.playlist.len() {
@@ -2716,6 +2770,7 @@ impl SidcraftApp {
                     && let Some(idx) = select
                 {
                     self.selected_playlist_idx = idx;
+                    self.sync_playlist_search_cursor();
                 }
                 if let Some(idx) = play {
                     self.play_playlist_index(idx);
@@ -5685,7 +5740,12 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             line(seam + v, seam - v);
         }
         "trash" => {
-            // Trash can: lid, body and two vertical lines.
+            // Trash can with a cross: a clearer destructive-delete symbol.
+            let handle = Rect::from_min_max(
+                pos2(c.x - s * 0.12, r.top() + s * 0.16),
+                pos2(c.x + s * 0.12, r.top() + s * 0.28),
+            );
+            painter.rect_stroke(handle, CornerRadius::same(1), stroke, StrokeKind::Inside);
             let lid = Rect::from_min_max(
                 pos2(r.left() + s * 0.08, r.top() + s * 0.28),
                 pos2(r.right() - s * 0.08, r.top() + s * 0.4),
@@ -5697,12 +5757,12 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, name: &str, color: Color32, w
             );
             painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
             line(
-                pos2(r.left() + s * 0.24, r.top() + s * 0.32),
-                pos2(r.left() + s * 0.24, r.bottom() - s * 0.08),
+                pos2(body.left() + s * 0.12, body.top() + s * 0.12),
+                pos2(body.right() - s * 0.12, body.bottom() - s * 0.12),
             );
             line(
-                pos2(r.right() - s * 0.24, r.top() + s * 0.32),
-                pos2(r.right() - s * 0.24, r.bottom() - s * 0.08),
+                pos2(body.right() - s * 0.12, body.top() + s * 0.12),
+                pos2(body.left() + s * 0.12, body.bottom() - s * 0.12),
             );
         }
         "list" => {
