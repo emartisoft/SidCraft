@@ -1949,7 +1949,7 @@ impl SidcraftApp {
         let filename = sid_download_filename(suggested_name);
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(&filename)
-            .add_filter("SID Files", &["sid", "mus"])
+            .add_filter("SID Files", &["sid"])
             .save_file()
         else {
             return;
