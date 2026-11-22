@@ -1498,9 +1498,11 @@ impl SidcraftApp {
                                 );
 
                                 // Subsong stepping and volume live on their own row
-                                // below the transport controls.
+                                // below the transport controls. The row wraps on
+                                // narrow windows instead of letting the right-hand
+                                // group overlap the subsong buttons.
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 8.0;
                                     // The chip-model button sits to the left of
                                     // the subsong stepper.
@@ -1545,76 +1547,88 @@ impl SidcraftApp {
                                         self.change_subsong(self.current_song + 1);
                                     }
 
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        // Sized to match the prev/next transport
-                                        // arrows: same glyph box and stroke.
-                                        if icon_button_glyph(
-                                            ui,
-                                            &t,
-                                            "plus",
-                                            40.0,
-                                            21.0,
-                                            1.6,
+                                    // Keep the volume/mute/download/add group on
+                                    // this row. The volume bar takes whatever is
+                                    // left after the three fixed 40 px buttons,
+                                    // so the add button never wraps on its own.
+                                    let spacing = ui.spacing().item_spacing.x;
+                                    // `available_width` reports the whole row in a
+                                    // wrapped layout, so use the cursor-relative
+                                    // rect for the space left on this row.
+                                    let remaining = ui.available_rect_before_wrap().width();
+                                    let fixed_width = 3.0 * 40.0 + 4.0 * spacing;
+                                    let volume_width =
+                                        110.0_f32.min((remaining - fixed_width).max(44.0));
+                                    ui.add_space(
+                                        (remaining - fixed_width - volume_width).max(0.0),
+                                    );
+
+                                    let muted =
+                                        self.muted.load(std::sync::atomic::Ordering::SeqCst);
+                                    let frac = if muted {
+                                        0.0
+                                    } else {
+                                        *self
+                                            .volume
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                    };
+                                    if let Some(f) = volume_bar(ui, &t, frac, volume_width) {
+                                        *self
+                                            .volume
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) = f;
+                                        // Adjusting the slider always leaves mute.
+                                        self.muted.store(
                                             false,
-                                            "Add current track to playlist",
-                                        )
-                                        .clicked()
-                                        {
-                                            self.add_current_to_playlist();
-                                        }
-                                        if icon_button_glyph(
-                                            ui,
-                                            &t,
-                                            "download",
-                                            40.0,
-                                            21.0,
-                                            1.6,
-                                            false,
-                                            "Download current SID file…",
-                                        )
-                                        .clicked()
-                                        {
-                                            self.download_current_sid();
-                                        }
-                                        // Kept in the same right-to-left row so the
-                                        // volume slider stays pinned to the right.
-                                        let muted =
-                                            self.muted.load(std::sync::atomic::Ordering::SeqCst);
-                                        if icon_button_glyph(
-                                            ui,
-                                            &t,
-                                            if muted { "speaker-off" } else { "speaker" },
-                                            40.0,
-                                            21.0,
-                                            1.6,
-                                            false,
-                                            "Mute / unmute",
-                                        )
-                                        .clicked()
-                                        {
-                                            self.muted
-                                                .store(!muted, std::sync::atomic::Ordering::SeqCst);
-                                        }
-                                        let frac = if muted {
-                                            0.0
-                                        } else {
-                                            *self
-                                                .volume
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                        };
-                                        if let Some(f) = volume_bar(ui, &t, frac, 110.0) {
-                                            *self
-                                                .volume
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner()) = f;
-                                            // Adjusting the slider always leaves mute.
-                                            self.muted.store(
-                                                false,
-                                                std::sync::atomic::Ordering::SeqCst,
-                                            );
-                                        }
-                                    });
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                    }
+                                    if icon_button_glyph(
+                                        ui,
+                                        &t,
+                                        if muted { "speaker-off" } else { "speaker" },
+                                        40.0,
+                                        21.0,
+                                        1.6,
+                                        false,
+                                        "Mute / unmute",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.muted
+                                            .store(!muted, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    if icon_button_glyph(
+                                        ui,
+                                        &t,
+                                        "download",
+                                        40.0,
+                                        21.0,
+                                        1.6,
+                                        false,
+                                        "Download current SID file…",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.download_current_sid();
+                                    }
+                                    // Sized to match the prev/next transport
+                                    // arrows: same glyph box and stroke.
+                                    if icon_button_glyph(
+                                        ui,
+                                        &t,
+                                        "plus",
+                                        40.0,
+                                        21.0,
+                                        1.6,
+                                        false,
+                                        "Add current track to playlist",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.add_current_to_playlist();
+                                    }
                                 });
                             });
                         });
