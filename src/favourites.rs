@@ -6,7 +6,7 @@
 //! The list contains curated HVSC paths for the editorial top 100 SIDs.
 //! Each path is appended to the HVSC mirror URL to produce an M3U entry.
 
-use crate::engine::hvsc::DEFAULT_HVSC_URL;
+use crate::engine::hvsc::mirror_resource_url;
 use crate::engine::playlist::{self, Playlist};
 use std::fs;
 use std::io;
@@ -125,23 +125,22 @@ pub fn playlist_path() -> PathBuf {
 }
 
 /// Builds the playlist from the curated list, prefixing each HVSC path with
-/// the mirror URL.
-pub fn build_playlist() -> Playlist {
+/// the selected mirror location.
+pub fn build_playlist(mirror_location: &str) -> Playlist {
     let mut result = Playlist::empty();
     for &path in FAVOURITE_TOP_100 {
-        result.add(&format!("{DEFAULT_HVSC_URL}{path}"), None);
+        result.add(&mirror_resource_url(mirror_location, path), None);
     }
     result
 }
 
 /// The exact M3U text generated from the list without intermediate Playlist allocations.
-fn m3u_content() -> String {
+fn m3u_content(mirror_location: &str) -> String {
     // Ortalama girdi uzunluğu: URL boyutu + ~45 karakter yol + 1 yeni satır
-    let estimated_entry_len = DEFAULT_HVSC_URL.len() + 45;
+    let estimated_entry_len = mirror_location.len() + 45;
     let mut content = String::with_capacity(FAVOURITE_TOP_100.len() * estimated_entry_len);
     for &path in FAVOURITE_TOP_100 {
-        content.push_str(DEFAULT_HVSC_URL);
-        content.push_str(path);
+        content.push_str(&mirror_resource_url(mirror_location, path));
         content.push('\n');
     }
     content
@@ -150,8 +149,9 @@ fn m3u_content() -> String {
 /// Creates the M3U file when enabled, and removes it when disabled.
 ///
 /// Existing content that already matches the list is left untouched, so an
-/// app launch does not rewrite the file unnecessarily.
-pub fn sync(enabled: bool) -> io::Result<()> {
+/// app launch does not rewrite the file unnecessarily. The mirror location is
+/// part of the comparison, so switching mirrors regenerates the playlist.
+pub fn sync(enabled: bool, mirror_location: &str) -> io::Result<()> {
     let path = playlist_path();
     if !enabled {
         return match fs::remove_file(&path) {
@@ -161,12 +161,27 @@ pub fn sync(enabled: bool) -> io::Result<()> {
         };
     }
 
-    let content = m3u_content();
+    let content = m3u_content(mirror_location);
     if fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    build_playlist().save(&path)
+    build_playlist(mirror_location).save(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn favourite_entry_urls_follow_the_selected_mirror() {
+        let playlist = build_playlist("https://hvsc.sannic.nl/?dir=C64Music");
+        assert_eq!(
+            playlist.entries[0].source,
+            "https://hvsc.sannic.nl/C64Music/MUSICIANS/D/Daglish_Ben/Last_Ninja.sid"
+        );
+        assert!(playlist.entries[0].is_url());
+    }
 }

@@ -184,6 +184,9 @@ impl eframe::App for SidcraftApp {
             if self.show_rename_playlist {
                 self.rename_playlist_window(ctx);
             }
+            if self.show_hvsc_mirror_editor {
+                self.hvsc_mirror_window(ctx);
+            }
             if self.confirm_action.is_some() {
                 self.confirm_window(ctx);
             }
@@ -2819,6 +2822,11 @@ impl SidcraftApp {
                         .font(theme::regular(12.0))
                         .color(t.text_muted),
                 );
+                ui.label(
+                    RichText::new(format!("Mirror: {}", self.config.active_hvsc_mirror().name))
+                        .font(theme::regular(11.5))
+                        .color(t.text_faint),
+                );
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
@@ -3653,6 +3661,94 @@ impl SidcraftApp {
                             );
                         });
 
+                        settings_card(ui, &t, "HVSC mirrors", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "The selected mirror is used for browsing, search, random playlists and HVSC playlist entries.",
+                                )
+                                .font(theme::regular(11.5))
+                                .color(t.text_faint),
+                            );
+                            ui.add_space(8.0);
+
+                            let mirrors = self.config.hvsc_mirrors.clone();
+                            let active_id = self.config.active_hvsc_mirror;
+                            let selected_name = mirrors
+                                .iter()
+                                .find(|mirror| mirror.id == active_id)
+                                .map(|mirror| mirror.name.clone())
+                                .unwrap_or_default();
+                            let mut selected = active_id;
+                            egui::ComboBox::from_id_salt("settings-hvsc-mirror")
+                                .width(220.0)
+                                .selected_text(&selected_name)
+                                .show_ui(ui, |ui| {
+                                    for mirror in &mirrors {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            mirror.id,
+                                            mirror.name.as_str(),
+                                        );
+                                    }
+                                });
+                            if selected != active_id {
+                                self.select_hvsc_mirror(selected);
+                            }
+                            ui.add_space(10.0);
+
+                            for mirror in &mirrors {
+                                ui.horizontal(|ui| {
+                                    let name = if mirror.id == active_id {
+                                        format!("{}  (default)", mirror.name)
+                                    } else {
+                                        mirror.name.clone()
+                                    };
+                                    ui.label(
+                                        RichText::new(name)
+                                            .font(theme::medium(12.0))
+                                            .color(t.text),
+                                    );
+                                    ui.label(
+                                        RichText::new(&mirror.location)
+                                            .font(theme::regular(11.0))
+                                            .color(t.text_faint),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    if mirror.id != active_id
+                                        && secondary_button(ui, &t, "Make default").clicked()
+                                    {
+                                        self.select_hvsc_mirror(mirror.id);
+                                    }
+                                    if secondary_button(ui, &t, "Edit").clicked() {
+                                        self.open_hvsc_mirror_editor(Some(mirror.id));
+                                    }
+                                    if secondary_button(ui, &t, "Remove").clicked() {
+                                        self.remove_hvsc_mirror(mirror.id);
+                                    }
+                                });
+                                ui.add_space(6.0);
+                            }
+
+                            ui.horizontal(|ui| {
+                                if secondary_button(ui, &t, "Add mirror").clicked() {
+                                    self.open_hvsc_mirror_editor(None);
+                                }
+                                if secondary_button(ui, &t, "Add local folder…").clicked()
+                                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                                {
+                                    self.add_local_hvsc_folder(path);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "A local folder must point at the C64Music directory of an HVSC copy.",
+                                )
+                                .font(theme::regular(11.0))
+                                .color(t.text_faint),
+                            );
+                        });
+
                         settings_card(ui, &t, "Playback", |ui| {
                             property_row(ui, &t, "SID chip", self.chip_label());
                             property_row(ui, &t, "Clock", self.clock_label());
@@ -3792,6 +3888,104 @@ impl SidcraftApp {
         }
         if !open {
             self.show_new_playlist = false;
+        }
+    }
+
+    fn hvsc_mirror_window(&mut self, ctx: &egui::Context) {
+        let t = Tokens::get(ctx);
+        let mut open = self.show_hvsc_mirror_editor;
+        let mut submit = false;
+        let editing = self.hvsc_mirror_editor.id.is_some();
+        let title = if editing {
+            "Edit HVSC mirror"
+        } else {
+            "Add HVSC mirror"
+        };
+        let error = self.hvsc_mirror_editor_error.clone();
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(20)),
+            )
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(theme::semibold(16.0))
+                        .color(t.text),
+                );
+                ui.label(
+                    RichText::new(
+                        "Use an HVSC directory URL, a ?dir= mirror URL, or a local C64Music folder.",
+                    )
+                    .font(theme::regular(11.5))
+                    .color(t.text_muted),
+                );
+                ui.add_space(10.0);
+
+                ui.label(
+                    RichText::new("Name")
+                        .font(theme::medium(12.0))
+                        .color(t.text),
+                );
+                let name_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.hvsc_mirror_editor.name)
+                        .hint_text("e.g. Local HVSC")
+                        .desired_width(f32::INFINITY)
+                        .font(theme::regular(13.0)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("URL or folder")
+                        .font(theme::medium(12.0))
+                        .color(t.text),
+                );
+                let location_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.hvsc_mirror_editor.location)
+                        .hint_text("https://… or C:\\HVSC\\C64Music")
+                        .desired_width(f32::INFINITY)
+                        .font(theme::regular(13.0)),
+                );
+                if (name_resp.lost_focus() || location_resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    submit = true;
+                }
+
+                if let Some(message) = &error {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(message)
+                            .font(theme::regular(11.5))
+                            .color(t.accent_text),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, &t, "Save").clicked() {
+                        submit = true;
+                    }
+                    if secondary_button(ui, &t, "Cancel").clicked() {
+                        self.show_hvsc_mirror_editor = false;
+                    }
+                });
+            });
+
+        if submit {
+            self.save_hvsc_mirror_editor();
+        }
+        if !open {
+            self.show_hvsc_mirror_editor = false;
+            self.hvsc_mirror_editor_error = None;
         }
     }
 

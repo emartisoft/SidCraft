@@ -17,7 +17,7 @@ use eframe::egui;
 use engine::audio::AudioOutput;
 use engine::config::Config;
 use engine::export::{ExportProgress, ExportSettings};
-use engine::hvsc::{HvscBrowser, HvscCollectionFilter, HvscEntry, DEFAULT_HVSC_URL};
+use engine::hvsc::{HvscBrowser, HvscCollectionFilter, HvscEntry, normalize_mirror_location};
 use engine::player::{
     FilterInfo, NoteSample, SamplingMethod, SharedPlayer, VoiceInfo, create_shared_player,
 };
@@ -226,18 +226,48 @@ pub struct DropReport {
     pub message: String,
 }
 
+/// Draft state behind the Settings → HVSC mirrors editor dialog.
+#[derive(Clone, Debug, Default)]
+pub struct HvscMirrorEditor {
+    /// `Some` while editing an existing mirror, `None` when adding one.
+    pub id: Option<u64>,
+    pub name: String,
+    pub location: String,
+}
+
 enum HvscAsyncMsg {
     EntriesLoaded {
+        generation: u64,
         path: String,
         entries: Vec<HvscEntry>,
     },
-    SearchDone(Vec<String>),
+    SearchDone {
+        generation: u64,
+        results: Vec<String>,
+    },
     SongDownloaded {
+        generation: u64,
         sid: SidFile,
         source: String,
         subsong: u16,
     },
-    Error(String),
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+impl HvscAsyncMsg {
+    /// Mirrors are switched at runtime; results from an older mirror must be
+    /// dropped instead of overwriting the new browser state.
+    fn generation(&self) -> u64 {
+        match self {
+            Self::EntriesLoaded { generation, .. }
+            | Self::SearchDone { generation, .. }
+            | Self::SongDownloaded { generation, .. }
+            | Self::Error { generation, .. } => *generation,
+        }
+    }
 }
 
 /// Progress of a batch job saving every SID file of a playlist to one folder.
@@ -435,6 +465,9 @@ pub struct SidcraftApp {
     hvsc_loading: bool,
     hvsc_async_tx: Sender<HvscAsyncMsg>,
     hvsc_async_rx: Receiver<HvscAsyncMsg>,
+    /// Incremented whenever the selected mirror changes so in-flight results
+    /// from the previous mirror can be ignored.
+    hvsc_generation: Arc<AtomicU64>,
 
     // Random List panel
     random_playlist_name: String,
@@ -499,6 +532,9 @@ pub struct SidcraftApp {
     config: Config,
 
     // UI state
+    pub show_hvsc_mirror_editor: bool,
+    pub hvsc_mirror_editor: HvscMirrorEditor,
+    pub hvsc_mirror_editor_error: Option<String>,
     pub status_message: String,
     status_timer: Instant,
     /// Window geometry changed and still needs to be written to the config.
@@ -572,11 +608,14 @@ fn startup_playlist(config: &Config) -> (Playlist, PathBuf) {
 
 /// Loads the first entry of `playlist`, or a silent stub when the playlist is
 /// empty or its first file cannot be read.
-fn first_playlist_tune(playlist: &Playlist) -> (SidFile, u16, Option<String>) {
+fn first_playlist_tune(
+    playlist: &Playlist,
+    mirror_location: &str,
+) -> (SidFile, u16, Option<String>) {
     let Some(entry) = playlist.entries.first() else {
         return (SidFile::silent(), 1, None);
     };
-    match entry.load() {
+    match entry.load_with_mirror(mirror_location) {
         Ok(sid) => {
             let song = entry.subsong.unwrap_or(sid.start_song);
             (sid, song, Some(entry.source.clone()))
@@ -603,6 +642,7 @@ impl SidcraftApp {
         Self::set_macos_window_transparency(&ctx, false);
         startup::set_wakeup(move || ctx.request_repaint());
         let config = Config::load();
+        let active_mirror_location = config.active_hvsc_mirror().location.clone();
         // Remembered filter model: 6581 chips use the EKV transistor model
         // when the user turned it on in Settings or the player panel.
         let ekv_filter = config.ekv_filter;
@@ -610,7 +650,7 @@ impl SidcraftApp {
         let mut startup_error = None;
         // The library always contains a Default playlist, and the optional
         // Favourite Top 100 file follows the saved setting before it is listed.
-        if let Err(e) = favourites::sync(config.show_favourite_top_100) {
+        if let Err(e) = favourites::sync(config.show_favourite_top_100, &active_mirror_location) {
             eprintln!("Could not update favourite playlist: {e}");
         }
         let (mut playlist, mut playlist_path) = startup_playlist(&config);
@@ -639,26 +679,24 @@ impl SidcraftApp {
             playlist_files.push(playlist_path.clone());
         }
 
-        let (sid_file, initial_song, initial_source) = match startup_path
-            .as_deref()
-            .filter(|path| startup::is_sid(path))
-        {
-            Some(path) => match SidFile::load(path) {
-                Ok(sid) => {
-                    let song = sid.start_song;
-                    let source = path.to_string_lossy().to_string();
-                    (sid, song, Some(source))
-                }
-                Err(e) => {
-                    startup_error = Some(format!(
-                        "Could not open {}: {e}; continuing with the playlist",
-                        path.display()
-                    ));
-                    first_playlist_tune(&playlist)
-                }
-            },
-            None => first_playlist_tune(&playlist),
-        };
+        let (sid_file, initial_song, initial_source) =
+            match startup_path.as_deref().filter(|path| startup::is_sid(path)) {
+                Some(path) => match SidFile::load(path) {
+                    Ok(sid) => {
+                        let song = sid.start_song;
+                        let source = path.to_string_lossy().to_string();
+                        (sid, song, Some(source))
+                    }
+                    Err(e) => {
+                        startup_error = Some(format!(
+                            "Could not open {}: {e}; continuing with the playlist",
+                            path.display()
+                        ));
+                        first_playlist_tune(&playlist, &active_mirror_location)
+                    }
+                },
+                None => first_playlist_tune(&playlist, &active_mirror_location),
+            };
 
         let audio = match AudioOutput::probe() {
             Ok(a) => a,
@@ -730,12 +768,13 @@ impl SidcraftApp {
             }
         };
 
-        let mut hvsc_browser = HvscBrowser::new(engine::hvsc::DEFAULT_HVSC_URL);
+        let mut hvsc_browser = HvscBrowser::new(&active_mirror_location);
         hvsc_browser.load_stil();
 
         let (hvsc_async_tx, hvsc_async_rx) = channel();
         let (seek_tx, seek_rx) = channel();
         let (update_async_tx, update_async_rx) = channel();
+        let hvsc_generation = Arc::new(AtomicU64::new(0));
 
         // Initial fetch of HVSC root directory
         let tx = hvsc_async_tx.clone();
@@ -744,12 +783,16 @@ impl SidcraftApp {
         std::thread::spawn(move || match browser_clone.list() {
             Ok(entries) => {
                 let _ = tx.send(HvscAsyncMsg::EntriesLoaded {
+                    generation: 0,
                     path: root_path,
                     entries,
                 });
             }
             Err(e) => {
-                let _ = tx.send(HvscAsyncMsg::Error(e.to_string()));
+                let _ = tx.send(HvscAsyncMsg::Error {
+                    generation: 0,
+                    message: e.to_string(),
+                });
             }
         });
 
@@ -815,6 +858,7 @@ impl SidcraftApp {
             hvsc_loading: true,
             hvsc_async_tx,
             hvsc_async_rx,
+            hvsc_generation,
             random_playlist_name: String::new(),
             random_track_count: 25,
             random_collections: HvscCollectionFilter::default(),
@@ -855,6 +899,9 @@ impl SidcraftApp {
             show_about: false,
             global_search: String::new(),
             config,
+            show_hvsc_mirror_editor: false,
+            hvsc_mirror_editor: HvscMirrorEditor::default(),
+            hvsc_mirror_editor_error: None,
             status_message: "Welcome to SidCraft".into(),
             status_timer: Instant::now(),
             geometry_dirty: false,
@@ -931,6 +978,185 @@ impl SidcraftApp {
             self.config.start_in_mini = self.start_in_mini;
             self.config.save();
         }
+    }
+
+    /// Current HVSC mirror generation, attached to every browser task.
+    fn hvsc_generation(&self) -> u64 {
+        self.hvsc_generation.load(Ordering::SeqCst)
+    }
+
+    /// Validates and normalises a mirror entry before it is persisted.
+    fn validate_hvsc_mirror(
+        &self,
+        name: &str,
+        location: &str,
+        ignore_id: Option<u64>,
+    ) -> Result<(String, String), String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("Enter a name for the mirror.".to_string());
+        }
+        let location = normalize_mirror_location(location);
+        if location.is_empty() {
+            return Err("Enter a mirror URL or local HVSC folder.".to_string());
+        }
+        let is_remote = location.starts_with("http://") || location.starts_with("https://");
+        if !is_remote {
+            let local_path = location.strip_prefix("file://").unwrap_or(&location);
+            if !Path::new(local_path).is_dir() {
+                return Err(format!("Folder does not exist: {local_path}"));
+            }
+        }
+        if self
+            .config
+            .hvsc_mirrors
+            .iter()
+            .any(|mirror| Some(mirror.id) != ignore_id && mirror.location == location)
+        {
+            return Err("That mirror is already in the list.".to_string());
+        }
+        Ok((name, location))
+    }
+
+    /// Opens the Settings mirror dialog for a new or existing mirror.
+    pub fn open_hvsc_mirror_editor(&mut self, id: Option<u64>) {
+        self.hvsc_mirror_editor =
+            match id.and_then(|id| self.config.hvsc_mirrors.iter().find(|m| m.id == id)) {
+                Some(mirror) => HvscMirrorEditor {
+                    id: Some(mirror.id),
+                    name: mirror.name.clone(),
+                    location: mirror.location.clone(),
+                },
+                None => HvscMirrorEditor::default(),
+            };
+        self.hvsc_mirror_editor_error = None;
+        self.show_hvsc_mirror_editor = true;
+    }
+
+    /// Prefills the mirror editor with a folder chosen in a native dialog.
+    pub fn add_local_hvsc_folder(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Local HVSC".to_string());
+        self.hvsc_mirror_editor = HvscMirrorEditor {
+            id: None,
+            name,
+            location: path.to_string_lossy().to_string(),
+        };
+        self.hvsc_mirror_editor_error = None;
+        self.show_hvsc_mirror_editor = true;
+    }
+
+    /// Commits the Settings mirror editor. Returns true when it was saved.
+    pub fn save_hvsc_mirror_editor(&mut self) -> bool {
+        let editor = self.hvsc_mirror_editor.clone();
+        let (name, location) =
+            match self.validate_hvsc_mirror(&editor.name, &editor.location, editor.id) {
+                Ok(value) => value,
+                Err(message) => {
+                    self.hvsc_mirror_editor_error = Some(message.clone());
+                    self.set_status(message);
+                    return false;
+                }
+            };
+
+        let active_id = self.config.active_hvsc_mirror;
+        match editor.id {
+            Some(id) => {
+                let Some(mirror) = self.config.hvsc_mirrors.iter_mut().find(|m| m.id == id) else {
+                    let message = "That mirror no longer exists.".to_string();
+                    self.hvsc_mirror_editor_error = Some(message.clone());
+                    self.set_status(message);
+                    return false;
+                };
+                mirror.name = name;
+                mirror.location = location;
+            }
+            None => {
+                let id = self
+                    .config
+                    .hvsc_mirrors
+                    .iter()
+                    .map(|mirror| mirror.id)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                self.config
+                    .hvsc_mirrors
+                    .push(engine::config::HvscMirror { id, name, location });
+            }
+        }
+
+        self.config.save();
+        let active_location = self.config.active_hvsc_mirror().location.clone();
+        let active_was_edited = editor.id == Some(active_id);
+        if active_location != self.hvsc_browser.base_url || active_was_edited {
+            self.apply_hvsc_mirror();
+        }
+        self.show_hvsc_mirror_editor = false;
+        self.hvsc_mirror_editor = HvscMirrorEditor::default();
+        self.hvsc_mirror_editor_error = None;
+        self.set_status("HVSC mirrors updated");
+        true
+    }
+
+    /// Removes a mirror, falling back to the first one when it was active.
+    pub fn remove_hvsc_mirror(&mut self, id: u64) {
+        if self.config.hvsc_mirrors.len() <= 1 {
+            self.set_status("At least one HVSC mirror is required");
+            return;
+        }
+        let Some(mirror) = self
+            .config
+            .hvsc_mirrors
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+        else {
+            self.set_status("That mirror no longer exists");
+            return;
+        };
+        self.config.hvsc_mirrors.retain(|m| m.id != id);
+        if self.config.active_hvsc_mirror == id {
+            self.config.active_hvsc_mirror = self.config.hvsc_mirrors[0].id;
+            self.apply_hvsc_mirror();
+        } else {
+            self.config.save();
+        }
+        self.set_status(format!("Removed HVSC mirror “{}”", mirror.name));
+    }
+
+    /// Makes `id` the active mirror and applies it immediately.
+    pub fn select_hvsc_mirror(&mut self, id: u64) {
+        if !self.config.hvsc_mirrors.iter().any(|m| m.id == id) {
+            return;
+        }
+        self.config.active_hvsc_mirror = id;
+        self.apply_hvsc_mirror();
+    }
+
+    /// Applies the configured mirror to the browser, playlists and downloads.
+    fn apply_hvsc_mirror(&mut self) {
+        let mirror = self.config.active_hvsc_mirror().clone();
+        if mirror.location == self.hvsc_browser.base_url {
+            self.config.save();
+            return;
+        }
+
+        self.hvsc_generation.fetch_add(1, Ordering::SeqCst);
+        self.hvsc_browser.set_mirror(&mirror.location);
+        self.hvsc_loading = true;
+        self.hvsc_search_query.clear();
+        self.hvsc_search_results.clear();
+        self.hvsc_search_selected = 0;
+        self.hvsc_browser.load_stil();
+
+        self.sync_favourite_playlist();
+        self.config.save();
+        self.hvsc_open_dir("/");
+        self.set_status(format!("Using HVSC mirror “{}”", mirror.name));
     }
 
     pub fn load_sid_direct(&mut self, sid: SidFile, song: Option<u16>, source: Option<String>) {
@@ -1097,7 +1323,8 @@ impl SidcraftApp {
         }
         self.selected_playlist_idx = idx;
         let entry = self.playlist.entries[idx].clone();
-        match entry.load() {
+        let mirror = self.hvsc_browser.base_url.clone();
+        match entry.load_with_mirror(&mirror) {
             Ok(sid) => {
                 let song = entry.subsong.unwrap_or(sid.start_song);
                 self.load_sid_direct(sid, Some(song), Some(entry.source));
@@ -1544,8 +1771,9 @@ impl SidcraftApp {
         let favourite_path = favourites::playlist_path();
         let was_active = self.playlist_path == favourite_path;
         let enabled = self.config.show_favourite_top_100;
+        let mirror = self.hvsc_browser.base_url.clone();
 
-        if let Err(e) = favourites::sync(enabled) {
+        if let Err(e) = favourites::sync(enabled, &mirror) {
             self.set_status(format!("Could not update favourite playlist: {e}"));
             return;
         }
@@ -1559,6 +1787,16 @@ impl SidcraftApp {
             self.playlist_drag_from = None;
             self.playlist_scroll_to_selected = false;
             self.sync_config();
+        } else if enabled && was_active {
+            // The file was regenerated for the selected mirror, so the active
+            // playlist's sources need refreshing even though the path is the same.
+            match Playlist::load(&favourite_path) {
+                Ok(playlist) => self.playlist = playlist,
+                Err(e) => self.set_status(format!("Could not reload favourite playlist: {e}")),
+            }
+            self.selected_playlist_idx = 0;
+            self.playlist_drag_from = None;
+            self.playlist_scroll_to_selected = false;
         }
         self.refresh_playlist_files();
         self.set_status(format!(
@@ -1642,7 +1880,7 @@ impl SidcraftApp {
 
         let mut list = Playlist::empty();
         for hvsc_path in paths {
-            list.add(&format!("{DEFAULT_HVSC_URL}{hvsc_path}"), None);
+            list.add(&self.hvsc_browser.resource_url(&hvsc_path), None);
         }
         if let Err(e) = list.save(&path) {
             self.fail_random_list(&format!("Could not save random playlist: {e}"));
@@ -1716,7 +1954,8 @@ impl SidcraftApp {
         else {
             return;
         };
-        match playlist::fetch_sid_bytes(source) {
+        let mirror = self.hvsc_browser.base_url.clone();
+        match playlist::fetch_sid_bytes_with_fallback(source, &mirror) {
             Ok(bytes) => match fs::write(&path, &bytes) {
                 Ok(()) => self.set_status(format!("Saved “{filename}” to {}", path.display())),
                 Err(e) => self.set_status(format!("Could not save SID file: {e}")),
@@ -1791,12 +2030,13 @@ impl SidcraftApp {
             current: jobs[0].1.clone(),
             failed: 0,
         };
+        let mirror = self.hvsc_browser.base_url.clone();
         self.set_status(format!("Saving {total} SID files to {}…", dir.display()));
 
         std::thread::spawn(move || {
             let mut failed = 0usize;
             for (index, (source, name)) in jobs.iter().enumerate() {
-                let result = playlist::fetch_sid_bytes(source)
+                let result = playlist::fetch_sid_bytes_with_fallback(source, &mirror)
                     .and_then(|bytes| fs::write(dir.join(name), bytes));
                 if result.is_err() {
                     failed += 1;
@@ -2215,13 +2455,20 @@ impl SidcraftApp {
         self.hvsc_search_results.clear();
         let tx = self.hvsc_async_tx.clone();
         let browser = self.hvsc_browser.clone();
+        let generation = self.hvsc_generation();
         self.set_status(format!("Searching HVSC for \"{query}\"…"));
         std::thread::spawn(move || match browser.search(&query) {
-            Ok(res) => {
-                let _ = tx.send(HvscAsyncMsg::SearchDone(res));
+            Ok(results) => {
+                let _ = tx.send(HvscAsyncMsg::SearchDone {
+                    generation,
+                    results,
+                });
             }
             Err(e) => {
-                let _ = tx.send(HvscAsyncMsg::Error(e.to_string()));
+                let _ = tx.send(HvscAsyncMsg::Error {
+                    generation,
+                    message: e.to_string(),
+                });
             }
         });
     }
@@ -2256,17 +2503,22 @@ impl SidcraftApp {
 
         let tx = self.hvsc_async_tx.clone();
         let mut browser = self.hvsc_browser.clone();
+        let generation = self.hvsc_generation();
         std::thread::spawn(move || {
             browser.current_path = target.clone();
             match browser.list() {
                 Ok(entries) => {
                     let _ = tx.send(HvscAsyncMsg::EntriesLoaded {
+                        generation,
                         path: target,
                         entries,
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(HvscAsyncMsg::Error(e.to_string()));
+                    let _ = tx.send(HvscAsyncMsg::Error {
+                        generation,
+                        message: e.to_string(),
+                    });
                 }
             }
         });
@@ -2278,35 +2530,45 @@ impl SidcraftApp {
         self.set_status(format!("Loading {path}…"));
         let tx = self.hvsc_async_tx.clone();
         let browser = self.hvsc_browser.clone();
+        let generation = self.hvsc_generation();
         let path = path.to_string();
         // Store the full URL in the playlist so entries stay loadable even when
         // they are played outside the HVSC browser.
-        let source = format!("{DEFAULT_HVSC_URL}{path}");
+        let source = browser.resource_url(&path);
         std::thread::spawn(move || match browser.fetch_entry(&path) {
             Ok(sid) => {
                 let subsong = sid.start_song;
                 let _ = tx.send(HvscAsyncMsg::SongDownloaded {
+                    generation,
                     sid,
                     source,
                     subsong,
                 });
             }
             Err(e) => {
-                let _ = tx.send(HvscAsyncMsg::Error(e.to_string()));
+                let _ = tx.send(HvscAsyncMsg::Error {
+                    generation,
+                    message: e.to_string(),
+                });
             }
         });
     }
 
     fn handle_async_hvsc(&mut self) {
+        let current_generation = self.hvsc_generation();
         while let Ok(msg) = self.hvsc_async_rx.try_recv() {
+            // A mirror switch invalidates everything already in flight.
+            if msg.generation() != current_generation {
+                continue;
+            }
             self.hvsc_loading = false;
             match msg {
-                HvscAsyncMsg::EntriesLoaded { path, entries } => {
+                HvscAsyncMsg::EntriesLoaded { path, entries, .. } => {
                     self.hvsc_browser.current_path = path;
                     self.hvsc_browser.entries = entries;
                     self.hvsc_browser.selected = 0;
                 }
-                HvscAsyncMsg::SearchDone(results) => {
+                HvscAsyncMsg::SearchDone { results, .. } => {
                     self.hvsc_search_results = results;
                     self.hvsc_search_selected = 0;
                     self.set_status(format!("Found {} tunes", self.hvsc_search_results.len()));
@@ -2315,6 +2577,7 @@ impl SidcraftApp {
                     sid,
                     source,
                     subsong,
+                    ..
                 } => {
                     // Playing a tune from the HVSC browser must not touch the
                     // playlist: only explicit user actions should add tracks.
@@ -2322,8 +2585,8 @@ impl SidcraftApp {
                     // away when the user wants to watch it.
                     self.load_sid_direct(sid, Some(subsong), Some(source));
                 }
-                HvscAsyncMsg::Error(err) => {
-                    self.set_status(format!("HVSC error: {err}"));
+                HvscAsyncMsg::Error { message, .. } => {
+                    self.set_status(format!("HVSC error: {message}"));
                 }
             }
         }

@@ -11,6 +11,7 @@ use crate::engine::sid_file::SidFile;
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,15 +51,118 @@ fn fetch_text(url: &str) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::other(e.to_string()))
 }
 
-/// Default HVSC mirror URL.
+/// Default HVSC mirror URL (also used for legacy playlist sources).
 pub const DEFAULT_HVSC_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music";
+/// Second built-in mirror. Its `?dir=` parameter lists folders; raw files are
+/// served from the same path without the query string.
+pub const DEFAULT_HVSC_QUERY_URL: &str = "https://hvsc.sannic.nl/?dir=C64Music";
+
+/// How a configured HVSC location has to be addressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HvscMirrorKind {
+    /// Plain Apache-style directory listing over HTTP(S).
+    Directory,
+    /// Directory lister driven by a `?dir=` query parameter (e.g. SaNNiC).
+    QueryDirectory,
+    /// Local folder, stored as a `file://` URL or an absolute path.
+    Local,
+}
+
+/// Classifies a configured location.
+pub fn mirror_kind(location: &str) -> HvscMirrorKind {
+    if location.starts_with("file://") || Path::new(location).is_absolute() {
+        HvscMirrorKind::Local
+    } else if location.contains("?dir=") {
+        HvscMirrorKind::QueryDirectory
+    } else {
+        HvscMirrorKind::Directory
+    }
+}
+
+/// Normalises a user-entered mirror location.
+///
+/// HTTP(S) URLs are kept as-is (minus trailing slashes). Local folders become
+/// `file://` URLs with forward slashes so the existing fetch layer can read
+/// them on every platform.
+pub fn normalize_mirror_location(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let trimmed = trimmed.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let path = rest.replace('\\', "/");
+        return format!("file://{}", strip_windows_slash(&path));
+    }
+    if Path::new(trimmed).is_absolute() {
+        return format!(
+            "file://{}",
+            strip_windows_slash(&trimmed.replace('\\', "/"))
+        );
+    }
+    trimmed.to_string()
+}
+
+fn strip_windows_slash(path: &str) -> &str {
+    if cfg!(windows) {
+        path.trim_start_matches('/')
+    } else {
+        path
+    }
+}
+
+/// Ensures an HVSC-relative path starts with exactly one slash.
+fn normalized_hvsc_path(path: &str) -> String {
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path.trim_start_matches('/'))
+    }
+}
+
+/// URL used to list a directory on the mirror.
+///
+/// Both supported HTTP mirror styles accept the HVSC path appended to the
+/// configured location; for `?dir=` mirrors that extends the query value.
+pub fn mirror_listing_url(location: &str, path: &str) -> String {
+    format!(
+        "{}{}",
+        location.trim_end_matches('/'),
+        normalized_hvsc_path(path)
+    )
+}
+
+/// URL used to fetch a raw file (SID, STIL, Songlengths, release notes).
+///
+/// A `?dir=` lister only serves HTML for its query URLs, so raw files are
+/// requested from the equivalent path on the same host.
+pub fn mirror_resource_url(location: &str, path: &str) -> String {
+    let path = normalized_hvsc_path(path);
+    if let Some((prefix, directory)) = location.split_once("?dir=") {
+        format!(
+            "{}/{}{}",
+            prefix.trim_end_matches('/'),
+            directory.trim_matches('/'),
+            path
+        )
+    } else {
+        format!("{}{}", location.trim_end_matches('/'), path)
+    }
+}
 
 /// Fetches the HVSC release number from `DOCUMENTS/hv_sids.txt`.
 ///
 /// That file begins with a stub comment line and then a line such as
 /// `Release 85`, which is the collection version shown in the browser title.
 pub fn fetch_release(base_url: &str) -> io::Result<Option<u32>> {
-    let content = fetch_text(&format!("{base_url}/DOCUMENTS/hv_sids.txt"))?;
+    let url = mirror_resource_url(base_url, "/DOCUMENTS/hv_sids.txt");
+    let content = fetch_text(&url)?;
     Ok(parse_release(&content))
 }
 
@@ -84,12 +188,21 @@ fn cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Clears the HVSC cache files.
+/// Clears the HVSC cache files for every configured mirror.
 #[allow(dead_code)] // kept for the remote-driven browser API
 pub fn clear_cache() {
     let Some(dir) = cache_dir() else { return };
     for name in [StilDatabase::CACHE_NAME, SonglengthsDatabase::CACHE_NAME] {
+        // Older SidCraft releases wrote one cache file without a mirror key.
         let _ = fs::remove_file(dir.join(name));
+        if let Ok(entries) = fs::read_dir(&dir) {
+            let prefix = format!("{name}.");
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -102,9 +215,22 @@ fn read_file(path: &Path, latin1: bool) -> io::Result<String> {
     }
 }
 
+/// Gives each mirror its own cache entry so switching mirrors cannot reuse
+/// another collection's STIL or song lengths.
+fn cache_file_name(base_url: &str, cache_name: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base_url.hash(&mut hasher);
+    format!("{cache_name}.{:016x}", hasher.finish())
+}
+
 /// Reads cached file if present, otherwise fetches from URL and caches result.
-fn fetch_with_cache(url: &str, cache_name: &str, latin1: bool) -> io::Result<String> {
-    let cache_path = cache_dir().map(|d| d.join(cache_name));
+fn fetch_with_cache(
+    base_url: &str,
+    url: &str,
+    cache_name: &str,
+    latin1: bool,
+) -> io::Result<String> {
+    let cache_path = cache_dir().map(|d| d.join(cache_file_name(base_url, cache_name)));
 
     if let Some(ref path) = cache_path {
         match read_file(path, latin1) {
@@ -146,8 +272,8 @@ impl StilDatabase {
 
     /// Fetches and parses the STIL file from HVSC, using cache if available.
     pub fn fetch(base_url: &str) -> io::Result<Self> {
-        let url = format!("{base_url}/DOCUMENTS/{}", Self::CACHE_NAME);
-        let content = fetch_with_cache(&url, Self::CACHE_NAME, true)?;
+        let url = mirror_resource_url(base_url, &format!("/DOCUMENTS/{}", Self::CACHE_NAME));
+        let content = fetch_with_cache(base_url, &url, Self::CACHE_NAME, true)?;
         Ok(Self::parse(&content))
     }
 
@@ -215,8 +341,8 @@ impl SonglengthsDatabase {
 
     /// Fetches and parses the Songlengths.md5 file from HVSC, using cache if available.
     pub fn fetch(base_url: &str) -> io::Result<Self> {
-        let url = format!("{base_url}/DOCUMENTS/{}", Self::CACHE_NAME);
-        let content = fetch_with_cache(&url, Self::CACHE_NAME, false)?;
+        let url = mirror_resource_url(base_url, &format!("/DOCUMENTS/{}", Self::CACHE_NAME));
+        let content = fetch_with_cache(base_url, &url, Self::CACHE_NAME, false)?;
         Ok(Self::parse(&content))
     }
 
@@ -303,7 +429,7 @@ pub struct HvscEntry {
 impl HvscEntry {
     /// Returns the full URL for this entry.
     pub fn url(&self, base_url: &str) -> String {
-        format!("{base_url}{}", self.path)
+        mirror_resource_url(base_url, &self.path)
     }
 
     /// Loads this entry as a SID file (only valid for files).
@@ -482,8 +608,14 @@ fn root_entries() -> Vec<HvscEntry> {
 impl HvscBrowser {
     /// Creates a new browser at the root level.
     pub fn new(base_url: &str) -> Self {
+        let base_url = normalize_mirror_location(base_url);
+        let base_url = if base_url.is_empty() {
+            DEFAULT_HVSC_URL.to_string()
+        } else {
+            base_url
+        };
         Self {
-            base_url: base_url.to_string(),
+            base_url,
             current_path: "/".to_string(),
             entries: root_entries(),
             selected: 0,
@@ -627,9 +759,33 @@ impl HvscBrowser {
         pool.into_iter().take(take).map(str::to_string).collect()
     }
 
+    /// URL used to store and fetch a raw file on the active mirror.
+    pub fn resource_url(&self, path: &str) -> String {
+        mirror_resource_url(&self.base_url, path)
+    }
+
+    /// Points the browser at a different mirror and drops stale derived state.
+    /// The caller decides when to reload the metadata databases.
+    pub fn set_mirror(&mut self, location: &str) {
+        let location = normalize_mirror_location(location);
+        if location.is_empty() || location == self.base_url {
+            return;
+        }
+        self.base_url = location;
+        self.current_path = "/".to_string();
+        self.entries = root_entries();
+        self.selected = 0;
+        self.stil = None;
+        self.stil_error = None;
+        self.songlengths = None;
+        self.release = None;
+        self.search_index = Arc::new(Vec::new());
+        self.error = None;
+    }
+
     /// Fetches a specific entry as a SID file from HVSC.
     pub fn fetch_entry(&self, path: &str) -> io::Result<SidFile> {
-        let url = format!("{}{}", self.base_url, path);
+        let url = self.resource_url(path);
         let bytes = fetch_bytes(&url)?;
         SidFile::parse(&bytes)
     }
@@ -719,10 +875,13 @@ impl HvscBrowser {
 
 /// Fetches and parses a directory listing from HVSC.
 fn fetch_directory(base_url: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
-    if let Some(base_path) = base_url.strip_prefix("file://") {
-        read_local_directory(base_path, path)
-    } else {
-        fetch_http_directory(base_url, path)
+    match mirror_kind(base_url) {
+        HvscMirrorKind::Local => {
+            let base_path = base_url.strip_prefix("file://").unwrap_or(base_url);
+            read_local_directory(base_path, path)
+        }
+        HvscMirrorKind::QueryDirectory => fetch_query_directory(base_url, path),
+        HvscMirrorKind::Directory => fetch_http_directory(base_url, path),
     }
 }
 
@@ -776,10 +935,59 @@ fn is_browsable(is_dir: bool, name: &str) -> bool {
     }
 }
 
-/// Fetches and parses an HTTP directory listing.
+/// Fetches and parses an Apache-style HTTP directory listing.
 fn fetch_http_directory(base_url: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
-    let html = fetch_text(&format!("{base_url}{path}"))?;
+    let html = fetch_text(&mirror_listing_url(base_url, path))?;
     Ok(parse_directory_listing(&html, path))
+}
+
+/// Fetches and parses a `?dir=`-driven directory listing.
+fn fetch_query_directory(base_url: &str, path: &str) -> io::Result<Vec<HvscEntry>> {
+    let html = fetch_text(&mirror_listing_url(base_url, path))?;
+    Ok(parse_query_directory_listing(&html, path))
+}
+
+/// Reads a quoted HTML attribute from a listing row.
+fn attr_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("{key}=\"");
+    let (_, rest) = line.split_once(marker.as_str())?;
+    let (value, _) = rest.split_once('"')?;
+    Some(value)
+}
+
+/// Parses the SaNNiC-style `<li data-name="…" data-href="…">` listing.
+fn parse_query_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
+    let mut entries: Vec<HvscEntry> = html
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("<li data-name=") {
+                return None;
+            }
+            let name = attr_value(line, "data-name")?;
+            if name == ".." {
+                return None;
+            }
+            let href = attr_value(line, "data-href")?;
+            let is_dir = href.starts_with("?dir=");
+            if !is_browsable(is_dir, name) {
+                return None;
+            }
+            let entry_path = if is_dir {
+                format!("{base_path}{name}/")
+            } else {
+                format!("{base_path}{name}")
+            };
+            Some(HvscEntry {
+                name: name.to_string(),
+                path: entry_path,
+                is_dir,
+            })
+        })
+        .collect();
+
+    sort_entries(&mut entries);
+    entries
 }
 
 /// Extracts href value from an HTML line, filtering navigation/special links.
@@ -823,3 +1031,112 @@ fn parse_directory_listing(html: &str, base_path: &str) -> Vec<HvscEntry> {
     entries
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_urls_handle_both_built_in_styles() {
+        let path = "/MUSICIANS/A/A-Man/Angel.sid";
+        assert_eq!(
+            mirror_resource_url(DEFAULT_HVSC_URL, path),
+            "https://hvsc.brona.dk/HVSC/C64Music/MUSICIANS/A/A-Man/Angel.sid"
+        );
+        assert_eq!(
+            mirror_listing_url(DEFAULT_HVSC_URL, "/MUSICIANS/"),
+            "https://hvsc.brona.dk/HVSC/C64Music/MUSICIANS/"
+        );
+        assert_eq!(
+            mirror_resource_url(DEFAULT_HVSC_QUERY_URL, path),
+            "https://hvsc.sannic.nl/C64Music/MUSICIANS/A/A-Man/Angel.sid"
+        );
+        assert_eq!(
+            mirror_listing_url(DEFAULT_HVSC_QUERY_URL, "/MUSICIANS/"),
+            "https://hvsc.sannic.nl/?dir=C64Music/MUSICIANS/"
+        );
+    }
+
+    #[test]
+    fn local_mirror_locations_are_normalised_to_file_urls() {
+        let (input, expected) = if cfg!(windows) {
+            (r"C:\HVSC\C64Music\", "file://C:/HVSC/C64Music")
+        } else {
+            ("/srv/HVSC/C64Music/", "file:///srv/HVSC/C64Music")
+        };
+        let location = normalize_mirror_location(input);
+        assert_eq!(location, expected);
+        assert_eq!(mirror_kind(&location), HvscMirrorKind::Local);
+        assert_eq!(
+            mirror_resource_url(&location, "/MUSICIANS/A/Angel.sid"),
+            format!("{expected}/MUSICIANS/A/Angel.sid")
+        );
+    }
+
+    #[test]
+    fn query_style_listing_parser_reads_folders_and_sids() {
+        let html = r#"
+            <ul id="directory-listing">
+              <li data-name=".." data-href="https://hvsc.sannic.nl/?dir=C64Music%2FMUSICIANS">
+                <a href="https://hvsc.sannic.nl/?dir=C64Music%2FMUSICIANS" class="file-link" data-name="..">..</a>
+              </li>
+              <li data-name="A-Man" data-href="?dir=C64Music/MUSICIANS/A/A-Man">
+                <a href="?dir=C64Music/MUSICIANS/A/A-Man" class="file-link" data-name="A-Man">A-Man</a>
+              </li>
+              <li data-name="Angel.sid" data-href="C64Music/MUSICIANS/A/Angel.sid">
+                <a href="C64Music/MUSICIANS/A/Angel.sid" class="file-link" data-name="Angel.sid">Angel.sid</a>
+              </li>
+              <li data-name="Notes.txt" data-href="C64Music/MUSICIANS/A/Notes.txt">
+                <a href="C64Music/MUSICIANS/A/Notes.txt" class="file-link" data-name="Notes.txt">Notes.txt</a>
+              </li>
+            </ul>
+        "#;
+        let entries = parse_query_directory_listing(html, "/MUSICIANS/A/");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "A-Man");
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].path, "/MUSICIANS/A/A-Man/");
+        assert_eq!(entries[1].name, "Angel.sid");
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[1].path, "/MUSICIANS/A/Angel.sid");
+    }
+
+    #[test]
+    fn switching_mirror_resets_browser_state() {
+        let mut browser = HvscBrowser::new(DEFAULT_HVSC_URL);
+        browser.current_path = "/MUSICIANS/A/".to_string();
+        browser.release = Some(85);
+        browser.set_mirror(DEFAULT_HVSC_QUERY_URL);
+        assert_eq!(browser.base_url, DEFAULT_HVSC_QUERY_URL);
+        assert_eq!(browser.current_path, "/");
+        assert_eq!(browser.release, None);
+        assert_eq!(browser.entries.len(), 3);
+    }
+
+    #[test]
+    fn local_mirror_root_can_browse_and_fetch_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "sidcraft-hvsc-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let album = root.join("MUSICIANS/A");
+        fs::create_dir_all(&album).unwrap();
+        let sid_path = album.join("Tune.sid");
+        fs::write(&sid_path, b"PSID local bytes").unwrap();
+
+        let root_string = root.to_string_lossy().replace('\\', "/");
+        let entries = read_local_directory(&root_string, "/MUSICIANS/A/").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Tune.sid");
+        assert_eq!(entries[0].path, "/MUSICIANS/A/Tune.sid");
+
+        let location = format!("file://{root_string}");
+        let url = mirror_resource_url(&location, &entries[0].path);
+        assert_eq!(fetch_bytes(&url).unwrap(), b"PSID local bytes");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+}

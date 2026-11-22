@@ -5,7 +5,7 @@
 // Copyright (c) 2026 Mikael Lund, licensed under the MIT License.
 // See licenses/MIT-crabsid.txt for the original license text.
 
-use crate::engine::hvsc::{self, DEFAULT_HVSC_URL};
+use crate::engine::hvsc::{self, DEFAULT_HVSC_URL, mirror_resource_url};
 use crate::engine::sid_file::SidFile;
 use std::fs;
 use std::io;
@@ -40,27 +40,48 @@ impl PlaylistEntry {
         })
     }
 
-    /// Returns true if this entry is a URL (http/https).
+    /// Returns true if this entry is an http(s) or `file://` URL.
     pub fn is_url(&self) -> bool {
-        self.source.starts_with("http://") || self.source.starts_with("https://")
+        self.source.starts_with("http://")
+            || self.source.starts_with("https://")
+            || self.source.starts_with("file://")
+    }
+
+    /// Loads the SID file from this entry's source, using the shipped mirror
+    /// for legacy HVSC-relative paths.
+    #[allow(dead_code)] // convenience wrapper for callers without a selected mirror
+    pub fn load(&self) -> io::Result<SidFile> {
+        self.load_with_mirror(DEFAULT_HVSC_URL)
     }
 
     /// Loads the SID file from this entry's source.
     ///
     /// Entries saved by older versions (and hand-written m3u files) may hold an
     /// HVSC-relative path such as `/MUSICIANS/E/Emarti/Tune.sid`. Those are not
-    /// local files, so a failed local load falls back to the HVSC mirror.
-    pub fn load(&self) -> io::Result<SidFile> {
-        SidFile::parse(&fetch_sid_bytes(&self.source)?)
+    /// local files, so a failed local load falls back to the selected mirror.
+    pub fn load_with_mirror(&self, mirror_location: &str) -> io::Result<SidFile> {
+        SidFile::parse(&fetch_sid_bytes_with_fallback(
+            &self.source,
+            mirror_location,
+        )?)
     }
 }
 
 /// Fetches the original SID file bytes for a playlist source.
 ///
-/// Supports local paths, `file://` URLs, http(s) URLs and the HVSC-relative
-/// paths used by older playlists. Used by both playback and the download
-/// buttons so saving a tune yields the very same bytes the player loaded.
+/// Uses the built-in mirror for legacy HVSC-relative paths; callers that know
+/// the selected mirror should prefer [`fetch_sid_bytes_with_fallback`].
+#[allow(dead_code)] // convenience wrapper for callers without a selected mirror
 pub fn fetch_sid_bytes(source: &str) -> io::Result<Vec<u8>> {
+    fetch_sid_bytes_with_fallback(source, DEFAULT_HVSC_URL)
+}
+
+/// Fetches the original SID file bytes for a playlist source.
+///
+/// Supports local paths, `file://` URLs, http(s) URLs and the HVSC-relative
+/// paths used by older playlists. Legacy paths are resolved against
+/// `mirror_location`, which may be a remote mirror or a local folder root.
+pub fn fetch_sid_bytes_with_fallback(source: &str, mirror_location: &str) -> io::Result<Vec<u8>> {
     if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("file://")
@@ -70,14 +91,15 @@ pub fn fetch_sid_bytes(source: &str) -> io::Result<Vec<u8>> {
     match fs::read(source) {
         Ok(bytes) => Ok(bytes),
         Err(err) => match hvsc_relative_path(source) {
-            Some(relative) => hvsc::fetch_bytes(&format!("{DEFAULT_HVSC_URL}{relative}")).map_err(
-                |fallback| {
+            Some(relative) => {
+                let url = mirror_resource_url(mirror_location, &relative);
+                hvsc::fetch_bytes(&url).map_err(|fallback| {
                     io::Error::new(
                         fallback.kind(),
                         format!("{err} (HVSC fallback: {fallback})"),
                     )
-                },
-            ),
+                })
+            }
             None => Err(err),
         },
     }
@@ -141,8 +163,11 @@ impl Playlist {
             .lines()
             .filter_map(|line| {
                 let mut entry = PlaylistEntry::new(line)?;
-                // Resolve relative paths against playlist directory
+                // Resolve relative paths against the playlist directory. URLs,
+                // local absolute paths and legacy HVSC-relative paths are left
+                // untouched so they keep working after a mirror change.
                 if !entry.is_url()
+                    && hvsc_relative_path(&entry.source).is_none()
                     && !Path::new(&entry.source).is_absolute()
                     && let Some(base) = base_dir
                 {
@@ -293,4 +318,62 @@ pub fn playlist_display_name(path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sidcraft-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn loading_m3u_keeps_legacy_and_url_sources_unchanged() {
+        let dir = temp_dir("playlist-load");
+        let playlist_path = dir.join("list.m3u");
+        fs::write(
+            &playlist_path,
+            "/MUSICIANS/A/Tune.sid\nfile://C:/HVSC/C64Music/MUSICIANS/B/Tune.sid\nlocal.sid\n",
+        )
+        .unwrap();
+
+        let playlist = Playlist::load(&playlist_path).unwrap();
+        assert_eq!(playlist.entries.len(), 3);
+        assert_eq!(playlist.entries[0].source, "/MUSICIANS/A/Tune.sid");
+        assert!(playlist.entries[1].is_url());
+        assert_eq!(
+            playlist.entries[2].source,
+            dir.join("local.sid").to_string_lossy().to_string()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_sources_fall_back_to_a_local_mirror_root() {
+        let root = temp_dir("playlist-local-mirror");
+        let album = root.join("MUSICIANS/A");
+        fs::create_dir_all(&album).unwrap();
+        let bytes = b"PSID local mirror bytes";
+        fs::write(album.join("Tune.sid"), bytes).unwrap();
+
+        let root_string = root.to_string_lossy().replace('\\', "/");
+        let location = format!("file://{root_string}");
+        assert_eq!(
+            fetch_sid_bytes_with_fallback("/MUSICIANS/A/Tune.sid", &location).unwrap(),
+            bytes
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
