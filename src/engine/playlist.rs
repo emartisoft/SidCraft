@@ -117,7 +117,10 @@ const HVSC_ROOTS: &[&str] = &[
 /// Maps an HVSC path recorded without its mirror prefix to the path component
 /// of an HVSC URL, e.g. `/MUSICIANS/E/Emarti/Tune.sid` or
 /// `C:/MUSICIANS/E/Emarti/Tune.sid`. Returns `None` for anything else.
-fn hvsc_relative_path(source: &str) -> Option<String> {
+///
+/// Also used by the CSDb "Releases Using This SID" lookup, so every HVSC
+/// collection (not only `MUSICIANS`) is recognised.
+pub(crate) fn hvsc_relative_path(source: &str) -> Option<String> {
     let normalized = source.replace('\\', "/");
     HVSC_ROOTS
         .iter()

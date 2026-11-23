@@ -380,15 +380,17 @@ fn sid_download_filename(name: &str) -> String {
 /// Extracts the HVSC-relative SID path CSDb expects from a tune source.
 ///
 /// Accepts plain HVSC paths as well as HTTP(S), `file://` and local paths that
-/// contain `/MUSICIANS/…`, and drops an optional `@subsong` suffix.
+/// point into the HVSC tree (`/MUSICIANS/…`, `/GAMES/…`, `/DEMOS/…`, …), and
+/// drops an optional `@subsong` suffix. Purely local files such as
+/// `/home/me/SIDs/Tune.sid` yield `None`, so the CSDb lookup stays hidden for
+/// tunes that HVSC does not know.
 fn hvsc_sid_path(source: &str) -> Option<String> {
     let normalized = source.trim().replace('\\', "/");
     let without_subsong = match normalized.rfind('@') {
         Some(at) if normalized[at + 1..].parse::<u16>().is_ok() => &normalized[..at],
         _ => normalized.as_str(),
     };
-    let start = without_subsong.find("/MUSICIANS/")?;
-    let mut path = without_subsong[start..].to_string();
+    let mut path = playlist::hvsc_relative_path(without_subsong)?;
     if let Some(end) = path.find(['?', '#']) {
         path.truncate(end);
     }
@@ -3607,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn hvsc_sid_path_accepts_hvsc_http_local_and_subsong_sources() {
+    fn hvsc_sid_path_accepts_every_hvsc_collection_and_subsong_sources() {
         let expected = "/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid";
         assert_eq!(hvsc_sid_path(expected), Some(expected.to_string()));
         assert_eq!(
@@ -3623,6 +3625,19 @@ mod tests {
         assert_eq!(
             hvsc_sid_path("C:\\HVSC\\C64Music\\MUSICIANS\\T\\Tel_Jeroen\\RoboCop_3.sid"),
             Some(expected.to_string())
+        );
+        // Every HVSC collection counts, not only MUSICIANS.
+        assert_eq!(
+            hvsc_sid_path("https://hvsc.brona.dk/HVSC/C64Music/GAMES/A-F/Abyss.sid"),
+            Some("/GAMES/A-F/Abyss.sid".to_string())
+        );
+        assert_eq!(
+            hvsc_sid_path("https://hvsc.brona.dk/HVSC/C64Music/DEMOS/G-L/Kaiser_Intro.sid@2"),
+            Some("/DEMOS/G-L/Kaiser_Intro.sid".to_string())
+        );
+        assert_eq!(
+            hvsc_sid_path("D:\\HVSC\\C64Music\\DEMOS\\A-F\\Demo_I.sid"),
+            Some("/DEMOS/A-F/Demo_I.sid".to_string())
         );
         assert_eq!(hvsc_sid_path("/home/me/tunes/RoboCop_3.sid"), None);
         assert_eq!(hvsc_sid_path("/MUSICIANS/T/Tel_Jeroen/"), None);
