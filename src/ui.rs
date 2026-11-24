@@ -864,17 +864,18 @@ impl SidcraftApp {
                             // Match the height of the neighbouring "Open"
                             // button so the row stays level.
                             let height = open.rect.height();
-                            if icon_button_glyph(
-                                ui,
-                                &t,
-                                "download",
-                                height,
-                                (height * 0.8).min(21.0),
-                                1.6,
-                                false,
-                                "Download current SID file…",
-                            )
-                            .clicked()
+                            if self.can_download_current_sid()
+                                && icon_button_glyph(
+                                    ui,
+                                    &t,
+                                    "download",
+                                    height,
+                                    (height * 0.8).min(21.0),
+                                    1.6,
+                                    false,
+                                    "Download current SID file…",
+                                )
+                                .clicked()
                             {
                                 self.download_current_sid();
                             }
@@ -1615,17 +1616,18 @@ impl SidcraftApp {
                                         self.muted
                                             .store(!muted, std::sync::atomic::Ordering::SeqCst);
                                     }
-                                    if icon_button_glyph(
-                                        ui,
-                                        &t,
-                                        "download",
-                                        40.0,
-                                        21.0,
-                                        1.6,
-                                        false,
-                                        "Download current SID file…",
-                                    )
-                                    .clicked()
+                                    if self.can_download_current_sid()
+                                        && icon_button_glyph(
+                                            ui,
+                                            &t,
+                                            "download",
+                                            40.0,
+                                            21.0,
+                                            1.6,
+                                            false,
+                                            "Download current SID file…",
+                                        )
+                                        .clicked()
                                     {
                                         self.download_current_sid();
                                     }
@@ -4079,16 +4081,18 @@ impl SidcraftApp {
                             if index > 0 {
                                 ui.separator();
                             }
-                            ui.horizontal(|ui| {
-                                let number = format!("{:>width$}.", index + 1, width = index_width);
+                            ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+                                let number = format!("{:>width$}", index + 1, width = index_width);
                                 ui.label(
                                     RichText::new(number)
-                                        .font(theme::semibold(16.0))
+                                        .font(theme::semibold(18.0))
                                         .color(t.text),
                                 );
                                 ui.vertical(|ui| {
                                     ui.set_width(ui.available_width());
-                                    let response = ui.add(egui::Link::new(&release.release));
+                                    let response = ui.add(egui::Link::new(
+                                        RichText::new(&release.release).font(theme::medium(15.0)),
+                                    ));
                                     if response.clicked() {
                                         open_url(&crate::csdb::url_for(&release.release_path));
                                     }

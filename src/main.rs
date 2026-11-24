@@ -404,6 +404,37 @@ fn hvsc_sid_path(source: &str) -> Option<String> {
     }
 }
 
+/// Whether a tune source can be downloaded again from an HVSC mirror.
+///
+/// Local files and local HVSC folder roots are deliberately excluded: the
+/// bytes are already on disk, so the "Download current SID file" buttons are
+/// hidden for those tunes. Legacy HVSC-relative playlist sources are counted
+/// only when the configured mirror is itself a remote HTTP(S) location.
+fn sid_source_is_from_hvsc_mirror(source: Option<&str>, mirror_location: &str) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let source = source.trim();
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return true;
+    }
+    let has_windows_drive = source
+        .as_bytes()
+        .get(1)
+        .is_some_and(|byte| *byte == b':')
+        && source
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| matches!(byte, b'/' | b'\\'));
+    if source.starts_with("file://") || source.starts_with("\\\\") || has_windows_drive {
+        return false;
+    }
+    // A leading `/MUSICIANS/…` is the legacy HVSC path format on every
+    // platform, so it must not be mistaken for a Unix absolute local file.
+    playlist::hvsc_relative_path(source).is_some()
+        && (mirror_location.starts_with("http://") || mirror_location.starts_with("https://"))
+}
+
 /// Where the in-app update flow currently is. The release itself is kept
 /// separately in [`SidcraftApp::update_release`] so retries do not lose it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2062,6 +2093,15 @@ impl SidcraftApp {
         }
     }
 
+    /// Whether the playing tune can be downloaded again from a remote mirror.
+    /// Local-folder playback must hide the download buttons.
+    pub fn can_download_current_sid(&self) -> bool {
+        sid_source_is_from_hvsc_mirror(
+            self.current_source.as_deref(),
+            &self.hvsc_browser.base_url,
+        )
+    }
+
     /// Saves the currently playing SID file, including when it came from HVSC.
     pub fn download_current_sid(&mut self) {
         let Some(source) = self.current_source.clone() else {
@@ -3597,7 +3637,10 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hvsc_sid_path, playlist_search_indices, sid_download_filename};
+    use super::{
+        hvsc_sid_path, playlist_search_indices, sid_download_filename,
+        sid_source_is_from_hvsc_mirror,
+    };
     use crate::engine::playlist::{PlaylistEntry, fetch_sid_bytes};
 
     #[test]
@@ -3606,6 +3649,50 @@ mod tests {
         assert_eq!(sid_download_filename("A/B\\C.sid"), "A_B_C.sid");
         assert_eq!(sid_download_filename(" Tune. "), "Tune.sid");
         assert_eq!(sid_download_filename(""), "tune.sid");
+    }
+
+    #[test]
+    fn current_sid_download_button_requires_a_remote_mirror_source() {
+        const REMOTE_MIRROR: &str = "https://hvsc.brona.dk/HVSC/C64Music";
+        const LOCAL_MIRROR: &str = "file://C:/HVSC/C64Music";
+        const HVSC_PATH: &str = "/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid";
+        const REMOTE_URL: &str = "https://hvsc.brona.dk/HVSC/C64Music/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid";
+
+        // HTTP(S) sources are mirror downloads, even if the configured mirror
+        // has since been switched to a local folder.
+        assert!(sid_source_is_from_hvsc_mirror(
+            Some(REMOTE_URL),
+            LOCAL_MIRROR
+        ));
+        assert!(sid_source_is_from_hvsc_mirror(
+            Some("https://hvsc.sannic.nl/C64Music/GAMES/A-F/Abyss.sid@2"),
+            REMOTE_MIRROR
+        ));
+        // Legacy HVSC-relative playlist paths are fetched through the mirror,
+        // so they are downloadable only while that mirror is remote.
+        assert!(sid_source_is_from_hvsc_mirror(
+            Some(HVSC_PATH),
+            REMOTE_MIRROR
+        ));
+        assert!(!sid_source_is_from_hvsc_mirror(
+            Some(HVSC_PATH),
+            LOCAL_MIRROR
+        ));
+        // Local folders never offer the download button, even when they are a
+        // configured HVSC root containing a valid /MUSICIANS/... path.
+        assert!(!sid_source_is_from_hvsc_mirror(
+            Some("file://C:/HVSC/C64Music/MUSICIANS/T/Tel_Jeroen/RoboCop_3.sid"),
+            REMOTE_MIRROR
+        ));
+        assert!(!sid_source_is_from_hvsc_mirror(
+            Some("C:\\HVSC\\C64Music\\MUSICIANS\\T\\Tel_Jeroen\\RoboCop_3.sid"),
+            REMOTE_MIRROR
+        ));
+        assert!(!sid_source_is_from_hvsc_mirror(
+            Some("/home/me/tunes/RoboCop_3.sid"),
+            REMOTE_MIRROR
+        ));
+        assert!(!sid_source_is_from_hvsc_mirror(None, REMOTE_MIRROR));
     }
 
     #[test]
