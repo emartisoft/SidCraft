@@ -512,10 +512,12 @@ impl Player {
         self.frame_cycle_count = self.frame_cycle_count.saturating_add(elapsed_u32);
 
         // PC away from the sentinel = a play routine or IRQ handler is running;
-        // a too-long stretch trips the runaway-routine timeout. Free-running
-        // RSID tunes execute their main loop here by design, so skip the guard.
+        // a too-long stretch trips the runaway-routine timeout. Interrupt-driven
+        // RSID tunes (and free-running ones) legitimately keep executing a main
+        // loop between IRQs and never return to the sentinel, so the cumulative
+        // guard does not apply to them.
         if self.cpu.registers.program_counter != SENTINEL_PC {
-            if !self.free_running {
+            if !self.free_running && self.drive_mode != DriveMode::Interrupt {
                 self.cpu_busy_cycles = self.cpu_busy_cycles.saturating_add(elapsed);
                 if self.cpu_busy_cycles > MAX_PLAY_CYCLES {
                     self.playback_error = Some(format!(
@@ -973,7 +975,7 @@ impl Player {
     /// Reinitialize for a different song number (1-indexed).
     /// Reloads SID data, resets CPU state, and runs the init routine.
     pub fn load_song(&mut self, song: u16) -> PlayerResult<()> {
-        self.cpu.memory.clear_zeropage_and_stack();
+        self.cpu.memory.clear_ram();
         self.cpu.memory.load(self.load_address, &self.sid_data);
 
         for sid_chip in &mut self.cpu.memory.sids {
@@ -1487,6 +1489,72 @@ mod tests {
             (1..=frames as u16 + 1).contains(&entries),
             "expected about one handler call per frame, got {entries} in {frames} frames"
         );
+    }
+
+    #[test]
+    fn interrupt_driven_tune_with_long_main_loop_is_not_killed_by_runaway_guard() {
+        // Some RSIDs (e.g. Savage) return from init but then spend long stretches
+        // in their own play/main loop without returning to the $0000 sentinel.
+        // The runaway guard is for frame/CIA tunes that must return from play(),
+        // so it must not fire merely because CPU time accumulates between IRQs.
+        #[rustfmt::skip]
+        let mut data = vec![
+            0xA9, 0x20,       // LDA #$20
+            0x8D, 0x14, 0x03, // STA $0314
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x15, 0x03, // STA $0315
+            0xA9, 0x00,       // LDA #$00
+            0x8D, 0x12, 0xD0, // STA $D012  (raster compare = line 0)
+            0xA9, 0x01,       // LDA #$01
+            0x8D, 0x1A, 0xD0, // STA $D01A  (enable raster IRQ)
+            0x60,             // RTS
+        ];
+        data.resize(0x20, 0); // IRQ handler at $0820
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200  (count handler entries)
+            0xA9, 0x01, // LDA #$01
+            0x8D, 0x19, 0xD0, // STA $D019  (acknowledge raster IRQ)
+            0x40, // RTI
+        ]);
+        data.resize(0x30, 0); // main loop at $0830
+        data.extend_from_slice(&[
+            0x4C, 0x30, 0x08, // JMP $0830
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        assert_eq!(p.drive_mode, DriveMode::Interrupt);
+        assert!(!p.free_running, "init should have returned to the sentinel");
+
+        // Init returned to the sentinel; emulate the tune's own main program
+        // taking over from there, as Savage's copied player does.
+        p.cpu.registers.program_counter = 0x0830;
+
+        let mut buffer = [0.0f32; 1024];
+        for _ in 0..30 {
+            p.fill_buffer(&mut buffer);
+            assert!(p.playback_error.is_none(), "{:?}", p.playback_error);
+            assert!(!p.is_paused());
+        }
+        assert!(
+            p.cpu.memory.get_byte(0x0200) > 0,
+            "raster IRQ handler never ran"
+        );
+    }
+
+    #[test]
+    fn loading_another_file_clears_stale_ram_from_previous_tune() {
+        // A tune that used $0200 as a work area must not leave that byte behind
+        // for the next file: stale RAM made Savage fall silent after switching
+        // away to ACE II and back.
+        let first = synthetic_sid("PSID", 0x0800, 0x0800, vec![0x60]);
+        let second = synthetic_sid("PSID", 0x0800, 0x0800, vec![0x60]);
+        let mut p = Player::new(&first, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+
+        p.cpu.memory.set_byte(0x0200, 0xA5);
+        p.load_sid_file(&second, 1).unwrap();
+
+        assert_eq!(p.cpu.memory.get_byte(0x0200), 0);
     }
 
     #[test]

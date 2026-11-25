@@ -14,7 +14,6 @@ use mos6502::memory::Bus;
 use residfp::{ChipModel, Sid};
 
 const RAM_SIZE: usize = 65536;
-const ZEROPAGE_AND_STACK_END: usize = 0x0200;
 const SID_REGISTER_COUNT: u16 = 0x20;
 const SID_RANGE_START: u16 = 0xD400;
 const SID_RANGE_END: u16 = 0xD800;
@@ -258,10 +257,11 @@ impl C64Memory {
         self.ram[start..end].copy_from_slice(&data[..end - start]);
     }
 
-    /// Resets zero page + stack and re-arms banking, CIA1, VIC-II, and the IRQ vector.
-    /// Called between songs so init starts from a clean machine state.
-    pub fn clear_zeropage_and_stack(&mut self) {
-        self.ram[..ZEROPAGE_AND_STACK_END].fill(0);
+    /// Clears all RAM and re-arms banking, CIA1, VIC-II, and the IRQ vectors.
+    /// Called between songs so init starts from a clean machine state; stale RAM
+    /// left by another tune can corrupt the new player's work areas.
+    pub fn clear_ram(&mut self) {
+        self.ram.fill(0);
         self.bank_config = BANK_DEFAULT;
         self.cia1 = Cia1::new();
         self.cia2 = Cia::new_stopped();
@@ -451,6 +451,33 @@ mod tests {
             0x01,
             "other CIA2 registers still store writes"
         );
+    }
+
+    #[test]
+    fn clear_ram_wipes_all_ram_but_keeps_boot_defaults() {
+        let mut mem = memory();
+        for addr in [0x0002, 0x0200, 0x4000, 0x9FFF, 0xCFFF] {
+            mem.set_byte(addr, 0xA5);
+        }
+        mem.set_byte(0x0314, 0x12);
+        mem.set_byte(0x0315, 0x34);
+        mem.set_byte(0x0318, 0x56);
+        mem.set_byte(0x0319, 0x78);
+
+        mem.clear_ram();
+
+        for addr in [0x0002, 0x0200, 0x4000, 0x9FFF, 0xCFFF] {
+            assert_eq!(
+                mem.get_byte(addr),
+                0,
+                "stale byte at ${addr:04X} survived song change"
+            );
+        }
+        assert_eq!(mem.get_byte(0x0001), BANK_DEFAULT);
+        assert_eq!(mem.get_byte(0x0314), 0x8E);
+        assert_eq!(mem.get_byte(0x0315), 0xFF);
+        assert_eq!(mem.get_byte(0x0318), 0x47);
+        assert_eq!(mem.get_byte(0x0319), 0xFE);
     }
 
     #[test]

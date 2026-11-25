@@ -1395,6 +1395,9 @@ impl SidcraftApp {
             self.current_song = song;
             self.song_elapsed = Duration::ZERO;
             self.song_resumed_at = Instant::now();
+            // `load_song` always unpauses the player; keep the UI flag in sync so
+            // Next/Prev starts playing instead of showing 0:00 while muted.
+            self.paused = false;
             let md5 = &self.sid_file.md5;
             self.song_timeout = self
                 .hvsc_browser
