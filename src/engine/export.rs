@@ -226,6 +226,19 @@ fn find_ffmpeg() -> Option<PathBuf> {
     None
 }
 
+/// Builds a `Command` that suppresses the transient console window when a
+/// Windows GUI process spawns a console child (`ffmpeg.exe`, `reg.exe`, etc.).
+fn command_no_window(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn find_ffmpeg_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     #[cfg(windows)]
     const EXECUTABLE: &str = "ffmpeg.exe";
@@ -235,7 +248,7 @@ fn find_ffmpeg_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBu
     dirs.into_iter().find_map(|dir| {
         let candidate = dir.join(EXECUTABLE);
         if candidate.is_file()
-            && Command::new(&candidate)
+            && command_no_window(&candidate)
                 .arg("-version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -260,7 +273,7 @@ fn windows_registry_path_dirs() -> Vec<PathBuf> {
     PATH_KEYS
         .iter()
         .filter_map(|key| {
-            let output = Command::new("reg.exe")
+            let output = command_no_window("reg.exe")
                 .args(["query", key, "/v", "Path"])
                 .output()
                 .ok()?;
@@ -343,7 +356,7 @@ fn ffmpeg_convert(input: &Path, output: &Path, codec_args: &[&str]) -> io::Resul
         )
     })?;
 
-    let out = Command::new(&ffmpeg)
+    let out = command_no_window(&ffmpeg)
         .args([
             "-y",
             "-nostdin",

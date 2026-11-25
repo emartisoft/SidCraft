@@ -9,7 +9,10 @@ use crate::engine::memory::C64Memory;
 use crate::engine::sid_file::SidFile;
 use mos6502::cpu::CPU;
 use mos6502::instruction::Nmos6502;
-use mos6502::memory::{Bus, IRQ_INTERRUPT_VECTOR_HI, IRQ_INTERRUPT_VECTOR_LO};
+use mos6502::memory::{
+    Bus, IRQ_INTERRUPT_VECTOR_HI, IRQ_INTERRUPT_VECTOR_LO, NMI_INTERRUPT_VECTOR_HI,
+    NMI_INTERRUPT_VECTOR_LO,
+};
 use mos6502::registers::{StackPointer, Status};
 pub use residfp::SamplingMethod;
 use residfp::{ChipModel, clock};
@@ -214,6 +217,8 @@ pub struct Player {
     /// whose init is also their main loop). The CPU then never parks at the
     /// sentinel, so the runaway-routine watchdog must stay out of the way.
     free_running: bool,
+    /// Previous NMI line state for edge-triggered NMI detection while parked at sentinel.
+    last_nmi_state: bool,
 }
 
 /// Errors that can occur while initializing or running SID routines.
@@ -326,6 +331,7 @@ impl Player {
             play_iomap: psid_iomap(sid_file.play_address),
             ekv_filter: false,
             free_running: !init_returned,
+            last_nmi_state: false,
         };
         player.apply_drive_mode(song);
         Ok(player)
@@ -445,10 +451,16 @@ impl Player {
     fn advance_one_step(&mut self) -> bool {
         let at_sentinel = self.cpu.registers.program_counter == SENTINEL_PC;
 
-        // Only RSID-style tunes route CIA IRQs through mos6502's vector. PSID
+        // NMI is edge-triggered (rising edge on CIA2 IRQ line) and non-maskable.
+        let nmi_current = self.drive_mode == DriveMode::Interrupt && self.cpu.memory.nmi_pending();
+        let service_nmi = nmi_current && !self.last_nmi_state;
+        self.last_nmi_state = nmi_current;
+
+        // Only RSID-style tunes route CIA/VIC IRQs through mos6502's vector. PSID
         // (frame or CIA-poll) keeps the CPU at the sentinel and the player
-        // dispatches play() directly.
-        let irq_at_sentinel = at_sentinel
+        // dispatches play() directly. Note: `at_sentinel` is NOT required here,
+        // because free-running RSIDs loop in user RAM while still taking IRQs.
+        let service_irq = !service_nmi
             && self.drive_mode == DriveMode::Interrupt
             && self.cpu.memory.irq_pending()
             && !self
@@ -458,8 +470,12 @@ impl Player {
                 .contains(Status::PS_DISABLE_INTERRUPTS);
 
         let prev_cycles = self.cpu.cycles;
-        let mut elapsed = if irq_at_sentinel {
-            // Manually vector — single-stepping the RTS at $0000 would pop garbage.
+        let mut elapsed = if service_nmi {
+            self.force_nmi_service();
+            IRQ_ENTRY_CYCLES
+        } else if service_irq {
+            // Manually vector — single-stepping the RTS at $0000 would pop garbage,
+            // and mos6502::CPU::single_step does not poll Bus::irq_pending().
             self.force_irq_service();
             IRQ_ENTRY_CYCLES
         } else if at_sentinel {
@@ -547,7 +563,7 @@ impl Player {
     }
 
     /// Mimics mos6502's `service_interrupt` without executing whatever opcode lives
-    /// at the current PC. Used to wake the CPU from the sentinel when CIA1 fires.
+    /// at the current PC. Used to wake the CPU from the sentinel when CIA1/VIC fires.
     fn force_irq_service(&mut self) {
         let [pc_lo, pc_hi] = self.cpu.registers.program_counter.to_le_bytes();
         self.push_byte(pc_hi);
@@ -560,6 +576,22 @@ impl Player {
             .insert(Status::PS_DISABLE_INTERRUPTS);
         let lo = self.cpu.memory.get_byte(IRQ_INTERRUPT_VECTOR_LO);
         let hi = self.cpu.memory.get_byte(IRQ_INTERRUPT_VECTOR_HI);
+        self.cpu.registers.program_counter = u16::from_le_bytes([lo, hi]);
+    }
+
+    /// Services a rising-edge NMI (CIA2) through `$FFFA/$FFFB`.
+    fn force_nmi_service(&mut self) {
+        let [pc_lo, pc_hi] = self.cpu.registers.program_counter.to_le_bytes();
+        self.push_byte(pc_hi);
+        self.push_byte(pc_lo);
+        let status = self.cpu.registers.status & !Status::PS_BRK;
+        self.push_byte(status.bits());
+        self.cpu
+            .registers
+            .status
+            .insert(Status::PS_DISABLE_INTERRUPTS);
+        let lo = self.cpu.memory.get_byte(NMI_INTERRUPT_VECTOR_LO);
+        let hi = self.cpu.memory.get_byte(NMI_INTERRUPT_VECTOR_HI);
         self.cpu.registers.program_counter = u16::from_le_bytes([lo, hi]);
     }
 
@@ -623,8 +655,142 @@ impl Player {
         self.note_write_pos = (self.note_write_pos + 1) % NOTE_HISTORY_SIZE;
     }
 
+    /// Copies envelope history for each voice into `out`, reusing existing buffers.
+    pub fn copy_envelope_samples_into(&self, out: &mut Vec<Vec<f32>>) {
+        let voice_count = self.envelope_history.len();
+        out.resize_with(voice_count, Vec::new);
+        if self.paused {
+            for buf in out.iter_mut() {
+                buf.resize(SCOPE_BUFFER_SIZE, 0.0);
+                buf.fill(0.0);
+            }
+            return;
+        }
+        for (buf, history) in out.iter_mut().zip(self.envelope_history.iter()) {
+            let (head, tail) = history.split_at(self.envelope_write_pos);
+            buf.clear();
+            buf.extend_from_slice(tail);
+            buf.extend_from_slice(head);
+        }
+    }
+
+    /// Copies newest mixed output samples into `out`, reusing its allocation.
+    pub fn copy_audio_samples_into(&self, out: &mut Vec<f32>) {
+        if self.paused {
+            out.resize(ANALYSIS_BUFFER_SIZE, 0.0);
+            out.fill(0.0);
+            return;
+        }
+        let (head, tail) = self.analysis_buffer.split_at(self.analysis_write_pos);
+        out.clear();
+        out.extend_from_slice(tail);
+        out.extend_from_slice(head);
+    }
+
+    /// Copies ADSR stage history per voice into `out`, reusing existing buffers.
+    pub fn copy_envelope_states_into(&self, out: &mut Vec<Vec<u8>>) {
+        out.resize_with(self.envelope_state_history.len(), Vec::new);
+        for (buf, history) in out.iter_mut().zip(self.envelope_state_history.iter()) {
+            let (head, tail) = history.split_at(self.envelope_write_pos);
+            buf.clear();
+            buf.extend_from_slice(tail);
+            buf.extend_from_slice(head);
+        }
+    }
+
+    /// Copies piano-roll history per voice into `out`, reusing existing buffers.
+    pub fn copy_note_history_into(&self, out: &mut Vec<Vec<NoteSample>>) {
+        out.resize_with(self.note_history.len(), Vec::new);
+        for (buf, history) in out.iter_mut().zip(self.note_history.iter()) {
+            let (head, tail) = history.split_at(self.note_write_pos);
+            buf.clear();
+            buf.extend_from_slice(tail);
+            buf.extend_from_slice(head);
+        }
+    }
+
+    /// Copies current register state of every voice into `out`, reusing its allocation.
+    pub fn copy_voice_infos_into(&self, out: &mut Vec<VoiceInfo>) {
+        out.clear();
+        for sid_chip in &self.cpu.memory.sids {
+            let state = sid_chip.sid.read_state();
+            for voice in 0..3 {
+                let reg = voice * 7;
+                let freq = u16::from(state.sid_register[reg])
+                    | (u16::from(state.sid_register[reg + 1]) << 8);
+                let pulse_width = u16::from(state.sid_register[reg + 2])
+                    | ((u16::from(state.sid_register[reg + 3]) & 0x0F) << 8);
+                let control = state.sid_register[reg + 4];
+                let gate = control & 0x01 != 0;
+                let freq_hz = f32::from(freq) * self.clock_hz as f32 / 16_777_216.0;
+                out.push(VoiceInfo {
+                    note: (gate && freq > 0).then(|| freq_to_note(freq, self.clock_hz)),
+                    freq_hz,
+                    gate,
+                    waveform: (control >> 4) & 0x0F,
+                    pulse_width: f32::from(pulse_width) / 4095.0,
+                    ring: control & 0x04 != 0,
+                    sync: control & 0x02 != 0,
+                    test: control & 0x08 != 0,
+                });
+            }
+        }
+    }
+
+    /// Copies current filter configuration of every SID chip into `out`, reusing its allocation.
+    pub fn copy_filter_infos_into(&self, out: &mut Vec<FilterInfo>) {
+        out.clear();
+        for sid_chip in &self.cpu.memory.sids {
+            let state = sid_chip.sid.read_state();
+            let reg = &state.sid_register;
+            let cutoff = u16::from(reg[0x15]) | (u16::from(reg[0x16] & 0x07) << 8);
+            let res_routing = reg[0x17];
+            let mode_volume = reg[0x18];
+            out.push(FilterInfo {
+                cutoff,
+                cutoff_hz: 30.0
+                    + f32::from(cutoff) * 5.8 * (self.clock_hz as f32 / 1_000_000.0),
+                resonance: res_routing >> 4,
+                lowpass: mode_volume & 0x10 != 0,
+                bandpass: mode_volume & 0x20 != 0,
+                highpass: mode_volume & 0x40 != 0,
+                routed: [
+                    res_routing & 0x01 != 0,
+                    res_routing & 0x02 != 0,
+                    res_routing & 0x04 != 0,
+                ],
+                volume: mode_volume & 0x0F,
+            });
+        }
+    }
+
+    /// Copies envelope levels (0-255) for all SID voices into `out`, reusing its allocation.
+    pub fn copy_voice_levels_into(&self, out: &mut Vec<u8>) {
+        let voice_count = self.cpu.memory.sids.len() * 3;
+        if self.paused {
+            out.resize(voice_count, 0);
+            out.fill(0);
+            return;
+        }
+        out.clear();
+        for s in &self.cpu.memory.sids {
+            out.extend_from_slice(&s.sid.read_state().envelope_counter);
+        }
+    }
+
+    /// Copies per-voice mute switches into `out`, reusing its allocation.
+    pub fn copy_voice_mutes_into(&self, out: &mut Vec<bool>) {
+        out.clear();
+        for chip in &self.cpu.memory.sids {
+            for voice in 0..3 {
+                out.push(chip.voice_muted(voice));
+            }
+        }
+    }
+
     /// Returns envelope history for each voice, ordered oldest to newest.
     /// Returns 3 entries per SID (3/6/9 voices for 1/2/3 SIDs).
+    #[allow(dead_code)]
     pub fn envelope_samples(&self) -> Vec<Vec<f32>> {
         let voice_count = self.envelope_history.len();
         if self.paused {
@@ -643,6 +809,7 @@ impl Player {
     /// Newest mixed output samples, ordered oldest to newest.
     ///
     /// Used by the spectrum analyser and the triggered oscilloscope.
+    #[allow(dead_code)]
     pub fn audio_samples(&self) -> Vec<f32> {
         if self.paused {
             return vec![0.0; ANALYSIS_BUFFER_SIZE];
@@ -653,6 +820,7 @@ impl Player {
 
     /// ADSR stage history per voice, ordered oldest to newest.
     /// `0` = attack, `1` = decay/sustain, `2` = release.
+    #[allow(dead_code)]
     pub fn envelope_states(&self) -> Vec<Vec<u8>> {
         self.envelope_state_history
             .iter()
@@ -664,6 +832,7 @@ impl Player {
     }
 
     /// Piano-roll history per voice, ordered oldest to newest.
+    #[allow(dead_code)]
     pub fn note_history(&self) -> Vec<Vec<NoteSample>> {
         self.note_history
             .iter()
@@ -675,6 +844,7 @@ impl Player {
     }
 
     /// Current register state of every voice (3 per SID).
+    #[allow(dead_code)]
     pub fn voice_infos(&self) -> Vec<VoiceInfo> {
         let mut infos = Vec::with_capacity(self.cpu.memory.sids.len() * 3);
         for sid_chip in &self.cpu.memory.sids {
@@ -704,6 +874,7 @@ impl Player {
     }
 
     /// Current filter configuration of every SID chip.
+    #[allow(dead_code)]
     pub fn filter_infos(&self) -> Vec<FilterInfo> {
         self.cpu
             .memory
@@ -834,6 +1005,7 @@ impl Player {
         self.cycle_accumulator = 0.0;
         self.frame_cycle_count = 0;
         self.cpu_busy_cycles = 0;
+        self.last_nmi_state = false;
         self.paused = false;
         self.playback_error = None;
         Ok(())
@@ -858,6 +1030,7 @@ impl Player {
     /// Returns 3 entries per SID (3/6/9 voices for 1/2/3 SIDs).
     /// Unlike hardware where only ENV3 ($D41C) is readable, emulation
     /// gives us direct access to all voice envelopes via internal state.
+    #[allow(dead_code)]
     pub fn voice_levels(&self) -> Vec<u8> {
         let voice_count = self.cpu.memory.sids.len() * 3;
         if self.paused {
@@ -872,6 +1045,7 @@ impl Player {
     }
 
     /// Returns the per-voice mute switches, ordered chip by chip (3 per SID).
+    #[allow(dead_code)]
     pub fn voice_mutes(&self) -> Vec<bool> {
         self.cpu.memory.voice_mutes()
     }
@@ -1096,7 +1270,10 @@ fn run_routine(
         if cpu.registers.program_counter == SENTINEL_PC {
             return Ok(());
         }
+        let prev_cycles = cpu.cycles;
         cpu.single_step();
+        let elapsed = (cpu.cycles - prev_cycles).max(1);
+        cpu.memory.tick(elapsed);
         steps += 1;
     }
     Err(timeout_err)
@@ -1281,5 +1458,86 @@ mod tests {
         let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
         assert_eq!(p.cpu.memory.get_byte(0xDD0D), 0x00);
         assert_eq!(p.cpu.memory.get_byte(0xDD0E), 0x01);
+    }
+
+    #[test]
+    fn free_running_rsid_still_services_irqs_and_ea31_acks_cia1() {
+        // Init installs a $0314 CIA1 Timer A handler that exits with JMP $EA31,
+        // enables CIA1 Timer A IRQ, clears I flag, then loops forever (`JMP *`).
+        #[rustfmt::skip]
+        let mut data = vec![
+            0x78,             // SEI
+            0xA9, 0x30,       // LDA #$30
+            0x8D, 0x14, 0x03, // STA $0314
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x15, 0x03, // STA $0315
+            0xA9, 0x81,       // LDA #$81 (enable Timer A IRQ)
+            0x8D, 0x0D, 0xDC, // STA $DC0D
+            0x58,             // CLI
+            0x4C, 0x11, 0x08, // JMP $0811 (free-running wait loop)
+        ];
+        data.resize(0x30, 0);
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200 (count IRQ entries)
+            0x4C, 0x31, 0xEA, // JMP $EA31 (KERNAL exit must ACK $DC0D)
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        assert!(p.free_running, "init loop should mark tune as free_running");
+
+        let mut buffer = vec![0.0f32; 4096];
+        for _ in 0..5 {
+            p.fill_buffer(&mut buffer);
+            assert!(p.playback_error.is_none(), "{:?}", p.playback_error);
+        }
+
+        let entries = p.cpu.memory.get_byte(0x0200);
+        // ~0.46s at ~60Hz => ~27 IRQs; if $EA31 did not ACK $DC0D it would fire hundreds of times.
+        assert!(
+            (10..=60).contains(&entries),
+            "expected normal ~60Hz CIA1 IRQ rate, got {entries}"
+        );
+    }
+
+    #[test]
+    fn cia2_timer_a_triggers_nmi_through_0318_vector() {
+        // Init installs an NMI handler at $0318 ($0830), programs CIA2 Timer A
+        // to fire every ~1000 cycles, enables NMI, and returns via RTS.
+        #[rustfmt::skip]
+        let mut data = vec![
+            0xA9, 0x30,       // LDA #$30
+            0x8D, 0x18, 0x03, // STA $0318
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x19, 0x03, // STA $0319
+            0xA9, 0xE8,       // LDA #$E8
+            0x8D, 0x04, 0xDD, // STA $DD04 (latch lo = 1000)
+            0xA9, 0x03,       // LDA #$03
+            0x8D, 0x05, 0xDD, // STA $DD05 (latch hi)
+            0xA9, 0x81,       // LDA #$81
+            0x8D, 0x0D, 0xDD, // STA $DD0D (enable Timer A NMI)
+            0xA9, 0x11,       // LDA #$11
+            0x8D, 0x0E, 0xDD, // STA $DD0E (force-load & start)
+            0x60,             // RTS
+        ];
+        data.resize(0x30, 0);
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200 (count NMI entries)
+            0xAD, 0x0D, 0xDD, // LDA $DD0D (ACK CIA2 NMI)
+            0x40,             // RTI
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+
+        let mut buffer = vec![0.0f32; 4096];
+        p.fill_buffer(&mut buffer);
+        assert!(p.playback_error.is_none(), "{:?}", p.playback_error);
+
+        let nmi_entries = p.cpu.memory.get_byte(0x0200);
+        assert!(
+            nmi_entries > 10,
+            "expected CIA2 Timer A NMI handler to run repeatedly, got {nmi_entries}"
+        );
     }
 }

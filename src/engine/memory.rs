@@ -7,7 +7,7 @@
 
 //! Emulated C64 memory map: RAM, banked KERNAL stub, SID chips, CIA1, VIC-II.
 
-use crate::engine::cia::Cia1;
+use crate::engine::cia::{Cia, Cia1};
 use crate::engine::sid_file::PRIMARY_SID_ADDRESS;
 use crate::engine::vic::Vic;
 use mos6502::memory::Bus;
@@ -42,11 +42,18 @@ const KERNAL_SIZE: usize = 0x2000;
 // Stub-internal addresses where we patch specific opcodes/vectors.
 const KERNAL_IRQ_ENTRY: u16 = 0xFF48;
 const KERNAL_IRQ_EXIT: u16 = 0xFF8E;
+const KERNAL_NMI_ENTRY: u16 = 0xFE43;
+const KERNAL_NMI_EXIT: u16 = 0xFE47;
 /// Standard KERNAL IRQ-exit entry points. Many RSID handlers finish with
-/// `JMP $EA31` (full keyboard scan) or `JMP $EA7E`/`$EA81` (skip scan) and
-/// expect the KERNAL to restore registers and `RTI`. The stub turns all three
-/// into a plain `RTI`; SID playback does not need the keyboard scan.
-const KERNAL_IRQ_EXITS: [u16; 3] = [0xEA31, 0xEA7E, 0xEA81];
+/// `JMP $EA31` (full keyboard scan) or `JMP $EA7E`/`$EA81` (skip scan).
+/// On a real C64, `$EA31` and `$EA7E` read `$DC0D` (CIA1 ICR) to acknowledge
+/// the timer IRQ before returning, while `$EA81` returns directly.
+const KERNAL_IRQ_EXIT_EA31: u16 = 0xEA31;
+const KERNAL_IRQ_EXIT_EA7E: u16 = 0xEA7E;
+const KERNAL_IRQ_EXIT_EA81: u16 = 0xEA81;
+const OPCODE_LDA_ABS: u8 = 0xAD;
+const CIA1_ICR_LO: u8 = 0x0D;
+const CIA1_ICR_HI: u8 = 0xDC;
 const HW_IRQ_VECTOR_LO: u16 = 0xFFFE;
 const HW_IRQ_VECTOR_HI: u16 = 0xFFFF;
 const HW_NMI_VECTOR_LO: u16 = 0xFFFA;
@@ -56,6 +63,9 @@ const HW_NMI_VECTOR_HI: u16 = 0xFFFB;
 /// handler; default points at the stub's RTI so pre-init IRQs are silent.
 const USER_IRQ_VECTOR_LO: u16 = 0x0314;
 const USER_IRQ_VECTOR_HI: u16 = 0x0315;
+/// User-installed NMI vector in RAM (`$0318/$0319`).
+const USER_NMI_VECTOR_LO: u16 = 0x0318;
+const USER_NMI_VECTOR_HI: u16 = 0x0319;
 
 const OPCODE_JMP_INDIRECT: u8 = 0x6C;
 const OPCODE_RTI: u8 = 0x40;
@@ -76,14 +86,23 @@ const KERNAL_STUB: [u8; KERNAL_SIZE] = build_kernel_stub();
 const fn build_kernel_stub() -> [u8; KERNAL_SIZE] {
     let mut stub = [OPCODE_RTS; KERNAL_SIZE];
     let [entry_lo, entry_hi] = KERNAL_IRQ_ENTRY.to_le_bytes();
+    let [nmi_lo, nmi_hi] = KERNAL_NMI_ENTRY.to_le_bytes();
     let [user_lo, user_hi] = USER_IRQ_VECTOR_LO.to_le_bytes();
+    let [user_nmi_lo, user_nmi_hi] = USER_NMI_VECTOR_LO.to_le_bytes();
 
-    // Hardware IRQ + NMI vectors → KERNAL IRQ entry. We don't service NMI
-    // separately, but the vector cannot be 0 or random ROM byte.
+    // Hardware IRQ → KERNAL IRQ entry; Hardware NMI → KERNAL NMI entry.
     stub[(HW_IRQ_VECTOR_LO - KERNAL_BASE) as usize] = entry_lo;
     stub[(HW_IRQ_VECTOR_HI - KERNAL_BASE) as usize] = entry_hi;
-    stub[(HW_NMI_VECTOR_LO - KERNAL_BASE) as usize] = entry_lo;
-    stub[(HW_NMI_VECTOR_HI - KERNAL_BASE) as usize] = entry_hi;
+    stub[(HW_NMI_VECTOR_LO - KERNAL_BASE) as usize] = nmi_lo;
+    stub[(HW_NMI_VECTOR_HI - KERNAL_BASE) as usize] = nmi_hi;
+
+    // $FE43: JMP ($0318) — NMI trampoline through user NMI vector.
+    let nmi_entry = (KERNAL_NMI_ENTRY - KERNAL_BASE) as usize;
+    stub[nmi_entry] = OPCODE_JMP_INDIRECT;
+    stub[nmi_entry + 1] = user_nmi_lo;
+    stub[nmi_entry + 2] = user_nmi_hi;
+    // $FE47: RTI — default NMI exit.
+    stub[(KERNAL_NMI_EXIT - KERNAL_BASE) as usize] = OPCODE_RTI;
 
     // $FF48: JMP ($0314) — trampoline through user IRQ vector.
     let entry = (KERNAL_IRQ_ENTRY - KERNAL_BASE) as usize;
@@ -94,14 +113,21 @@ const fn build_kernel_stub() -> [u8; KERNAL_SIZE] {
     // $FF8E: RTI — exit point for handlers that JMP here to return.
     stub[(KERNAL_IRQ_EXIT - KERNAL_BASE) as usize] = OPCODE_RTI;
 
-    // Standard KERNAL IRQ exits: let handlers that JMP into the ROM finish the
-    // interrupt instead of executing the stub's default RTS and losing the
-    // interrupt frame.
-    let mut i = 0;
-    while i < KERNAL_IRQ_EXITS.len() {
-        stub[(KERNAL_IRQ_EXITS[i] - KERNAL_BASE) as usize] = OPCODE_RTI;
-        i += 1;
-    }
+    // $EA31: LDA $DC0D; RTI — acknowledges CIA1 ICR before returning.
+    let ea31 = (KERNAL_IRQ_EXIT_EA31 - KERNAL_BASE) as usize;
+    stub[ea31] = OPCODE_LDA_ABS;
+    stub[ea31 + 1] = CIA1_ICR_LO;
+    stub[ea31 + 2] = CIA1_ICR_HI;
+    stub[ea31 + 3] = OPCODE_RTI;
+
+    // $EA7E: LDA $DC0D — falls through directly into $EA81 (RTI).
+    let ea7e = (KERNAL_IRQ_EXIT_EA7E - KERNAL_BASE) as usize;
+    stub[ea7e] = OPCODE_LDA_ABS;
+    stub[ea7e + 1] = CIA1_ICR_LO;
+    stub[ea7e + 2] = CIA1_ICR_HI;
+
+    // $EA81: RTI.
+    stub[(KERNAL_IRQ_EXIT_EA81 - KERNAL_BASE) as usize] = OPCODE_RTI;
 
     stub
 }
@@ -191,8 +217,8 @@ pub struct C64Memory {
     ram: Box<[u8]>,
     pub sids: Vec<SidChip>,
     pub cia1: Cia1,
+    pub cia2: Cia,
     pub vic: Vic,
-    cia2_regs: [u8; 16],
     bank_config: u8,
     /// Whether hardware IRQ lines (CIA1 or VIC-II) are routed to the CPU. Off by default
     /// so PSID tunes (frame or CIA-poll) never have mos6502 service spurious IRQs;
@@ -207,8 +233,8 @@ impl C64Memory {
             ram: vec![0; RAM_SIZE].into_boxed_slice(),
             sids: vec![SidChip::new(chip_model, PRIMARY_SID_ADDRESS)],
             cia1: Cia1::new(),
+            cia2: Cia::new_stopped(),
             vic: Vic::default(),
-            cia2_regs: [0; 16],
             bank_config: BANK_DEFAULT,
             irq_routed: false,
         };
@@ -238,16 +264,19 @@ impl C64Memory {
         self.ram[..ZEROPAGE_AND_STACK_END].fill(0);
         self.bank_config = BANK_DEFAULT;
         self.cia1 = Cia1::new();
+        self.cia2 = Cia::new_stopped();
         self.vic.reset();
-        self.cia2_regs.fill(0);
         self.init_zeropage_defaults();
     }
 
     fn init_zeropage_defaults(&mut self) {
         let [exit_lo, exit_hi] = KERNAL_IRQ_EXIT.to_le_bytes();
+        let [nmi_exit_lo, nmi_exit_hi] = KERNAL_NMI_EXIT.to_le_bytes();
         self.ram[BANK_DATA_DIR_ADDR as usize] = BANK_DATA_DIR_DEFAULT;
         self.ram[USER_IRQ_VECTOR_LO as usize] = exit_lo;
         self.ram[USER_IRQ_VECTOR_HI as usize] = exit_hi;
+        self.ram[USER_NMI_VECTOR_LO as usize] = nmi_exit_lo;
+        self.ram[USER_NMI_VECTOR_HI as usize] = nmi_exit_hi;
     }
 
     /// Replace the chip model for a specific SID (by index).
@@ -265,6 +294,7 @@ impl C64Memory {
     }
 
     /// Per-voice mute switches, ordered chip by chip (3 entries per SID).
+    #[allow(dead_code)]
     pub fn voice_mutes(&self) -> Vec<bool> {
         self.sids
             .iter()
@@ -279,9 +309,10 @@ impl C64Memory {
         }
     }
 
-    /// Advances per-cycle peripherals (CIA1, VIC-II) by `cycles`.
+    /// Advances per-cycle peripherals (CIA1, CIA2, VIC-II) by `cycles`.
     pub fn tick(&mut self, cycles: u64) {
         self.cia1.tick(cycles);
+        self.cia2.tick(cycles);
         self.vic.tick(cycles);
     }
 
@@ -324,6 +355,10 @@ impl Bus for C64Memory {
         if addr == BANK_CONFIG_ADDR {
             return self.bank_config;
         }
+        // Fast path: $0002..$CFFF is always plain RAM (all I/O & KERNAL are >= $D000).
+        if addr < VIC_BASE {
+            return self.ram[addr as usize];
+        }
         if addr >= KERNAL_BASE && self.kernal_banked_in() {
             return KERNAL_STUB[(addr - KERNAL_BASE) as usize];
         }
@@ -344,11 +379,8 @@ impl Bus for C64Memory {
             return self.cia1.read_register((addr & 0x0F) as u8);
         }
         if (CIA2_BASE..CIA2_END).contains(&addr) {
-            let reg = (addr & 0x0F) as usize;
-            if reg == 0x0D {
-                return 0x00; // CIA2 ICR read returns 0 (no pending NMIs)
-            }
-            return self.cia2_regs[reg];
+            #[allow(clippy::cast_possible_truncation)]
+            return self.cia2.read_register((addr & 0x0F) as u8);
         }
         self.ram[addr as usize]
     }
@@ -356,6 +388,11 @@ impl Bus for C64Memory {
     fn set_byte(&mut self, addr: u16, val: u8) {
         if addr == BANK_CONFIG_ADDR {
             self.bank_config = val;
+            return;
+        }
+        // Fast path: $0002..$CFFF is always plain RAM.
+        if addr < VIC_BASE {
+            self.ram[addr as usize] = val;
             return;
         }
         if (VIC_BASE..VIC_END).contains(&addr) {
@@ -378,7 +415,8 @@ impl Bus for C64Memory {
             return;
         }
         if (CIA2_BASE..CIA2_END).contains(&addr) {
-            self.cia2_regs[(addr & 0x0F) as usize] = val;
+            #[allow(clippy::cast_possible_truncation)]
+            self.cia2.write_register((addr & 0x0F) as u8, val);
             return;
         }
         self.ram[addr as usize] = val;
@@ -386,6 +424,10 @@ impl Bus for C64Memory {
 
     fn irq_pending(&mut self) -> bool {
         self.irq_routed && (self.cia1.irq_line() || self.vic.irq_line())
+    }
+
+    fn nmi_pending(&mut self) -> bool {
+        self.irq_routed && self.cia2.irq_line()
     }
 }
 
@@ -453,10 +495,16 @@ mod tests {
     }
 
     #[test]
-    fn kernal_irq_exits_return_with_rti() {
+    fn kernal_irq_exits_acknowledge_cia_and_return_with_rti() {
         let mut mem = memory();
-        for addr in [0xEA31, 0xEA7E, 0xEA81] {
-            assert_eq!(mem.get_byte(addr), OPCODE_RTI, "exit at ${addr:04X}");
-        }
+        assert_eq!(mem.get_byte(0xEA31), OPCODE_LDA_ABS);
+        assert_eq!(mem.get_byte(0xEA32), CIA1_ICR_LO);
+        assert_eq!(mem.get_byte(0xEA33), CIA1_ICR_HI);
+        assert_eq!(mem.get_byte(0xEA34), OPCODE_RTI);
+
+        assert_eq!(mem.get_byte(0xEA7E), OPCODE_LDA_ABS);
+        assert_eq!(mem.get_byte(0xEA7F), CIA1_ICR_LO);
+        assert_eq!(mem.get_byte(0xEA80), CIA1_ICR_HI);
+        assert_eq!(mem.get_byte(0xEA81), OPCODE_RTI);
     }
 }

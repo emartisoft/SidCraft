@@ -124,6 +124,7 @@ pub struct Spectrum {
     window: Vec<f32>,
     re: Vec<f32>,
     im: Vec<f32>,
+    twiddles: Vec<(f32, f32)>,
     band_edges: Vec<(usize, usize)>,
     sample_rate: u32,
 }
@@ -136,6 +137,13 @@ impl Spectrum {
                 0.5 - 0.5 * x.cos()
             })
             .collect();
+        let mut twiddles = Vec::new();
+        let mut len = 2;
+        while len <= FFT_SIZE {
+            let angle = -2.0 * PI / len as f32;
+            twiddles.push((angle.cos(), angle.sin()));
+            len <<= 1;
+        }
         Self {
             bands: vec![0.0; SPECTRUM_BANDS],
             peaks: vec![0.0; SPECTRUM_BANDS],
@@ -143,6 +151,7 @@ impl Spectrum {
             window,
             re: vec![0.0; FFT_SIZE],
             im: vec![0.0; FFT_SIZE],
+            twiddles,
             band_edges: Vec::new(),
             sample_rate: 0,
         }
@@ -166,7 +175,7 @@ impl Spectrum {
             self.re[i] = sample * self.window[i];
             self.im[i] = 0.0;
         }
-        fft(&mut self.re, &mut self.im);
+        fft(&mut self.re, &mut self.im, &self.twiddles);
 
         let now = Instant::now();
         let norm = 4.0 / FFT_SIZE as f32;
@@ -226,7 +235,12 @@ impl Spectrogram {
 
     pub fn push(&mut self, bands: &[f32]) {
         if self.columns.len() >= SPECTROGRAM_COLUMNS {
-            self.columns.pop_front();
+            if let Some(mut recycled) = self.columns.pop_front() {
+                recycled.resize(bands.len(), 0.0);
+                recycled.copy_from_slice(bands);
+                self.columns.push_back(recycled);
+                return;
+            }
         }
         self.columns.push_back(bands.to_vec());
     }
@@ -236,8 +250,8 @@ impl Spectrogram {
     }
 }
 
-/// In-place iterative radix-2 Cooley-Tukey FFT.
-fn fft(re: &mut [f32], im: &mut [f32]) {
+/// In-place iterative radix-2 Cooley-Tukey FFT using precomputed stage twiddle factors.
+fn fft(re: &mut [f32], im: &mut [f32], twiddles: &[(f32, f32)]) {
     let n = re.len();
     if n <= 1 || !n.is_power_of_two() {
         return;
@@ -259,9 +273,15 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 
     let mut len = 2;
+    let mut stage = 0;
     while len <= n {
-        let angle = -2.0 * PI / len as f32;
-        let (w_re, w_im) = (angle.cos(), angle.sin());
+        let (w_re, w_im) = twiddles
+            .get(stage)
+            .copied()
+            .unwrap_or_else(|| {
+                let angle = -2.0 * PI / len as f32;
+                (angle.cos(), angle.sin())
+            });
         let half = len / 2;
         let mut start = 0;
         while start < n {
@@ -284,5 +304,6 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
             start += len;
         }
         len <<= 1;
+        stage += 1;
     }
 }

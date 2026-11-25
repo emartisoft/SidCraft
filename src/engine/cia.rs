@@ -13,20 +13,26 @@
 /// across `$DC00..=$DCFF`).
 const REG_TIMER_A_LO: u8 = 0x04;
 const REG_TIMER_A_HI: u8 = 0x05;
+const REG_TIMER_B_LO: u8 = 0x06;
+const REG_TIMER_B_HI: u8 = 0x07;
 const REG_ICR: u8 = 0x0D;
 const REG_CRA: u8 = 0x0E;
+const REG_CRB: u8 = 0x0F;
 /// CIA register file is 16 bytes; addresses above mirror.
 const REG_MASK: u8 = 0x0F;
 
-/// Control Register A bits. Exposed `pub(crate)` so test fixtures and other
-/// modules can write CRA values without inlining hex literals.
+/// Control Register A/B bits.
 pub(crate) const CRA_START: u8 = 1 << 0;
 const CRA_MODE_ONESHOT: u8 = 1 << 3;
 /// Force-load is a write-only strobe: copies latch into counter then clears itself.
 pub(crate) const CRA_FORCE_LOAD: u8 = 1 << 4;
+/// CRB bits 5-6 = 10 (`0x40`): Timer B counts Timer A underflows instead of CPU cycles.
+const CRB_INMODE_MASK: u8 = 0x60;
+const CRB_INMODE_TA_UNDERFLOW: u8 = 0x40;
 
-/// Interrupt Control Register source bits (only Timer A is acted on).
+/// Interrupt Control Register source bits.
 pub(crate) const ICR_TIMER_A: u8 = 1 << 0;
+pub(crate) const ICR_TIMER_B: u8 = 1 << 1;
 /// Set in the read value when any masked source is pending; mirrors the IRQ line.
 const ICR_ANY: u8 = 1 << 7;
 /// Bit 7 in writes selects set vs clear; bits 0-4 select which sources.
@@ -44,44 +50,66 @@ const FLOATING_BUS: u8 = 0xFF;
 /// reprogram the CIA at all.
 const KERNAL_DEFAULT_LATCH: u16 = 0x4025;
 
-/// MOS 6526 CIA1 — Timer A + Interrupt Control Register.
-pub struct Cia1 {
-    /// Decrementing 16-bit counter (per CPU cycle when `CRA_START` is set).
+/// MOS 6526 CIA — Timer A + Timer B + Interrupt Control Register.
+/// Used for both CIA1 (IRQ) and CIA2 (NMI).
+pub struct Cia {
+    /// Decrementing 16-bit Timer A counter (per CPU cycle when `CRA_START` is set).
     counter_a: u16,
     /// Reloaded into `counter_a` on underflow (continuous) or force-load.
     latch_a: u16,
     /// Control register A; force-load strobe is acted on but not stored.
     cra: u8,
+    /// Decrementing 16-bit Timer B counter.
+    counter_b: u16,
+    /// Reloaded into `counter_b` on underflow (continuous) or force-load.
+    latch_b: u16,
+    /// Control register B; force-load strobe is acted on but not stored.
+    crb: u8,
     /// Pending interrupt sources, bits 0-4.
     icr_pending: u8,
-    /// Mask: bits 0-4 enable per-source IRQ assertion.
+    /// Mask: bits 0-4 enable per-source IRQ/NMI assertion.
     icr_mask: u8,
 }
 
-impl Default for Cia1 {
+pub type Cia1 = Cia;
+
+impl Default for Cia {
     fn default() -> Self {
         // Boot already armed — see KERNAL_DEFAULT_LATCH note above.
         Self {
             counter_a: KERNAL_DEFAULT_LATCH,
             latch_a: KERNAL_DEFAULT_LATCH,
             cra: CRA_START,
+            counter_b: 0xFFFF,
+            latch_b: 0xFFFF,
+            crb: 0,
             icr_pending: 0,
             icr_mask: 0,
         }
     }
 }
 
-impl Cia1 {
+impl Cia {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Bus read of CIA1 register `reg` (low 4 bits significant; mirrors).
+    /// Creates a CIA with Timer A stopped (suitable for CIA2 at boot).
+    pub fn new_stopped() -> Self {
+        Self {
+            cra: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Bus read of CIA register `reg` (low 4 bits significant; mirrors).
     pub fn read_register(&mut self, reg: u8) -> u8 {
         #[allow(clippy::cast_possible_truncation)]
         match reg & REG_MASK {
             REG_TIMER_A_LO => (self.counter_a & 0x00FF) as u8,
             REG_TIMER_A_HI => (self.counter_a >> 8) as u8,
+            REG_TIMER_B_LO => (self.counter_b & 0x00FF) as u8,
+            REG_TIMER_B_HI => (self.counter_b >> 8) as u8,
             REG_ICR => {
                 // Returning ICR atomically reads pending+IRQ line and clears both.
                 let any = if self.irq_line() { ICR_ANY } else { 0 };
@@ -89,16 +117,19 @@ impl Cia1 {
                 self.icr_pending = 0;
                 value
             }
-            REG_CRA => self.cra & !CRA_FORCE_LOAD, // strobe never reads back
+            REG_CRA => self.cra & !CRA_FORCE_LOAD,
+            REG_CRB => self.crb & !CRA_FORCE_LOAD,
             _ => FLOATING_BUS,
         }
     }
 
-    /// Bus write of CIA1 register `reg`.
+    /// Bus write of CIA register `reg`.
     pub fn write_register(&mut self, reg: u8, val: u8) {
         match reg & REG_MASK {
             REG_TIMER_A_LO => self.latch_a = (self.latch_a & 0xFF00) | u16::from(val),
             REG_TIMER_A_HI => self.latch_a = (self.latch_a & 0x00FF) | (u16::from(val) << 8),
+            REG_TIMER_B_LO => self.latch_b = (self.latch_b & 0xFF00) | u16::from(val),
+            REG_TIMER_B_HI => self.latch_b = (self.latch_b & 0x00FF) | (u16::from(val) << 8),
             REG_ICR => {
                 // Bit 7 = 1 → set the source bits in the mask; bit 7 = 0 → clear them.
                 let sources = val & ICR_SOURCE_MASK;
@@ -114,39 +145,41 @@ impl Cia1 {
                 }
                 self.cra = val & !CRA_FORCE_LOAD;
             }
-            _ => {} // other registers stub: accept but discard
+            REG_CRB => {
+                if val & CRA_FORCE_LOAD != 0 {
+                    self.counter_b = self.latch_b;
+                }
+                self.crb = val & !CRA_FORCE_LOAD;
+            }
+            _ => {}
         }
     }
 
-    /// Advance Timer A by `cycles`. Sets ICR Timer A bit on each underflow;
-    /// reloads from latch (continuous) or stops (one-shot).
+    /// Advance Timer A and Timer B by `cycles`.
     pub fn tick(&mut self, cycles: u64) {
-        if self.cra & CRA_START == 0 {
-            return;
-        }
-        // Pathological: latch=0 would underflow every cycle. One IRQ flag is enough.
-        if self.latch_a == 0 {
-            self.icr_pending |= ICR_TIMER_A;
-            return;
-        }
-        let mut remaining = cycles;
-        while remaining > 0 {
-            let to_underflow = u64::from(self.counter_a) + 1;
-            if remaining < to_underflow {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    self.counter_a -= remaining as u16;
-                }
-                return;
-            }
-            remaining -= to_underflow;
-            self.icr_pending |= ICR_TIMER_A;
-            if self.cra & CRA_MODE_ONESHOT != 0 {
-                self.cra &= !CRA_START;
-                self.counter_a = self.latch_a;
-                return;
-            }
-            self.counter_a = self.latch_a;
+        let ta_underflows = tick_timer(
+            &mut self.counter_a,
+            self.latch_a,
+            &mut self.cra,
+            cycles,
+            &mut self.icr_pending,
+            ICR_TIMER_A,
+        );
+
+        let tb_ticks = if (self.crb & CRB_INMODE_MASK) == CRB_INMODE_TA_UNDERFLOW {
+            ta_underflows
+        } else {
+            cycles
+        };
+        if tb_ticks > 0 {
+            tick_timer(
+                &mut self.counter_b,
+                self.latch_b,
+                &mut self.crb,
+                tb_ticks,
+                &mut self.icr_pending,
+                ICR_TIMER_B,
+            );
         }
     }
 
@@ -163,4 +196,44 @@ impl Cia1 {
         self.icr_pending &= !ICR_TIMER_A;
         fired
     }
+}
+
+/// Advances one CIA timer by `ticks`, returning the number of underflows.
+fn tick_timer(
+    counter: &mut u16,
+    latch: u16,
+    cr: &mut u8,
+    ticks: u64,
+    icr_pending: &mut u8,
+    icr_bit: u8,
+) -> u64 {
+    if *cr & CRA_START == 0 {
+        return 0;
+    }
+    if latch == 0 {
+        *icr_pending |= icr_bit;
+        return 1;
+    }
+    let mut remaining = ticks;
+    let mut underflows = 0u64;
+    while remaining > 0 {
+        let to_underflow = u64::from(*counter) + 1;
+        if remaining < to_underflow {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *counter -= remaining as u16;
+            }
+            return underflows;
+        }
+        remaining -= to_underflow;
+        underflows += 1;
+        *icr_pending |= icr_bit;
+        if *cr & CRA_MODE_ONESHOT != 0 {
+            *cr &= !CRA_START;
+            *counter = latch;
+            return underflows;
+        }
+        *counter = latch;
+    }
+    underflows
 }

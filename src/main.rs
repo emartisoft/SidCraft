@@ -503,6 +503,12 @@ pub struct SidcraftApp {
     envelope_curves: Vec<Vec<f32>>,
     /// Per-voice mute switches mirrored from the player for the mixer UI.
     pub voice_mutes: Vec<bool>,
+    /// Reusable buffer for per-frame voice envelope levels.
+    voice_levels_buf: Vec<u8>,
+    /// Cached GPU texture for the spectrogram waterfall display.
+    spectrogram_texture: Option<egui::TextureHandle>,
+    /// Set whenever a new column is pushed to `spectrogram`.
+    spectrogram_dirty: bool,
 
     // Song timing
     song_elapsed: Duration,
@@ -533,6 +539,10 @@ pub struct SidcraftApp {
     pub playlist_search: String,
     /// Cursor within the current search matches.
     playlist_search_match: usize,
+    /// Cached `(query, playlist_len, matches)` for `playlist_search_matches`.
+    playlist_search_cache: (String, u64, Vec<usize>),
+    /// Incremented whenever `playlist` is modified, to invalidate search cache.
+    playlist_revision: u64,
     playlist_files: Vec<PathBuf>,
     pub show_new_playlist: bool,
     pub new_playlist_name: String,
@@ -846,8 +856,11 @@ impl SidcraftApp {
         let stream = match audio.start(move |data| {
             // Fill the buffer first: `fill_buffer` overwrites every sample, so
             // the gain/mute stage has to run afterwards or it would be lost.
-            if let Ok(mut p) = player_audio.lock() {
+            // Use `try_lock` so a background seek/load never blocks the OS audio thread.
+            if let Ok(mut p) = player_audio.try_lock() {
                 p.fill_buffer(data);
+            } else {
+                data.fill(0.0);
             }
             let vol = if muted_handle.load(Ordering::SeqCst) {
                 0.0
@@ -920,6 +933,9 @@ impl SidcraftApp {
             envelope_states: Vec::new(),
             envelope_curves: Vec::new(),
             voice_mutes: vec![false; sid_count * 3],
+            voice_levels_buf: Vec::with_capacity(sid_count * 3),
+            spectrogram_texture: None,
+            spectrogram_dirty: false,
             song_elapsed: Duration::ZERO,
             song_resumed_at: Instant::now(),
             song_timeout: Duration::from_secs(180),
@@ -940,6 +956,8 @@ impl SidcraftApp {
             playlist_scroll_to_selected: false,
             playlist_search: String::new(),
             playlist_search_match: 0,
+            playlist_search_cache: (String::new(), 0, Vec::new()),
+            playlist_revision: 1,
             playlist_files,
             show_new_playlist: false,
             new_playlist_name: String::new(),
@@ -1061,14 +1079,14 @@ impl SidcraftApp {
         };
         let accent = self.accent.config_key();
         let viz = self.viz_mode.config_key();
-        let active = self.playlist_path.to_string_lossy().to_string();
+        let active = self.playlist_path.to_string_lossy();
         if self.config.theme != theme
             || self.config.accent_color != accent
             || self.config.left_panel != self.left_open
             || self.config.right_panel != self.right_open
             || self.config.viz_mode != viz
             || self.config.ekv_filter != self.ekv_filter
-            || self.config.active_playlist.as_deref() != Some(active.as_str())
+            || self.config.active_playlist.as_deref() != Some(active.as_ref())
             || (self.config.mini_opacity - self.mini_opacity).abs() > 0.001
             || self.config.start_in_mini != self.start_in_mini
         {
@@ -1078,7 +1096,7 @@ impl SidcraftApp {
             self.config.right_panel = self.right_open;
             self.config.viz_mode = viz.to_string();
             self.config.ekv_filter = self.ekv_filter;
-            self.config.active_playlist = Some(active);
+            self.config.active_playlist = Some(active.into_owned());
             self.config.mini_opacity = self.mini_opacity;
             self.config.start_in_mini = self.start_in_mini;
             self.config.save();
@@ -1864,6 +1882,7 @@ impl SidcraftApp {
         match Playlist::load(&path) {
             Ok(playlist) => {
                 self.playlist = playlist;
+                self.playlist_revision = self.playlist_revision.wrapping_add(1);
                 self.playlist_path = path;
                 self.selected_playlist_idx = 0;
                 self.playlist_drag_from = None;
@@ -1911,6 +1930,7 @@ impl SidcraftApp {
         if !enabled && was_active {
             let default_path = ensure_default_playlist(&playlist::playlists_dir());
             self.playlist = Playlist::load(&default_path).unwrap_or_default();
+            self.playlist_revision = self.playlist_revision.wrapping_add(1);
             self.playlist_path = default_path;
             self.selected_playlist_idx = 0;
             self.playlist_drag_from = None;
@@ -1920,7 +1940,10 @@ impl SidcraftApp {
             // The file was regenerated for the selected mirror, so the active
             // playlist's sources need refreshing even though the path is the same.
             match Playlist::load(&favourite_path) {
-                Ok(playlist) => self.playlist = playlist,
+                Ok(playlist) => {
+                    self.playlist = playlist;
+                    self.playlist_revision = self.playlist_revision.wrapping_add(1);
+                }
                 Err(e) => self.set_status(format!("Could not reload favourite playlist: {e}")),
             }
             self.selected_playlist_idx = 0;
@@ -2018,6 +2041,7 @@ impl SidcraftApp {
 
         let created = list.len();
         self.playlist = list;
+        self.playlist_revision = self.playlist_revision.wrapping_add(1);
         self.playlist_path = path;
         self.selected_playlist_idx = 0;
         self.playlist_drag_from = None;
@@ -2046,6 +2070,7 @@ impl SidcraftApp {
     }
 
     pub fn save_playlist(&mut self) {
+        self.playlist_revision = self.playlist_revision.wrapping_add(1);
         if let Err(e) = self.playlist.save(&self.playlist_path) {
             self.set_status(format!("Could not save playlist: {e}"));
         }
@@ -2247,18 +2272,25 @@ impl SidcraftApp {
         }
     }
 
-    /// Playlist indices currently matching the search box.
-    pub fn playlist_search_matches(&self) -> Vec<usize> {
-        playlist_search_indices(&self.playlist.entries, &self.playlist_search)
+    /// Playlist indices currently matching the search box (cached across frames).
+    pub fn playlist_search_matches(&mut self) -> &[usize] {
+        if self.playlist_search_cache.0 != self.playlist_search
+            || self.playlist_search_cache.1 != self.playlist_revision
+        {
+            self.playlist_search_cache.0.clear();
+            self.playlist_search_cache.0.push_str(&self.playlist_search);
+            self.playlist_search_cache.1 = self.playlist_revision;
+            self.playlist_search_cache.2 =
+                playlist_search_indices(&self.playlist.entries, &self.playlist_search);
+        }
+        &self.playlist_search_cache.2
     }
 
     /// Keeps the search cursor aligned when a row is selected directly.
     pub fn sync_playlist_search_cursor(&mut self) {
+        let selected = self.selected_playlist_idx;
         let matches = self.playlist_search_matches();
-        if let Some(pos) = matches
-            .iter()
-            .position(|&idx| idx == self.selected_playlist_idx)
-        {
+        if let Some(pos) = matches.iter().position(|&idx| idx == selected) {
             self.playlist_search_match = pos;
         }
     }
@@ -2271,8 +2303,9 @@ impl SidcraftApp {
             return;
         }
         let cursor = cursor.min(matches.len() - 1);
+        let target = matches[cursor];
         self.playlist_search_match = cursor;
-        self.selected_playlist_idx = matches[cursor];
+        self.selected_playlist_idx = target;
         self.playlist_scroll_to_selected = true;
     }
 
@@ -2384,6 +2417,7 @@ impl SidcraftApp {
             self.playlist = Playlist::default();
             self.playlist_path = fallback;
         }
+        self.playlist_revision = self.playlist_revision.wrapping_add(1);
 
         self.refresh_playlist_files();
         self.sync_config();
@@ -2536,6 +2570,7 @@ impl SidcraftApp {
         match Playlist::load(&path) {
             Ok(loaded) => {
                 self.playlist = loaded;
+                self.playlist_revision = self.playlist_revision.wrapping_add(1);
                 self.playlist_path = path.clone();
                 self.selected_playlist_idx = 0;
                 self.refresh_playlist_files();

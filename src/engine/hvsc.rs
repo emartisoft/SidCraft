@@ -568,18 +568,19 @@ fn contains_at_word_start(haystack: &str, needle: &str) -> bool {
 
 /// Ranks a match: exact file names first, then names starting with the query,
 /// then path matches, then title/artist mentions.
-fn search_score(path: &str, haystack: &str, phrase: &str, tokens: &[String]) -> u32 {
+/// Score a search hit without allocating; `haystack`'s first line is already the normalized path.
+fn search_score(haystack: &str, phrase: &str, tokens: &[String]) -> u32 {
     let mut score = 0;
-    if let Some(name) = path.rsplit('/').next() {
-        let stem = normalize_search_text(name);
-        let stem = stem.strip_suffix(".sid").unwrap_or(&stem);
+    let norm_path = haystack.split('\n').next().unwrap_or(haystack);
+    if let Some(stem) = norm_path.rsplit('/').next() {
+        let stem = stem.strip_suffix(".sid").unwrap_or(stem);
         if stem == phrase {
             score += 1000;
         } else if stem.starts_with(phrase) {
             score += 500;
         }
     }
-    if normalize_search_text(path).contains(phrase) {
+    if norm_path.contains(phrase) {
         score += 100;
     }
     if haystack.contains(phrase) {
@@ -724,13 +725,17 @@ impl HvscBrowser {
             .search_index
             .iter()
             .filter(|(_, haystack)| tokens.iter().all(|token| haystack.contains(token.as_str())))
-            .map(|(path, haystack)| (search_score(path, haystack, &phrase, &tokens), path.as_str()))
+            .map(|(path, haystack)| (search_score(haystack, &phrase, &tokens), path.as_str()))
             .collect();
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let cmp = |a: &(u32, &str), b: &(u32, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+        if matches.len() > 100 {
+            matches.select_nth_unstable_by(99, cmp);
+            matches.truncate(100);
+        }
+        matches.sort_by(cmp);
 
         Ok(matches
             .into_iter()
-            .take(100)
             .map(|(_, path)| path.to_string())
             .collect())
     }
