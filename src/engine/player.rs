@@ -1442,6 +1442,54 @@ mod tests {
     }
 
     #[test]
+    fn rsid_handler_that_decs_d019_runs_once_per_frame() {
+        // `DEC $D019` is a common way to acknowledge the raster IRQ: the 6502
+        // read-modify-write cycle performs a dummy write of the value read
+        // ($F1), which clears the flag on real hardware. The CPU emulator only
+        // issues the final write ($F0), so the VIC has to infer the dummy write.
+        // Without that, the flag stays set and the handler runs back-to-back at
+        // CPU speed instead of once per frame (heard as a tune playing too fast,
+        // e.g. Great Giana Sisters subsongs 2+).
+        #[rustfmt::skip]
+        let mut data = vec![
+            0xA9, 0x20,       // LDA #$20
+            0x8D, 0x14, 0x03, // STA $0314
+            0xA9, 0x08,       // LDA #$08
+            0x8D, 0x15, 0x03, // STA $0315
+            0xA9, 0x00,       // LDA #$00
+            0x8D, 0x12, 0xD0, // STA $D012  (raster compare = line 0)
+            0xA9, 0x01,       // LDA #$01
+            0x8D, 0x1A, 0xD0, // STA $D01A  (enable raster IRQ)
+            0x60,             // RTS
+        ];
+        data.resize(0x20, 0);
+        data.extend_from_slice(&[
+            0xEE, 0x00, 0x02, // INC $0200 (count low byte)
+            0xD0, 0x03,       // BNE +3
+            0xEE, 0x01, 0x02, // INC $0201 (count high byte)
+            0xCE, 0x19, 0xD0, // DEC $D019 (acknowledge raster IRQ)
+            0x40,             // RTI
+        ]);
+
+        let sid = synthetic_sid("RSID", 0x0800, 0, data);
+        let mut p = Player::new(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        assert_eq!(p.drive_mode, DriveMode::Interrupt);
+
+        let frames = 3u32;
+        let target = PAL_FRAME_CYCLES * frames;
+        while p.frame_cycle_count < target {
+            assert!(p.advance_one_step(), "{:?}", p.playback_error);
+        }
+
+        let entries = u16::from(p.cpu.memory.get_byte(0x0200))
+            | (u16::from(p.cpu.memory.get_byte(0x0201)) << 8);
+        assert!(
+            (1..=frames as u16 + 1).contains(&entries),
+            "expected about one handler call per frame, got {entries} in {frames} frames"
+        );
+    }
+
+    #[test]
     fn cia2_and_vic_register_writes_during_init_do_not_fail_load() {
         #[rustfmt::skip]
         let data = vec![

@@ -31,6 +31,9 @@ pub struct Vic {
     raster_compare: u16,
     irq_flag: u8,
     irq_mask: u8,
+    /// Last value returned from `$D019`, used to reconstruct the dummy write of
+    /// 6502 read-modify-write instructions (see `write_register`).
+    last_irr_read: u8,
 }
 
 impl Default for Vic {
@@ -57,6 +60,7 @@ impl Vic {
             raster_compare: 0,
             irq_flag: 0,
             irq_mask: 0,
+            last_irr_read: 0,
         }
     }
 
@@ -68,6 +72,7 @@ impl Vic {
         self.raster_compare = 0;
         self.irq_flag = 0;
         self.irq_mask = 0;
+        self.last_irr_read = 0;
     }
 
     /// Configures the video standard (PAL vs NTSC).
@@ -96,7 +101,7 @@ impl Vic {
     }
 
     /// Reads a VIC-II register ($D000..$D03F).
-    pub fn read_register(&self, reg: u8) -> u8 {
+    pub fn read_register(&mut self, reg: u8) -> u8 {
         match reg & REG_MASK {
             REG_CR1 => {
                 let msb = if self.current_line() >= 256 {
@@ -109,7 +114,9 @@ impl Vic {
             REG_RASTER => (self.current_line() & 0xFF) as u8,
             REG_IRR => {
                 let any = if self.irq_line() { 0x80 } else { 0x00 };
-                0x70 | any | (self.irq_flag & 0x0F)
+                let value = 0x70 | any | (self.irq_flag & 0x0F);
+                self.last_irr_read = value;
+                value
             }
             REG_IMR => 0xF0 | (self.irq_mask & 0x0F),
             r => self.regs[r as usize],
@@ -133,13 +140,19 @@ impl Vic {
             }
             REG_IRR => {
                 // Writing 1 to a bit acknowledges and clears that interrupt flag.
-                // On real 6510 hardware, `INC $D019` acknowledges the raster IRQ via the
-                // 6502 Read-Modify-Write dummy write cycle (which writes the unincremented
-                // value with bit 0 set). Single-write 6502 emulators only perform the final write
-                // ($F2), so we also clear bit 0 if bit 1 is set or if bit 0 was set.
+                // On real 6510 hardware, `INC $D019` / `DEC $D019` acknowledge the
+                // raster IRQ through the Read-Modify-Write dummy write cycle, which
+                // writes the value read before the modified value. `mos6502` only
+                // performs the final write, so infer the dummy write: a write that
+                // matches the last `$D019` read (or is one more/less) came from an
+                // RMW instruction, and the bits that were set when it was read must
+                // be acknowledged.
                 let mut clear_mask = val & 0x0F;
-                if (val & 0x02 != 0) && (self.irq_flag & 0x01 != 0) {
-                    clear_mask |= 0x01;
+                if val == self.last_irr_read
+                    || val == self.last_irr_read.wrapping_add(1)
+                    || val == self.last_irr_read.wrapping_sub(1)
+                {
+                    clear_mask |= self.last_irr_read & 0x0F;
                 }
                 self.irq_flag &= !clear_mask;
             }
@@ -251,7 +264,35 @@ mod tests {
         vic.write_register(REG_IMR, 0x01);
         vic.tick(pal_line_start(10) + 1);
 
-        vic.write_register(REG_IRR, 0xF2);
+        let read = vic.read_register(REG_IRR);
+        vic.write_register(REG_IRR, read.wrapping_add(1));
+        assert_eq!(vic.irq_flag_bits() & 0x01, 0);
+    }
+
+    #[test]
+    fn dec_d019_acknowledges_raster_irq() {
+        // `DEC $D019` reads $F1 and writes $F0 on a single-write emulator.
+        let mut vic = Vic::new(true);
+        vic.write_register(REG_RASTER, 10);
+        vic.write_register(REG_IMR, 0x01);
+        vic.tick(pal_line_start(10) + 1);
+
+        let read = vic.read_register(REG_IRR);
+        vic.write_register(REG_IRR, read.wrapping_sub(1));
+        assert_eq!(vic.irq_flag_bits() & 0x01, 0);
+        assert!(!vic.irq_line());
+    }
+
+    #[test]
+    fn read_then_write_back_d019_acknowledges_raster_irq() {
+        // `LDA $D019 / STA $D019` writes the value read.
+        let mut vic = Vic::new(true);
+        vic.write_register(REG_RASTER, 10);
+        vic.write_register(REG_IMR, 0x01);
+        vic.tick(pal_line_start(10) + 1);
+
+        let read = vic.read_register(REG_IRR);
+        vic.write_register(REG_IRR, read);
         assert_eq!(vic.irq_flag_bits() & 0x01, 0);
     }
 
