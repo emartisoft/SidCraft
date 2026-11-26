@@ -452,17 +452,23 @@ impl Player {
         let at_sentinel = self.cpu.registers.program_counter == SENTINEL_PC;
 
         // NMI is edge-triggered (rising edge on CIA2 IRQ line) and non-maskable.
-        let nmi_current = self.drive_mode == DriveMode::Interrupt && self.cpu.memory.nmi_pending();
+        let nmi_current =
+            self.drive_mode == DriveMode::Interrupt && self.cpu.memory.raw_nmi_pending();
         let service_nmi = nmi_current && !self.last_nmi_state;
         self.last_nmi_state = nmi_current;
 
-        // Only RSID-style tunes route CIA/VIC IRQs through mos6502's vector. PSID
-        // (frame or CIA-poll) keeps the CPU at the sentinel and the player
-        // dispatches play() directly. Note: `at_sentinel` is NOT required here,
-        // because free-running RSIDs loop in user RAM while still taking IRQs.
+        // Only RSID-style tunes route CIA/VIC IRQs through the tune's vector. PSID
+        // (frame or CIA-poll) keeps the CPU at the sentinel and the player calls
+        // play() directly. `at_sentinel` is NOT required here: free-running RSIDs
+        // loop in user RAM while still taking interrupts.
+        //
+        // `mos6502` also polls the bus for interrupts after each instruction, so
+        // `Bus::irq_pending`/`nmi_pending` deliberately return false. Otherwise its
+        // independent edge latch would service the same NMI again with a stale
+        // return address, running the tune's handler twice per timer underflow.
         let service_irq = !service_nmi
             && self.drive_mode == DriveMode::Interrupt
-            && self.cpu.memory.irq_pending()
+            && self.cpu.memory.raw_irq_pending()
             && !self
                 .cpu
                 .registers
@@ -474,29 +480,27 @@ impl Player {
             self.force_nmi_service();
             IRQ_ENTRY_CYCLES
         } else if service_irq {
-            // Manually vector — single-stepping the RTS at $0000 would pop garbage,
-            // and mos6502::CPU::single_step does not poll Bus::irq_pending().
+            // Manually vector: at the sentinel an RTS would pop the planted dummy
+            // return address instead of a real interrupted PC.
             self.force_irq_service();
             IRQ_ENTRY_CYCLES
         } else if at_sentinel {
             1
         } else {
-            // `single_step` already advances `cpu.cycles`; the manual paths above
-            // do not, so reconcile the counter with the charged delta below.
             self.cpu.single_step();
-            0
+            self.cpu.cycles - prev_cycles
         };
         if elapsed == 0 {
             // WAI/STP (or an undecodable opcode) completes without consuming a
             // cycle in mos6502. Charge one idle cycle anyway so the audio loop
             // makes progress and the VIC/CIA can eventually raise the interrupt
             // that wakes the CPU instead of spinning here forever.
-            elapsed = self.cpu.cycles - prev_cycles;
-            if elapsed == 0 {
-                elapsed = 1;
-            }
-            self.cpu.cycles = prev_cycles.saturating_add(elapsed);
+            elapsed = 1;
         }
+        // Forced interrupt entry and sentinel idle do not move `cpu.cycles`, but
+        // the peripherals and sample clock are charged for them; keep the CPU's
+        // own cycle counter in step with that accounting.
+        self.cpu.cycles = prev_cycles.saturating_add(elapsed);
 
         // Frame-mode tunes never observe CIA1, so skip the timer arithmetic entirely.
         if self.drive_mode != DriveMode::Frame {
@@ -1638,7 +1642,9 @@ mod tests {
         ];
         data.resize(0x30, 0);
         data.extend_from_slice(&[
-            0xEE, 0x00, 0x02, // INC $0200 (count NMI entries)
+            0xEE, 0x00, 0x02, // INC $0200 (count NMI entries, low byte)
+            0xD0, 0x03,       // BNE skip-high (skip the next INC)
+            0xEE, 0x01, 0x02, // INC $0201 (high byte)
             0xAD, 0x0D, 0xDD, // LDA $DD0D (ACK CIA2 NMI)
             0x40,             // RTI
         ]);
@@ -1650,10 +1656,14 @@ mod tests {
         p.fill_buffer(&mut buffer);
         assert!(p.playback_error.is_none(), "{:?}", p.playback_error);
 
-        let nmi_entries = p.cpu.memory.get_byte(0x0200);
+        let lo = u16::from(p.cpu.memory.get_byte(0x0200));
+        let hi = u16::from(p.cpu.memory.get_byte(0x0201));
+        let nmi_entries = lo | (hi << 8);
+        // ~91k emulated cycles at 1001 cycles per underflow. A second, duplicate
+        // service from mos6502's poller would roughly double this count.
         assert!(
-            nmi_entries > 10,
-            "expected CIA2 Timer A NMI handler to run repeatedly, got {nmi_entries}"
+            (70..=110).contains(&nmi_entries),
+            "expected one CIA2 Timer A NMI per underflow, got {nmi_entries}"
         );
     }
 }

@@ -326,9 +326,19 @@ impl C64Memory {
         self.cia1.take_timer_a_underflow()
     }
 
-    /// Toggles whether hardware IRQ lines (CIA1 or VIC-II) drive `Bus::irq_pending`.
-    /// Only RSID-style tunes want this — PSID-CIA polls the underflow flag directly via
-    /// `cia1_take_timer_a_underflow` and would be disrupted by mos6502 servicing.
+    /// Raw IRQ line state for the player's own interrupt dispatcher.
+    pub fn raw_irq_pending(&mut self) -> bool {
+        self.irq_routed && (self.cia1.irq_line() || self.vic.irq_line())
+    }
+
+    /// Raw NMI line state for the player's own interrupt dispatcher.
+    pub fn raw_nmi_pending(&mut self) -> bool {
+        self.irq_routed && self.cia2.irq_line()
+    }
+
+    /// Toggles whether hardware IRQ lines (CIA1 or VIC-II) drive the player's IRQ
+    /// dispatcher. Only RSID-style tunes want this — PSID-CIA polls the underflow
+    /// flag directly via `cia1_take_timer_a_underflow`.
     pub fn set_irq_routed(&mut self, routed: bool) {
         self.irq_routed = routed;
     }
@@ -423,11 +433,15 @@ impl Bus for C64Memory {
     }
 
     fn irq_pending(&mut self) -> bool {
-        self.irq_routed && (self.cia1.irq_line() || self.vic.irq_line())
+        // The player is the sole interrupt dispatcher. Exposing the line to
+        // mos6502 as well lets its own poller enter the handler a second time
+        // with a stale return address, advancing interrupt-driven tunes twice.
+        false
     }
 
     fn nmi_pending(&mut self) -> bool {
-        self.irq_routed && self.cia2.irq_line()
+        // See `irq_pending`: the player consumes NMI edges via raw_nmi_pending().
+        false
     }
 }
 
@@ -488,17 +502,36 @@ mod tests {
         mem.set_byte(0xD01A, 0x01);
         mem.tick(64);
         assert!(mem.vic.irq_line());
-        assert!(!mem.irq_pending(), "PSID must not see hardware IRQs");
+        assert!(!mem.raw_irq_pending(), "PSID must not see hardware IRQs");
 
         mem.set_irq_routed(true);
-        assert!(mem.irq_pending(), "RSID must see the VIC raster IRQ");
+        assert!(mem.raw_irq_pending(), "RSID must see the VIC raster IRQ");
+    }
+
+    #[test]
+    fn bus_hides_interrupt_lines_from_mos6502() {
+        let mut mem = memory();
+        mem.set_irq_routed(true);
+        mem.set_byte(0xD012, 1);
+        mem.set_byte(0xD01A, 0x01);
+        mem.tick(64);
+        assert!(mem.raw_irq_pending());
+        assert!(!Bus::irq_pending(&mut mem));
+
+        mem.set_byte(0xDD04, 1);
+        mem.set_byte(0xDD05, 0);
+        mem.set_byte(0xDD0E, 0x11);
+        mem.set_byte(0xDD0D, 0x81);
+        mem.tick(2);
+        assert!(mem.raw_nmi_pending());
+        assert!(!Bus::nmi_pending(&mut mem));
     }
 
     #[test]
     fn vic_and_cia1_both_feed_irq_pending() {
         let mut mem = memory();
         mem.set_irq_routed(true);
-        assert!(!mem.irq_pending());
+        assert!(!mem.raw_irq_pending());
 
         // CIA1 Timer A underflow raises its IRQ line.
         mem.set_byte(0xDC04, 1);
@@ -507,18 +540,18 @@ mod tests {
         mem.set_byte(0xDC0D, 0x81); // enable the Timer A IRQ mask
         mem.tick(2);
         assert!(mem.cia1.irq_line());
-        assert!(mem.irq_pending());
+        assert!(mem.raw_irq_pending());
 
         // Reading ICR clears the pending flag, as a real handler does.
         mem.get_byte(0xDC0D);
         assert!(!mem.cia1.irq_line());
-        assert!(!mem.irq_pending());
+        assert!(!mem.raw_irq_pending());
 
         mem.set_byte(0xD012, 1);
         mem.set_byte(0xD01A, 0x01);
         mem.tick(64);
         assert!(mem.vic.irq_line());
-        assert!(mem.irq_pending());
+        assert!(mem.raw_irq_pending());
     }
 
     #[test]
