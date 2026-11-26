@@ -1,5 +1,5 @@
 import { DESKTOP_ID } from "./config";
-import { capture, which } from "./exec";
+import { capture, which } from "../../exec";
 
 const SCHEMA = "org.gnome.shell";
 const KEY = "favorite-apps";

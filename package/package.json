@@ -1,0 +1,20 @@
+{
+  "name": "@sidcraft/package",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-platform SidCraft packaging with Bun and TypeScript",
+  "scripts": {
+    "build": "bun run src/cli.ts build",
+    "app": "bun run src/cli.ts app",
+    "dmg": "bun run src/cli.ts dmg",
+    "install-desktop": "bun run src/cli.ts install",
+    "uninstall-desktop": "bun run src/cli.ts uninstall",
+    "help": "bun run src/cli.ts help",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}

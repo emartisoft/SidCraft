@@ -18,7 +18,7 @@ import {
   REPO_ROOT,
   XDG_DATA_HOME,
 } from "./config";
-import { runQuietly, which } from "./exec";
+import { runQuietly, which } from "../../exec";
 import { unpinFromFavorites } from "./gnome";
 import { generateIcons } from "./icons";
 

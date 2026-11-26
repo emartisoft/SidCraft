@@ -10,7 +10,7 @@ import {
   appImageArch,
   projectVersion,
 } from "./config";
-import { run } from "./exec";
+import { run } from "../../exec";
 import { generateIcons } from "./icons";
 
 export interface BuildOptions {

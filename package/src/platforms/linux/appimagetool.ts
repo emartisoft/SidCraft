@@ -1,7 +1,7 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { appImageArch, XDG_CACHE_HOME } from "./config";
-import { run } from "./exec";
+import { run } from "../../exec";
 
 const DOWNLOAD_URLS = [
   (arch: string) =>

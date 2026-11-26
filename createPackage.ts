@@ -1,30 +1,22 @@
 #!/usr/bin/env bun
 
-// Single-file, package.json-free release packager.
+// Single-file, package.json-free entry point.
 // Usage: bun run createPackage.ts
-// Builds the Cargo release binary, then runs the packaging project for the
-// current OS. Bun's own APIs are used instead of Node child_process/fs imports.
+// Builds the Cargo release binary, then runs the unified package/ project.
+// Bun's own APIs are used here instead of Node child_process/fs imports.
 
 const USAGE = `SidCraft release packager
 
 Usage:
   bun run createPackage.ts
 
-Builds target/release first with Cargo, then runs:
-  Windows: bun windows/build.ts
-  Linux:   cd linux && bun run appimage build
-  macOS:   cd macos && bun run build
+1. cargo build --release
+2. cd package && bun run build
 
-The resulting package is written to the repository's dist/ directory.
-No package.json is required for this script.
+The packaging project selects the Windows, Linux or macOS builder from the
+current OS and writes the result to the repository's dist/ directory.
+No root-level package.json is required for this script.
 `;
-
-interface PackageStep {
-  label: string;
-  command: string[];
-  cwd: string;
-  artifact: string;
-}
 
 function separator(): string {
   return process.platform === "win32" ? "\\" : "/";
@@ -67,39 +59,30 @@ function appImageArch(): string {
   }
 }
 
-function packageStep(version: string): PackageStep {
+function artifactName(version: string): string {
   switch (process.platform) {
     case "win32":
-      return {
-        label: "bun windows/build.ts",
-        command: [process.execPath, join(ROOT, "windows", "build.ts")],
-        cwd: ROOT,
-        artifact: `SidCraft-${version}-windows-x86_64.zip`,
-      };
+      return `SidCraft-${version}-windows-x86_64.zip`;
     case "linux":
-      return {
-        label: "cd linux && bun run appimage build",
-        command: [process.execPath, "run", "appimage", "build"],
-        cwd: join(ROOT, "linux"),
-        artifact: `SidCraft-${version}-linux-${appImageArch()}.AppImage`,
-      };
+      return `SidCraft-${version}-linux-${appImageArch()}.AppImage`;
     case "darwin":
-      return {
-        label: "cd macos && bun run build",
-        command: [process.execPath, "run", "build"],
-        cwd: join(ROOT, "macos"),
-        artifact: `SidCraft-${version}-macos.dmg`,
-      };
+      return `SidCraft-${version}-macos.dmg`;
     default:
       throw new Error(`Unsupported platform: ${process.platform}`);
   }
 }
 
-async function run(label: string, command: string[], cwd: string): Promise<void> {
+async function run(
+  label: string,
+  command: string[],
+  cwd: string,
+  env: Record<string, string | undefined> = {},
+): Promise<void> {
   console.log(`==> ${label}`);
 
   const child = Bun.spawn(command, {
     cwd,
+    env: { ...Bun.env, ...env },
     stdout: "inherit",
     stderr: "inherit",
   });
@@ -116,17 +99,21 @@ async function main(): Promise<void> {
     return;
   }
 
-  const version = await readVersion();
-  const step = packageStep(version);
+  const expectedArtifact = artifactName(await readVersion());
 
   if (!Bun.which("cargo")) {
     throw new Error("cargo was not found in PATH");
   }
 
   await run("cargo build --release", ["cargo", "build", "--release"], ROOT);
-  await run(step.label, step.command, step.cwd);
+  await run(
+    "cd package && bun run build",
+    [process.execPath, "run", "build"],
+    join(ROOT, "package"),
+    { SIDCRAFT_SKIP_CARGO_BUILD: "1" },
+  );
 
-  const artifact = join(DIST, step.artifact);
+  const artifact = join(DIST, expectedArtifact);
   if (!(await Bun.file(artifact).exists())) {
     throw new Error(`Expected package was not created: ${artifact}`);
   }

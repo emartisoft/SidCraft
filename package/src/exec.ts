@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 
 export interface RunOptions {
   cwd?: string;
@@ -87,9 +88,9 @@ export async function capture(
 
 /** Looks up a program on PATH without invoking an external `which`. */
 export function which(command: string): string | undefined {
-  for (const dir of (process.env.PATH ?? "").split(":")) {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = `${dir}/${command}`;
+    const candidate = join(dir, command);
     if (existsSync(candidate)) return candidate;
   }
   return undefined;

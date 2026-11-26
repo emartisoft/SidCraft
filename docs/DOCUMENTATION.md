@@ -28,7 +28,8 @@ terminal:
 
 The desktop entry declares the `audio/prs.sid`, `audio/x-sid` and
 `audio/x-psid` MIME types, so file managers list SidCraft under **Open With**
-after `bun run appimage install` (or when using the AppImage). From a terminal:
+after `bun run install-desktop` from the `package/` directory (or when using
+the AppImage). From a terminal:
 
 ```bash
 ./target/release/sidcraft ~/Music/HVSC/MUSICIANS/.../Tune.sid
@@ -36,8 +37,9 @@ after `bun run appimage install` (or when using the AppImage). From a terminal:
 
 ### macOS
 
-The `.app` bundle built by `macos/build.ts` declares the SID document type, so
-Finder lists SidCraft under **Open With**. From a terminal:
+The `.app` bundle built by `package/src/platforms/macos/build.ts` declares the
+SID document type, so Finder lists SidCraft under **Open With**. From a
+terminal:
 
 ```bash
 ./target/release/sidcraft ~/Music/HVSC/MUSICIANS/.../Tune.sid
@@ -166,7 +168,9 @@ Run it with:
 - Open PowerShell or Developer PowerShell and run `cargo build --release`
   from the repository root.
 
-Output: `target\release\sidcraft.exe`.
+Output: `target\release\sidcraft.exe`. To create the distributable ZIP, install Bun
+and run `bun run createPackage.ts` from the repository root. The archive is
+written to `dist\SidCraft-<version>-windows-x86_64.zip`.
 
 ### macOS
 
@@ -175,14 +179,20 @@ Output: `target\release\sidcraft.exe`.
 
 Output: `target/release/sidcraft`. This builds a binary for the Mac's current
 architecture. To optionally create a `.app` bundle and `.dmg` package, install
-Bun and the Xcode Command Line Tools, then run:
+Bun and the Xcode Command Line Tools, then run from the repository root:
 
 ```bash
-cd macos
+bun run createPackage.ts   # cargo build --release, then package for this OS
+```
+
+Or use the unified packaging project directly:
+
+```bash
+cd package
 bun run build   # .app + .dmg
 bun run app     # .app only
 bun run dmg     # .app + .dmg
-bun run help    # help
+bun run help
 bun run typecheck
 ```
 
@@ -208,12 +218,19 @@ Window → "Remember window positions" can be cleared to use native Wayland
 instead; that choice takes effect after a restart.
 
 Output: `target/release/sidcraft`. To optionally create an AppImage, install
-Bun 1.4 or newer and run:
+Bun 1.4 or newer and run from the repository root:
 
 ```bash
-cd linux
-# Build the AppImage (cargo build + icons + AppDir + appimagetool)
-bun run appimage build
+bun run createPackage.ts   # cargo build --release, then package for this OS
+```
+
+Or use the unified packaging project directly:
+
+```bash
+cd package
+bun run build              # cargo build + icons + AppDir + appimagetool
+bun run install-desktop    # optional desktop integration
+bun run uninstall-desktop
 ```
 
 System library package names may vary between Linux distributions. The

@@ -1,87 +1,52 @@
-#!/usr/bin/env bun
 import { $ } from "bun";
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { basename, join } from "node:path";
+import {
+  DIST_DIR,
+  REPO_ROOT,
+  readVersion,
+  releaseBinary,
+} from "../../config";
 
-const ROOT = resolve(import.meta.dir, "..");
-const DIST = join(ROOT, "dist");
 const APP_NAME = "SidCraft";
 const BINARY_NAME = "sidcraft";
 const BUNDLE_ID = "com.emarti.sidcraft";
 const MIN_MACOS = "11.0";
 
-type Command = "all" | "app" | "dmg" | "help";
-
-const HELP = `Usage: bun macos/build.ts <command> [options]
-
-Commands:
-  all    Build ${APP_NAME}.app and ${APP_NAME}-<version>-macos.dmg (default)
-  app    Build only ${APP_NAME}.app
-  dmg    Build ${APP_NAME}.app and ${APP_NAME}-<version>-macos.dmg
-  help   Show this help
-
-Options:
-  --no-sign   Skip ad-hoc code signing
-  --open      Open the produced artifact`;
-
-function parseArgs() {
-  const args = Bun.argv.slice(2);
-  const flags = new Set(args.filter((arg) => arg.startsWith("--")));
-  const knownFlags = new Set(["--no-sign", "--open", "--help"]);
-  const unknownFlags = [...flags].filter((flag) => !knownFlags.has(flag));
-
-  if (unknownFlags.length > 0) {
-    throw new Error(`Unknown option(s): ${unknownFlags.join(", ")}`);
-  }
-
-  const command = (args.find((arg) => !arg.startsWith("--")) ?? "all") as Command;
-  const validCommands = new Set<Command>(["all", "app", "dmg", "help"]);
-
-  if (!validCommands.has(command)) {
-    throw new Error(`Unknown command: ${command}`);
-  }
-
-  return {
-    command,
-    sign: !flags.has("--no-sign"),
-    open: flags.has("--open"),
-    help: flags.has("--help") || command === "help",
-  };
+export interface MacosBuildOptions {
+  target?: "all" | "app" | "dmg";
+  sign?: boolean;
+  open?: boolean;
 }
 
-async function readVersion(): Promise<string> {
-  const cargoToml = await Bun.file(join(ROOT, "Cargo.toml")).text();
-  const packageSection = cargoToml.match(/^\[package\]([\s\S]*?)(?=^\[|$(?![\s\S]))/m)?.[1] ?? "";
-  const version = packageSection.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
-
-  if (!version) {
-    throw new Error("Could not read the package version from Cargo.toml");
-  }
-
-  return version;
-}
-
-function requireTool(name: string) {
+function requireTool(name: string): void {
   if (!Bun.which(name)) {
     throw new Error(`Required macOS tool not found: ${name}`);
   }
 }
 
-function ensurePrerequisites() {
+function ensurePrerequisites(): void {
   if (process.platform !== "darwin") {
-    throw new Error("This script only runs on macOS");
+    throw new Error("The macOS packager only runs on macOS");
   }
 
   for (const tool of ["sips", "iconutil", "codesign", "hdiutil"]) {
     requireTool(tool);
   }
 
-  const binary = join(ROOT, "target", "release", BINARY_NAME);
+  const binary = releaseBinary();
   if (!existsSync(binary)) {
     throw new Error(`Release binary not found: ${binary}\nRun: cargo build --release`);
   }
 
-  const icon = join(ROOT, "icon", "sidcraft.png");
+  const icon = join(REPO_ROOT, "icon", "sidcraft.png");
   if (!existsSync(icon)) {
     throw new Error(`Application icon not found: ${icon}`);
   }
@@ -163,7 +128,7 @@ function infoPlist(version: string): string {
 }
 
 async function generateIcns(source: string, output: string): Promise<void> {
-  const iconset = join(DIST, `${APP_NAME}.iconset`);
+  const iconset = join(DIST_DIR, `${APP_NAME}.iconset`);
   const sizes: Array<[number, string]> = [
     [16, "icon_16x16.png"],
     [32, "icon_16x16@2x.png"],
@@ -182,21 +147,23 @@ async function generateIcns(source: string, output: string): Promise<void> {
 
   try {
     for (const [size, name] of sizes) {
-      await $`sips -z ${size} ${size} ${source} --out ${join(iconset, name)}`.cwd(ROOT).quiet();
+      await $`sips -z ${size} ${size} ${source} --out ${join(iconset, name)}`
+        .cwd(REPO_ROOT)
+        .quiet();
     }
-    await $`iconutil -c icns ${iconset} -o ${output}`.cwd(ROOT).quiet();
+    await $`iconutil -c icns ${iconset} -o ${output}`.cwd(REPO_ROOT).quiet();
   } finally {
     rmSync(iconset, { recursive: true, force: true });
   }
 }
 
 async function buildApp(version: string, sign: boolean): Promise<string> {
-  const appDir = join(DIST, `${APP_NAME}.app`);
+  const appDir = join(DIST_DIR, `${APP_NAME}.app`);
   const contentsDir = join(appDir, "Contents");
   const macosDir = join(contentsDir, "MacOS");
   const resourcesDir = join(contentsDir, "Resources");
-  const binary = join(ROOT, "target", "release", BINARY_NAME);
-  const icon = join(ROOT, "icon", "sidcraft.png");
+  const binary = releaseBinary();
+  const icon = join(REPO_ROOT, "icon", "sidcraft.png");
   const icns = join(resourcesDir, `${APP_NAME}.icns`);
 
   rmSync(appDir, { recursive: true, force: true });
@@ -210,8 +177,10 @@ async function buildApp(version: string, sign: boolean): Promise<string> {
   await Bun.write(join(contentsDir, "Info.plist"), infoPlist(version));
 
   if (sign) {
-    await $`codesign --force --sign - ${appDir}`.cwd(ROOT).quiet();
-    await $`codesign --verify --deep --strict ${appDir}`.cwd(ROOT).quiet();
+    await $`codesign --force --sign - ${appDir}`.cwd(REPO_ROOT).quiet();
+    await $`codesign --verify --deep --strict ${appDir}`
+      .cwd(REPO_ROOT)
+      .quiet();
   }
 
   console.log(`Created ${appDir}`);
@@ -219,8 +188,8 @@ async function buildApp(version: string, sign: boolean): Promise<string> {
 }
 
 async function buildDmg(appDir: string, version: string): Promise<string> {
-  const stage = join(DIST, ".dmg-stage");
-  const dmg = join(DIST, `${APP_NAME}-${version}-macos.dmg`);
+  const stage = join(DIST_DIR, ".dmg-stage");
+  const dmg = join(DIST_DIR, `${APP_NAME}-${version}-macos.dmg`);
 
   rmSync(stage, { recursive: true, force: true });
   rmSync(dmg, { force: true });
@@ -230,8 +199,10 @@ async function buildDmg(appDir: string, version: string): Promise<string> {
     cpSync(appDir, join(stage, basename(appDir)), { recursive: true });
     symlinkSync("/Applications", join(stage, "Applications"));
 
-    await $`hdiutil create -volname ${APP_NAME} -srcfolder ${stage} -ov -format UDZO ${dmg}`.cwd(ROOT).quiet();
-    await $`hdiutil verify ${dmg}`.cwd(ROOT).quiet();
+    await $`hdiutil create -volname ${APP_NAME} -srcfolder ${stage} -ov -format UDZO ${dmg}`
+      .cwd(REPO_ROOT)
+      .quiet();
+    await $`hdiutil verify ${dmg}`.cwd(REPO_ROOT).quiet();
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
@@ -240,36 +211,22 @@ async function buildDmg(appDir: string, version: string): Promise<string> {
   return dmg;
 }
 
-async function main() {
-  const { command, sign, open, help } = parseArgs();
-
-  if (help) {
-    console.log(HELP);
-    return;
-  }
+/** Builds the macOS app bundle and, unless `target` is `app`, the DMG. */
+export async function build(options: MacosBuildOptions = {}): Promise<string> {
+  const { target = "all", sign = true, open = false } = options;
 
   ensurePrerequisites();
-  mkdirSync(DIST, { recursive: true });
+  mkdirSync(DIST_DIR, { recursive: true });
 
   const version = await readVersion();
   const appDir = await buildApp(version, sign);
 
-  if (command === "app") {
-    if (open) {
-      await $`open ${appDir}`.cwd(ROOT);
-    }
-    return;
+  if (target === "app") {
+    if (open) await $`open ${appDir}`.cwd(REPO_ROOT).quiet();
+    return appDir;
   }
 
   const dmg = await buildDmg(appDir, version);
-
-  if (open) {
-    await $`open ${dmg}`.cwd(ROOT);
-  }
+  if (open) await $`open ${dmg}`.cwd(REPO_ROOT).quiet();
+  return dmg;
 }
-
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`error: ${message}`);
-  process.exit(1);
-});
