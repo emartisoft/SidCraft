@@ -29,6 +29,7 @@ use crate::theme::{self, AccentColor, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
 use crate::{
     ConfirmAction, PlaylistDownloadProgress, SidcraftApp, UpdatePhase, View, VizMode,
+    playlist_rows_for_query,
 };
 
 mod dialogs;
@@ -1337,7 +1338,10 @@ impl SidcraftApp {
                             }
                             if let Some(idx) = play {
                                 self.play_playlist_index(idx);
-                                self.view = View::Player;
+                                self.sync_playlist_search_cursor();
+                                // Deliberately stay on the current view: the
+                                // playlist is the browser, not a launch pad
+                                // that navigates away as soon as a tune plays.
                             }
                         }
                     });
@@ -1863,6 +1867,7 @@ impl SidcraftApp {
 
                 // Track reordering and search share the row below the actions.
                 ui.add_space(6.0);
+                let mut matches = Vec::new();
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new("Move Track")
@@ -1937,10 +1942,11 @@ impl SidcraftApp {
                     search_box(ui, &t, &mut query, 170.0, "Search tracks…");
                     if query != self.playlist_search {
                         self.playlist_search = query;
+                        self.playlist_drag_from = None;
                         self.goto_playlist_search_match(0);
                     }
+                    matches = self.playlist_search_matches().to_vec();
                     if !self.playlist_search.trim().is_empty() {
-                        let matches = self.playlist_search_matches();
                         let count = matches.len();
                         let cursor = self.playlist_search_match.min(count.saturating_sub(1));
                         let summary = if count == 0 {
@@ -1980,6 +1986,9 @@ impl SidcraftApp {
                 let mut play = None;
                 let mut select = None;
                 let total_rows = self.playlist.entries.len();
+                let visible_rows = playlist_rows_for_query(total_rows, &self.playlist_search, &matches);
+                let visible_count = visible_rows.len();
+                let filtering = !self.playlist_search.trim().is_empty();
                 let scroll_to_selected = self.playlist_scroll_to_selected;
                 let selected_idx = self.selected_playlist_idx;
                 let mut drag_started: Option<usize> = None;
@@ -1990,17 +1999,22 @@ impl SidcraftApp {
                     .auto_shrink([false, false])
                     // Dragging a row reorders it; it must not scroll the list.
                     .drag_to_scroll(false)
-                    .show_rows(ui, 48.0, total_rows, |ui, row_range| {
-                        if total_rows == 0 {
+                    .show_rows(ui, 48.0, visible_count, |ui, row_range| {
+                        if visible_count == 0 {
                             ui.add_space(24.0);
                             ui.label(
-                                RichText::new("This playlist is empty. Use Add files, New…, or the HVSC browser.")
-                                    .font(theme::regular(13.0))
-                                    .color(t.text_muted),
+                                RichText::new(if filtering {
+                                    "No tracks match the current search."
+                                } else {
+                                    "This playlist is empty. Use Add files, New…, or the HVSC browser."
+                                })
+                                .font(theme::regular(13.0))
+                                .color(t.text_muted),
                             );
                         }
                         let mut selected_rect: Option<Rect> = None;
-                        for idx in row_range {
+                        for visible_row in row_range {
+                            let idx = visible_rows[visible_row];
                             let entry = &self.playlist.entries[idx];
                             let selected = idx == selected_idx;
                             let row = playlist_row(
@@ -2011,13 +2025,13 @@ impl SidcraftApp {
                                 &entry.source,
                                 entry.subsong,
                                 selected,
-                                true,
+                                !filtering,
                             );
                             row_rects.push((idx, row.rect));
                             if selected {
                                 selected_rect = Some(row.rect);
                             }
-                            if row.drag_started() {
+                            if !filtering && row.drag_started() {
                                 drag_started = Some(idx);
                             }
                             if row.clicked() {
@@ -2038,7 +2052,7 @@ impl SidcraftApp {
                             if clip.contains(pointer) && !row_rects.is_empty() {
                                 // Insertion slot: the visible row whose centre is below
                                 // the pointer, or after the last visible row.
-                                let last_visible_idx = row_rects.last().map_or(total_rows, |(i, _)| i + 1);
+                                let last_visible_idx = visible_rows.last().map_or(total_rows, |&i| i + 1);
                                 let mut insert = last_visible_idx;
                                 for (idx, rect) in &row_rects {
                                     if pointer.y < rect.center().y {
@@ -2089,9 +2103,11 @@ impl SidcraftApp {
                         if scroll_to_selected {
                             if let Some(rect) = selected_rect {
                                 ui.scroll_to_rect(rect, None);
-                            } else if selected_idx < total_rows {
+                            } else if let Some(visible_pos) =
+                                visible_rows.iter().position(|&idx| idx == selected_idx)
+                            {
                                 let stride = 48.0 + ui.spacing().item_spacing.y;
-                                let top = ui.min_rect().top() + selected_idx as f32 * stride;
+                                let top = ui.min_rect().top() + visible_pos as f32 * stride;
                                 let target = Rect::from_min_size(
                                     pos2(ui.min_rect().left(), top),
                                     vec2(ui.available_width(), 48.0),
@@ -2126,9 +2142,13 @@ impl SidcraftApp {
                     self.selected_playlist_idx = idx;
                     self.sync_playlist_search_cursor();
                 }
-                if let Some(idx) = play {
+                if drag_from.is_none()
+                    && let Some(idx) = play
+                {
                     self.play_playlist_index(idx);
-                    self.view = View::Player;
+                    self.sync_playlist_search_cursor();
+                    // Double-click plays in place; the user stays in the
+                    // playlist to keep browsing or navigating search matches.
                 }
             });
     }

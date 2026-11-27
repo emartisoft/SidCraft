@@ -335,12 +335,19 @@ enum PlaylistDownloadMsg {
     },
 }
 
+/// Normalizes playlist search text the same way the HVSC browser does: folded
+/// case, underscores treated as spaces, with surrounding whitespace removed.
+/// This lets `tel jeroen` find a path containing `Tel_Jeroen`.
+fn normalize_playlist_search(text: &str) -> String {
+    text.trim().to_lowercase().replace('_', " ")
+}
+
 /// Indices of playlist entries matching `query`, in playlist order.
 ///
 /// Matches against both the display name and the original source path, so a
 /// user can find a tune by title or by its HVSC/folder location.
 fn playlist_search_indices(entries: &[playlist::PlaylistEntry], query: &str) -> Vec<usize> {
-    let needle = query.trim().to_lowercase();
+    let needle = normalize_playlist_search(query);
     if needle.is_empty() {
         return Vec::new();
     }
@@ -348,11 +355,21 @@ fn playlist_search_indices(entries: &[playlist::PlaylistEntry], query: &str) -> 
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            entry.display_name.to_lowercase().contains(&needle)
-                || entry.source.to_lowercase().contains(&needle)
+            normalize_playlist_search(&entry.display_name).contains(&needle)
+                || normalize_playlist_search(&entry.source).contains(&needle)
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Playlist indices that should be rendered for the current search query.
+/// With no query every entry is shown; otherwise only the matches are shown.
+fn playlist_rows_for_query(entry_count: usize, query: &str, matches: &[usize]) -> Vec<usize> {
+    if query.trim().is_empty() {
+        (0..entry_count).collect()
+    } else {
+        matches.to_vec()
+    }
 }
 
 /// Turns a playlist display name into a safe SID filename for saving.
@@ -540,7 +557,7 @@ pub struct SidcraftApp {
     pub playlist_search: String,
     /// Cursor within the current search matches.
     playlist_search_match: usize,
-    /// Cached `(query, playlist_len, matches)` for `playlist_search_matches`.
+    /// Cached `(query, playlist_revision, matches)` for `playlist_search_matches`.
     playlist_search_cache: (String, u64, Vec<usize>),
     /// Incremented whenever `playlist` is modified, to invalidate search cache.
     playlist_revision: u64,
@@ -1870,10 +1887,7 @@ impl SidcraftApp {
                 self.playlist_revision = self.playlist_revision.wrapping_add(1);
                 self.playlist_path = path;
                 self.selected_playlist_idx = 0;
-                self.playlist_drag_from = None;
-                self.playlist_scroll_to_selected = false;
-                self.playlist_search.clear();
-                self.playlist_search_match = 0;
+                self.reset_playlist_search();
                 self.refresh_playlist_files();
                 if !self.playlist.is_empty() {
                     self.play_playlist_index(0);
@@ -1918,8 +1932,7 @@ impl SidcraftApp {
             self.playlist_revision = self.playlist_revision.wrapping_add(1);
             self.playlist_path = default_path;
             self.selected_playlist_idx = 0;
-            self.playlist_drag_from = None;
-            self.playlist_scroll_to_selected = false;
+            self.reset_playlist_search();
             self.sync_config();
         } else if enabled && was_active {
             // The file was regenerated for the selected mirror, so the active
@@ -1932,8 +1945,7 @@ impl SidcraftApp {
                 Err(e) => self.set_status(format!("Could not reload favourite playlist: {e}")),
             }
             self.selected_playlist_idx = 0;
-            self.playlist_drag_from = None;
-            self.playlist_scroll_to_selected = false;
+            self.reset_playlist_search();
         }
         self.refresh_playlist_files();
         self.set_status(format!(
@@ -2029,8 +2041,7 @@ impl SidcraftApp {
         self.playlist_revision = self.playlist_revision.wrapping_add(1);
         self.playlist_path = path;
         self.selected_playlist_idx = 0;
-        self.playlist_drag_from = None;
-        self.playlist_scroll_to_selected = false;
+        self.reset_playlist_search();
         self.refresh_playlist_files();
         self.sync_config();
         self.random_playlist_name.clear();
@@ -2257,6 +2268,16 @@ impl SidcraftApp {
         }
     }
 
+    /// Clears the track search when the active playlist changes, so a query
+    /// typed for one list never silently filters a different one.
+    fn reset_playlist_search(&mut self) {
+        self.playlist_search.clear();
+        self.playlist_search_match = 0;
+        self.playlist_search_cache = (String::new(), 0, Vec::new());
+        self.playlist_scroll_to_selected = false;
+        self.playlist_drag_from = None;
+    }
+
     /// Playlist indices currently matching the search box (cached across frames).
     pub fn playlist_search_matches(&mut self) -> &[usize] {
         if self.playlist_search_cache.0 != self.playlist_search
@@ -2388,8 +2409,7 @@ impl SidcraftApp {
 
         self.playlist_files.retain(|p| *p != path);
         self.selected_playlist_idx = 0;
-        self.playlist_drag_from = None;
-        self.playlist_scroll_to_selected = false;
+        self.reset_playlist_search();
 
         if let Some(next) = self.playlist_files.first().cloned() {
             self.playlist = Playlist::load(&next).unwrap_or_default();
@@ -2558,6 +2578,7 @@ impl SidcraftApp {
                 self.playlist_revision = self.playlist_revision.wrapping_add(1);
                 self.playlist_path = path.clone();
                 self.selected_playlist_idx = 0;
+                self.reset_playlist_search();
                 self.refresh_playlist_files();
                 self.sync_config();
                 self.set_status(format!(
@@ -3657,7 +3678,7 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hvsc_sid_path, playlist_search_indices, sid_download_filename,
+        hvsc_sid_path, playlist_rows_for_query, playlist_search_indices, sid_download_filename,
         sid_source_is_from_hvsc_mirror,
     };
     use crate::engine::playlist::{PlaylistEntry, fetch_sid_bytes};
@@ -3771,8 +3792,21 @@ mod tests {
         assert_eq!(playlist_search_indices(&entries, ""), Vec::<usize>::new());
         assert_eq!(playlist_search_indices(&entries, "MYTH"), vec![0, 2]);
         assert_eq!(playlist_search_indices(&entries, "tel_jeroen"), vec![0]);
+        assert_eq!(playlist_search_indices(&entries, "tel jeroen"), vec![0]);
+        assert_eq!(playlist_search_indices(&entries, "TEL JEROEN"), vec![0]);
         assert_eq!(playlist_search_indices(&entries, "  arkanoid  "), vec![1]);
         assert!(playlist_search_indices(&entries, "missing").is_empty());
+    }
+
+    #[test]
+    fn playlist_rows_show_everything_without_a_query_and_matches_with_one() {
+        let matches = vec![0, 2];
+        assert_eq!(playlist_rows_for_query(4, "", &matches), vec![0, 1, 2, 3]);
+        assert_eq!(
+            playlist_rows_for_query(4, "   ", &matches),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(playlist_rows_for_query(4, "myth", &matches), matches);
     }
 
     #[test]
