@@ -22,6 +22,7 @@ use engine::export::{ExportProgress, ExportSettings};
 use engine::hvsc::{HvscBrowser, HvscCollectionFilter, HvscEntry, normalize_mirror_location};
 use engine::player::{
     FilterInfo, NoteSample, SamplingMethod, SharedPlayer, VoiceInfo, create_shared_player,
+    lock_player, try_lock_player,
 };
 use engine::playlist::{self, extract_filename, Playlist};
 use engine::sid_file::SidFile;
@@ -842,10 +843,7 @@ impl SidcraftApp {
             }
         };
 
-        let chip_models = player
-            .lock()
-            .map(|p| p.chip_models().to_vec())
-            .unwrap_or_else(|_| vec![ChipModel::Mos6581]);
+        let chip_models = lock_player(&player).chip_models().to_vec();
         let sid_count = chip_models.len();
 
         let player_audio = Arc::clone(&player);
@@ -857,7 +855,7 @@ impl SidcraftApp {
             // Fill the buffer first: `fill_buffer` overwrites every sample, so
             // the gain/mute stage has to run afterwards or it would be lost.
             // Use `try_lock` so a background seek/load never blocks the OS audio thread.
-            if let Ok(mut p) = player_audio.try_lock() {
+            if let Some(mut p) = try_lock_player(&player_audio) {
                 p.fill_buffer(data);
             } else {
                 data.fill(0.0);
@@ -1052,7 +1050,8 @@ impl SidcraftApp {
             app.paused = true;
             app.song_elapsed = Duration::ZERO;
             app.song_resumed_at = Instant::now();
-            if let Ok(mut p) = app.player.lock() {
+            {
+                let mut p = lock_player(&app.player);
                 if !p.is_paused() {
                     p.toggle_pause();
                 }
@@ -1288,21 +1287,18 @@ impl SidcraftApp {
         let subsong = song.unwrap_or(sid.start_song);
         let chip_override = self.chip_models.first().copied();
 
-        let load_res = if let Ok(mut p) = self.player.lock() {
+        let load_res = {
+            let mut p = lock_player(&self.player);
             if chip_override.is_some() {
                 p.switch_chip_model(0); // sync if needed
             }
             p.load_sid_file(&sid, subsong).map_err(|e| e.to_string())
-        } else {
-            Err("Lock poisoned".to_string())
         };
 
         match load_res {
             Ok(()) => {
                 if self.ekv_filter {
-                    if let Ok(mut p) = self.player.lock() {
-                        p.set_ekv_filter(true);
-                    }
+                    lock_player(&self.player).set_ekv_filter(true);
                 }
                 self.current_song = subsong;
                 self.total_songs = sid.songs;
@@ -1315,9 +1311,7 @@ impl SidcraftApp {
                 let duration = self.hvsc_browser.song_duration(&sid.md5, subsong);
                 self.song_timeout = duration.unwrap_or(self.default_timeout);
 
-                if let Ok(p) = self.player.lock() {
-                    self.chip_models = p.chip_models().to_vec();
-                }
+                self.chip_models = lock_player(&self.player).chip_models().to_vec();
                 let sid_count = self.chip_models.len();
                 self.vu_meter = VuMeter::with_voice_count(sid_count * 3);
                 self.voice_scopes = VoiceScopes::with_voice_count(sid_count * 3);
@@ -1346,9 +1340,7 @@ impl SidcraftApp {
     pub fn toggle_pause(&mut self) {
         self.cancel_seek();
         let (now_paused, was_paused) = {
-            let Ok(mut p) = self.player.lock() else {
-                return;
-            };
+            let mut p = lock_player(&self.player);
             p.toggle_pause();
             let was = self.paused;
             (p.is_paused(), was)
@@ -1367,9 +1359,7 @@ impl SidcraftApp {
     pub fn stop_playback(&mut self) {
         self.cancel_seek();
         {
-            let Ok(mut p) = self.player.lock() else {
-                return;
-            };
+            let mut p = lock_player(&self.player);
             if !p.is_paused() {
                 p.toggle_pause();
             }
@@ -1384,12 +1374,7 @@ impl SidcraftApp {
             return;
         }
         self.cancel_seek();
-        let success = {
-            let Ok(mut p) = self.player.lock() else {
-                return;
-            };
-            p.load_song(song).is_ok()
-        };
+        let success = lock_player(&self.player).load_song(song).is_ok();
 
         if success {
             self.current_song = song;
@@ -1411,9 +1396,7 @@ impl SidcraftApp {
 
     pub fn cycle_chip_model(&mut self) {
         let (model, count) = {
-            let Ok(mut p) = self.player.lock() else {
-                return;
-            };
+            let mut p = lock_player(&self.player);
             let sid_count = p.sid_count();
             if self.selected_sid >= sid_count {
                 self.selected_sid = 0;
@@ -1430,9 +1413,7 @@ impl SidcraftApp {
     }
 
     pub fn set_ekv_filter(&mut self, enabled: bool) {
-        if let Ok(mut p) = self.player.lock() {
-            p.set_ekv_filter(enabled);
-        }
+        lock_player(&self.player).set_ekv_filter(enabled);
         self.ekv_filter = enabled;
         self.sync_config();
         self.set_status(if enabled {
@@ -1486,7 +1467,8 @@ impl SidcraftApp {
             self.track_gap_until = Some(Instant::now() + Duration::from_secs(1));
             self.paused = true;
             self.song_elapsed = self.song_timeout;
-            if let Ok(mut p) = self.player.lock() {
+            {
+                let mut p = lock_player(&self.player);
                 if !p.is_paused() {
                     p.toggle_pause();
                 }
@@ -3149,14 +3131,13 @@ impl SidcraftApp {
         let tx = self.seek_tx.clone();
         std::thread::spawn(move || {
             if !cancel.load(Ordering::SeqCst) {
-                if let Ok(mut p) = player.lock() {
-                    if !cancel.load(Ordering::SeqCst) && p.load_song(song).is_ok() {
-                        p.fast_forward(target, &cancel);
-                        // `load_song` clears the pause flag; carry the UI state
-                        // across so seeking while paused stays silent.
-                        if p.is_paused() != was_paused {
-                            p.toggle_pause();
-                        }
+                let mut p = lock_player(&player);
+                if !cancel.load(Ordering::SeqCst) && p.load_song(song).is_ok() {
+                    p.fast_forward(target, &cancel);
+                    // `load_song` clears the pause flag; carry the UI state
+                    // across so seeking while paused stays silent.
+                    if p.is_paused() != was_paused {
+                        p.toggle_pause();
                     }
                 }
             }

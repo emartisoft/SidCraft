@@ -43,6 +43,9 @@ const KERNAL_IRQ_ENTRY: u16 = 0xFF48;
 const KERNAL_IRQ_EXIT: u16 = 0xFF8E;
 const KERNAL_NMI_ENTRY: u16 = 0xFE43;
 const KERNAL_NMI_EXIT: u16 = 0xFE47;
+/// Real KERNAL NMI return path: pops the three registers a handler saved
+/// (`PHA/TXA/PHA/TYA/PHA`) before the `RTI`. Some handlers `JMP $FEBC`.
+const KERNAL_NMI_RESTORE: u16 = 0xFEBC;
 /// Standard KERNAL IRQ-exit entry points. Many RSID handlers finish with
 /// `JMP $EA31` (full keyboard scan) or `JMP $EA7E`/`$EA81` (skip scan).
 /// On a real C64, `$EA31` and `$EA7E` read `$DC0D` (CIA1 ICR) to acknowledge
@@ -59,13 +62,20 @@ const HW_NMI_VECTOR_LO: u16 = 0xFFFA;
 const HW_NMI_VECTOR_HI: u16 = 0xFFFB;
 
 /// User-installed IRQ vector in RAM. Tunes overwrite this in init to point at their
-/// handler; default points at the stub's RTI so pre-init IRQs are silent.
+/// handler; default points at the stub's IRQ exit so pre-init IRQs are silent.
 const USER_IRQ_VECTOR_LO: u16 = 0x0314;
 const USER_IRQ_VECTOR_HI: u16 = 0x0315;
 /// User-installed NMI vector in RAM (`$0318/$0319`).
 const USER_NMI_VECTOR_LO: u16 = 0x0318;
 const USER_NMI_VECTOR_HI: u16 = 0x0319;
 
+const OPCODE_PHA: u8 = 0x48;
+const OPCODE_PLA: u8 = 0x68;
+const OPCODE_TAX: u8 = 0xAA;
+const OPCODE_TAY: u8 = 0xA8;
+const OPCODE_TXA: u8 = 0x8A;
+const OPCODE_TYA: u8 = 0x98;
+const OPCODE_SEI: u8 = 0x78;
 const OPCODE_JMP_INDIRECT: u8 = 0x6C;
 const OPCODE_RTI: u8 = 0x40;
 /// Default fill byte for the KERNAL stub. RTS keeps stray calls from corrupting
@@ -95,38 +105,74 @@ const fn build_kernel_stub() -> [u8; KERNAL_SIZE] {
     stub[(HW_NMI_VECTOR_LO - KERNAL_BASE) as usize] = nmi_lo;
     stub[(HW_NMI_VECTOR_HI - KERNAL_BASE) as usize] = nmi_hi;
 
-    // $FE43: JMP ($0318) — NMI trampoline through user NMI vector.
+    // $FE43: SEI; JMP ($0318) — NMI trampoline through user NMI vector.
+    // The real KERNAL does *not* save registers here; handlers do that
+    // themselves (and end with `JMP $FEBC` or their own PLA/RTI).
     let nmi_entry = (KERNAL_NMI_ENTRY - KERNAL_BASE) as usize;
-    stub[nmi_entry] = OPCODE_JMP_INDIRECT;
-    stub[nmi_entry + 1] = user_nmi_lo;
-    stub[nmi_entry + 2] = user_nmi_hi;
-    // $FE47: RTI — default NMI exit.
+    stub[nmi_entry] = OPCODE_SEI;
+    stub[nmi_entry + 1] = OPCODE_JMP_INDIRECT;
+    stub[nmi_entry + 2] = user_nmi_lo;
+    stub[nmi_entry + 3] = user_nmi_hi;
+    // $FE47: RTI — default NMI handler (reached through the default vector).
     stub[(KERNAL_NMI_EXIT - KERNAL_BASE) as usize] = OPCODE_RTI;
+    // $FEBC: PLA; TAY; PLA; TAX; PLA; RTI — NMI return path.
+    let nmi_restore = (KERNAL_NMI_RESTORE - KERNAL_BASE) as usize;
+    stub[nmi_restore] = OPCODE_PLA;
+    stub[nmi_restore + 1] = OPCODE_TAY;
+    stub[nmi_restore + 2] = OPCODE_PLA;
+    stub[nmi_restore + 3] = OPCODE_TAX;
+    stub[nmi_restore + 4] = OPCODE_PLA;
+    stub[nmi_restore + 5] = OPCODE_RTI;
 
-    // $FF48: JMP ($0314) — trampoline through user IRQ vector.
+    // $FF48: PHA; TXA; PHA; TYA; PHA; JMP ($0314) — trampoline through user
+    // IRQ vector. Saving A/X/Y here is what lets handlers finish with the
+    // standard PLA/TAY/PLA/TAX/PLA/RTI sequence (or JMP $EA31).
     let entry = (KERNAL_IRQ_ENTRY - KERNAL_BASE) as usize;
-    stub[entry] = OPCODE_JMP_INDIRECT;
-    stub[entry + 1] = user_lo;
-    stub[entry + 2] = user_hi;
+    stub[entry] = OPCODE_PHA;
+    stub[entry + 1] = OPCODE_TXA;
+    stub[entry + 2] = OPCODE_PHA;
+    stub[entry + 3] = OPCODE_TYA;
+    stub[entry + 4] = OPCODE_PHA;
+    stub[entry + 5] = OPCODE_JMP_INDIRECT;
+    stub[entry + 6] = user_lo;
+    stub[entry + 7] = user_hi;
 
-    // $FF8E: RTI — exit point for handlers that JMP here to return.
-    stub[(KERNAL_IRQ_EXIT - KERNAL_BASE) as usize] = OPCODE_RTI;
+    // $FF8E: PLA; TAY; PLA; TAX; PLA; RTI — default IRQ exit.
+    let irq_exit = (KERNAL_IRQ_EXIT - KERNAL_BASE) as usize;
+    stub[irq_exit] = OPCODE_PLA;
+    stub[irq_exit + 1] = OPCODE_TAY;
+    stub[irq_exit + 2] = OPCODE_PLA;
+    stub[irq_exit + 3] = OPCODE_TAX;
+    stub[irq_exit + 4] = OPCODE_PLA;
+    stub[irq_exit + 5] = OPCODE_RTI;
 
-    // $EA31: LDA $DC0D; RTI — acknowledges CIA1 ICR before returning.
+    // $EA31: LDA $DC0D; PLA; TAY; PLA; TAX; PLA; RTI — acknowledges CIA1 ICR
+    // and restores the registers saved by $FF48 before returning.
     let ea31 = (KERNAL_IRQ_EXIT_EA31 - KERNAL_BASE) as usize;
     stub[ea31] = OPCODE_LDA_ABS;
     stub[ea31 + 1] = CIA1_ICR_LO;
     stub[ea31 + 2] = CIA1_ICR_HI;
-    stub[ea31 + 3] = OPCODE_RTI;
+    stub[ea31 + 3] = OPCODE_PLA;
+    stub[ea31 + 4] = OPCODE_TAY;
+    stub[ea31 + 5] = OPCODE_PLA;
+    stub[ea31 + 6] = OPCODE_TAX;
+    stub[ea31 + 7] = OPCODE_PLA;
+    stub[ea31 + 8] = OPCODE_RTI;
 
-    // $EA7E: LDA $DC0D — falls through directly into $EA81 (RTI).
+    // $EA7E: LDA $DC0D — falls through directly into $EA81.
     let ea7e = (KERNAL_IRQ_EXIT_EA7E - KERNAL_BASE) as usize;
     stub[ea7e] = OPCODE_LDA_ABS;
     stub[ea7e + 1] = CIA1_ICR_LO;
     stub[ea7e + 2] = CIA1_ICR_HI;
 
-    // $EA81: RTI.
-    stub[(KERNAL_IRQ_EXIT_EA81 - KERNAL_BASE) as usize] = OPCODE_RTI;
+    // $EA81: PLA; TAY; PLA; TAX; PLA; RTI.
+    let ea81 = (KERNAL_IRQ_EXIT_EA81 - KERNAL_BASE) as usize;
+    stub[ea81] = OPCODE_PLA;
+    stub[ea81 + 1] = OPCODE_TAY;
+    stub[ea81 + 2] = OPCODE_PLA;
+    stub[ea81 + 3] = OPCODE_TAX;
+    stub[ea81 + 4] = OPCODE_PLA;
+    stub[ea81 + 5] = OPCODE_RTI;
 
     stub
 }
@@ -223,6 +269,10 @@ pub struct C64Memory {
     /// so PSID tunes (frame or CIA-poll) never have mos6502 service spurious IRQs;
     /// `Player` flips it on for RSID-style tunes that expect vector dispatch.
     irq_routed: bool,
+    /// Set when the CPU reads CIA2's ICR, which lowers the NMI line. The player
+    /// uses it to re-arm edge detection if the timer underflows again in the
+    /// same instruction tick (otherwise that rising edge would be missed).
+    nmi_ack_seen: bool,
 }
 
 impl C64Memory {
@@ -236,6 +286,7 @@ impl C64Memory {
             vic: Vic::default(),
             bank_config: BANK_DEFAULT,
             irq_routed: false,
+            nmi_ack_seen: false,
         };
         mem.init_zeropage_defaults();
         mem
@@ -266,11 +317,12 @@ impl C64Memory {
         self.cia1 = Cia1::new();
         self.cia2 = Cia::new_stopped();
         self.vic.reset();
+        self.nmi_ack_seen = false;
         self.init_zeropage_defaults();
     }
 
     fn init_zeropage_defaults(&mut self) {
-        let [exit_lo, exit_hi] = KERNAL_IRQ_EXIT.to_le_bytes();
+        let [exit_lo, exit_hi] = KERNAL_IRQ_EXIT_EA31.to_le_bytes();
         let [nmi_exit_lo, nmi_exit_hi] = KERNAL_NMI_EXIT.to_le_bytes();
         self.ram[BANK_DATA_DIR_ADDR as usize] = BANK_DATA_DIR_DEFAULT;
         self.ram[USER_IRQ_VECTOR_LO as usize] = exit_lo;
@@ -336,6 +388,13 @@ impl C64Memory {
         self.irq_routed && self.cia2.irq_line()
     }
 
+    /// Consumes the "CIA2 ICR was read" flag. Reading ICR lowers the NMI line;
+    /// if the timer underflows again before the next instruction boundary the
+    /// player must treat that as a fresh edge rather than a still-asserted line.
+    pub fn take_nmi_ack_seen(&mut self) -> bool {
+        std::mem::take(&mut self.nmi_ack_seen)
+    }
+
     /// Toggles whether hardware IRQ lines (CIA1 or VIC-II) drive the player's IRQ
     /// dispatcher. Only RSID-style tunes want this — PSID-CIA polls the underflow
     /// flag directly via `cia1_take_timer_a_underflow`.
@@ -389,6 +448,9 @@ impl Bus for C64Memory {
             return self.cia1.read_register((addr & 0x0F) as u8);
         }
         if (CIA2_BASE..CIA2_END).contains(&addr) {
+            if addr == 0xDD0D {
+                self.nmi_ack_seen = true;
+            }
             #[allow(clippy::cast_possible_truncation)]
             return self.cia2.read_register((addr & 0x0F) as u8);
         }
@@ -488,8 +550,8 @@ mod tests {
             );
         }
         assert_eq!(mem.get_byte(0x0001), BANK_DEFAULT);
-        assert_eq!(mem.get_byte(0x0314), 0x8E);
-        assert_eq!(mem.get_byte(0x0315), 0xFF);
+        assert_eq!(mem.get_byte(0x0314), 0x31);
+        assert_eq!(mem.get_byte(0x0315), 0xEA);
         assert_eq!(mem.get_byte(0x0318), 0x47);
         assert_eq!(mem.get_byte(0x0319), 0xFE);
     }
@@ -528,6 +590,25 @@ mod tests {
     }
 
     #[test]
+    fn cia2_icr_read_reports_the_nmi_line_was_lowered() {
+        let mut mem = memory();
+        mem.set_irq_routed(true);
+        mem.set_byte(0xDD04, 1);
+        mem.set_byte(0xDD05, 0);
+        mem.set_byte(0xDD0E, 0x11); // force-load latch and start Timer A
+        mem.set_byte(0xDD0D, 0x81); // enable the Timer A NMI mask
+        mem.tick(2);
+        assert!(mem.raw_nmi_pending());
+        assert!(!mem.take_nmi_ack_seen());
+
+        // The handler acks CIA2 by reading ICR; the player re-arms its edge
+        // detector from this flag so a same-tick underflow is not lost.
+        mem.get_byte(0xDD0D);
+        assert!(mem.take_nmi_ack_seen());
+        assert!(!mem.take_nmi_ack_seen());
+    }
+
+    #[test]
     fn vic_and_cia1_both_feed_irq_pending() {
         let mut mem = memory();
         mem.set_irq_routed(true);
@@ -555,16 +636,71 @@ mod tests {
     }
 
     #[test]
-    fn kernal_irq_exits_acknowledge_cia_and_return_with_rti() {
+    fn kernal_irq_exits_acknowledge_cia_and_restore_registers() {
         let mut mem = memory();
         assert_eq!(mem.get_byte(0xEA31), OPCODE_LDA_ABS);
         assert_eq!(mem.get_byte(0xEA32), CIA1_ICR_LO);
         assert_eq!(mem.get_byte(0xEA33), CIA1_ICR_HI);
-        assert_eq!(mem.get_byte(0xEA34), OPCODE_RTI);
+        for (offset, opcode) in [
+            (0xEA34, OPCODE_PLA),
+            (0xEA35, OPCODE_TAY),
+            (0xEA36, OPCODE_PLA),
+            (0xEA37, OPCODE_TAX),
+            (0xEA38, OPCODE_PLA),
+            (0xEA39, OPCODE_RTI),
+        ] {
+            assert_eq!(
+                mem.get_byte(offset),
+                opcode,
+                "bad KERNAL exit byte at ${offset:04X}"
+            );
+        }
 
         assert_eq!(mem.get_byte(0xEA7E), OPCODE_LDA_ABS);
         assert_eq!(mem.get_byte(0xEA7F), CIA1_ICR_LO);
         assert_eq!(mem.get_byte(0xEA80), CIA1_ICR_HI);
-        assert_eq!(mem.get_byte(0xEA81), OPCODE_RTI);
+        for (offset, opcode) in [
+            (0xEA81, OPCODE_PLA),
+            (0xEA82, OPCODE_TAY),
+            (0xEA83, OPCODE_PLA),
+            (0xEA84, OPCODE_TAX),
+            (0xEA85, OPCODE_PLA),
+            (0xEA86, OPCODE_RTI),
+        ] {
+            assert_eq!(
+                mem.get_byte(offset),
+                opcode,
+                "bad KERNAL exit byte at ${offset:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernal_irq_entry_saves_registers_and_nmi_entry_does_not() {
+        // $FF48 saves A/X/Y so handlers can finish with the standard
+        // PLA/TAY/PLA/TAX/PLA/RTI sequence; $FE43 only disables IRQs and jumps
+        // through $0318, because NMI handlers save whatever they need themselves.
+        let mut mem = memory();
+        for (offset, opcode) in [
+            (0xFF48, OPCODE_PHA),
+            (0xFF49, OPCODE_TXA),
+            (0xFF4A, OPCODE_PHA),
+            (0xFF4B, OPCODE_TYA),
+            (0xFF4C, OPCODE_PHA),
+            (0xFF4D, OPCODE_JMP_INDIRECT),
+        ] {
+            assert_eq!(
+                mem.get_byte(offset),
+                opcode,
+                "bad KERNAL entry byte at ${offset:04X}"
+            );
+        }
+        assert_eq!(mem.get_byte(0xFF4E), 0x14, "$FF48 must JMP ($0314)");
+        assert_eq!(mem.get_byte(0xFF4F), 0x03);
+
+        assert_eq!(mem.get_byte(0xFE43), OPCODE_SEI);
+        assert_eq!(mem.get_byte(0xFE44), OPCODE_JMP_INDIRECT);
+        assert_eq!(mem.get_byte(0xFE45), 0x18);
+        assert_eq!(mem.get_byte(0xFE46), 0x03);
     }
 }

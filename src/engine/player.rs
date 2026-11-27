@@ -217,7 +217,7 @@ pub struct Player {
     /// whose init is also their main loop). The CPU then never parks at the
     /// sentinel, so the runaway-routine watchdog must stay out of the way.
     free_running: bool,
-    /// Previous NMI line state for edge-triggered NMI detection while parked at sentinel.
+    /// Previous NMI line state for edge-triggered NMI detection.
     last_nmi_state: bool,
 }
 
@@ -487,7 +487,21 @@ impl Player {
         } else if at_sentinel {
             1
         } else {
-            self.cpu.single_step();
+            // A malformed tune can drive mos6502 into an unimplemented opcode,
+            // which panics. Letting that panic escape the audio callback would
+            // poison the player mutex and make every UI button silently stop
+            // working, so turn it into a normal playback error instead.
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cpu.single_step();
+            }));
+            if stepped.is_err() {
+                self.playback_error = Some(format!(
+                    "Invalid CPU opcode at ${:04X}",
+                    self.cpu.registers.program_counter
+                ));
+                self.paused = true;
+                return false;
+            }
             self.cpu.cycles - prev_cycles
         };
         if elapsed == 0 {
@@ -505,6 +519,13 @@ impl Player {
         // Frame-mode tunes never observe CIA1, so skip the timer arithmetic entirely.
         if self.drive_mode != DriveMode::Frame {
             self.cpu.memory.tick(elapsed);
+        }
+        // If the handler acked CIA2 during this step, the NMI line was low for a
+        // moment. Re-arm the edge latch so a timer underflow that happens later
+        // in this same tick is still seen as a fresh rising edge; sampling only
+        // at instruction boundaries would miss it and stall NMI-driven tunes.
+        if self.cpu.memory.take_nmi_ack_seen() {
+            self.last_nmi_state = false;
         }
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_u32 = elapsed as u32;
@@ -1300,6 +1321,24 @@ pub fn create_shared_player(
         .map(|p| Arc::new(Mutex::new(p)))
 }
 
+/// Locks the player for a UI action, recovering a poisoned mutex instead of
+/// making every button silently stop working after one bad tune panics.
+pub fn lock_player(player: &SharedPlayer) -> std::sync::MutexGuard<'_, Player> {
+    player
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Non-blocking variant for the audio thread and per-frame visualizers.
+/// `None` means the lock is genuinely busy, not poisoned.
+pub fn try_lock_player(player: &SharedPlayer) -> Option<std::sync::MutexGuard<'_, Player>> {
+    match player.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,6 +1413,9 @@ mod tests {
             0x8D, 0x00, 0xD4, // STA $D400  (voice 1 frequency low)
             0xA9, 0x11, // LDA #$11
             0x8D, 0x04, 0xD4, // STA $D404  (gate + triangle)
+            0x68, 0xA8, // PLA; TAY  (restore the registers $FF48 saved)
+            0x68, 0xAA, // PLA; TAX
+            0x68, // PLA
             0x40, // RTI
         ]);
 
@@ -1428,6 +1470,9 @@ mod tests {
             0x8D, 0x19, 0xD0, // STA $D019  (acknowledge raster IRQ)
             0xA9, 0x00, // LDA #$00
             0x8D, 0x12, 0xD0, // STA $D012  (rewrite the current compare line)
+            0x68, 0xA8, // PLA; TAY
+            0x68, 0xAA, // PLA; TAX
+            0x68, // PLA
             0x40, // RTI
         ]);
 
@@ -1474,7 +1519,10 @@ mod tests {
             0xD0, 0x03,       // BNE +3
             0xEE, 0x01, 0x02, // INC $0201 (count high byte)
             0xCE, 0x19, 0xD0, // DEC $D019 (acknowledge raster IRQ)
-            0x40,             // RTI
+            0x68, 0xA8, // PLA; TAY
+            0x68, 0xAA, // PLA; TAX
+            0x68, // PLA
+            0x40, // RTI
         ]);
 
         let sid = synthetic_sid("RSID", 0x0800, 0, data);
@@ -1518,6 +1566,9 @@ mod tests {
             0xEE, 0x00, 0x02, // INC $0200  (count handler entries)
             0xA9, 0x01, // LDA #$01
             0x8D, 0x19, 0xD0, // STA $D019  (acknowledge raster IRQ)
+            0x68, 0xA8, // PLA; TAY
+            0x68, 0xAA, // PLA; TAX
+            0x68, // PLA
             0x40, // RTI
         ]);
         data.resize(0x30, 0); // main loop at $0830
@@ -1665,5 +1716,21 @@ mod tests {
             (70..=110).contains(&nmi_entries),
             "expected one CIA2 Timer A NMI per underflow, got {nmi_entries}"
         );
+    }
+
+    #[test]
+    fn lock_helpers_recover_a_poisoned_player() {
+        let sid = frame_psid();
+        let shared = create_shared_player(&sid, 1, 44_100, None, SamplingMethod::Fast).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock().unwrap();
+            panic!("simulate a panic inside the audio callback");
+        }));
+        assert!(shared.is_poisoned());
+
+        // UI actions and the audio callback must keep working after a bad tune
+        // panicked once; otherwise every button silently stops responding.
+        assert!(try_lock_player(&shared).is_some());
+        assert!(lock_player(&shared).playback_error.is_none());
     }
 }

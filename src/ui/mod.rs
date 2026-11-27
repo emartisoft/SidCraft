@@ -23,6 +23,7 @@ use eframe::egui::{
 use residfp::ChipModel;
 
 use crate::engine::export::ExportFormat;
+use crate::engine::player::{lock_player, try_lock_player};
 use crate::engine::playlist::playlist_display_name;
 use crate::theme::{self, AccentColor, ThemeKind, ThemePreference, Tokens};
 use crate::visuals::SPECTROGRAM_COLUMNS;
@@ -72,7 +73,7 @@ impl eframe::App for SidcraftApp {
         let viz_mode = self.viz_mode;
         let mut player_error: Option<String> = None;
         let mut player_paused = false;
-        if let Ok(mut p) = self.player.try_lock() {
+        if let Some(mut p) = try_lock_player(&self.player) {
             player_error = p.take_error();
             player_paused = p.is_paused();
             p.copy_voice_levels_into(&mut self.voice_levels_buf);
@@ -1124,9 +1125,7 @@ impl SidcraftApp {
                                 ) {
                                     let muted =
                                         self.voice_mutes.get(voice).copied().unwrap_or(false);
-                                    if let Ok(mut p) = self.player.lock() {
-                                        p.set_voice_muted(voice, !muted);
-                                    }
+                                    lock_player(&self.player).set_voice_muted(voice, !muted);
                                     if let Some(slot) = self.voice_mutes.get_mut(voice) {
                                         *slot = !muted;
                                     }
