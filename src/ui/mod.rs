@@ -1371,10 +1371,15 @@ impl SidcraftApp {
                 let card_width = page_width + 2.0 * CARD_MARGIN;
                 let side_gutter = ((available - card_width) / 2.0).max(SIDE_GUTTER);
 
-                ui.add_space(24.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(side_gutter);
-                    egui::Frame::NONE
+                // Mirror the horizontal gutters vertically: use the last
+                // measured card height to keep the top and bottom gaps equal.
+                let available_height = ui.available_height();
+                let top_gutter = ((available_height - self.player_card_height) / 2.0).max(0.0);
+                ui.add_space(top_gutter);
+                let card_height = ui
+                    .horizontal(|ui| {
+                        ui.add_space(side_gutter);
+                        let response = egui::Frame::NONE
                         .fill(t.card)
                         .stroke(Stroke::new(1.0_f32, t.border))
                         .shadow(egui::epaint::Shadow {
@@ -1684,10 +1689,14 @@ impl SidcraftApp {
                                     }
                                 });
                             });
-                        });
+                        })
+                        .response;
                     ui.add_space(side_gutter);
-                });
-                ui.add_space(24.0);
+                    response.rect.height()
+                })
+                .inner;
+                self.player_card_height = card_height;
+                ui.add_space(top_gutter);
             });
     }
 

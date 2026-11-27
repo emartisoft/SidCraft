@@ -638,6 +638,8 @@ pub struct SidcraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     last_window_alpha: Option<u8>,
     pub viz_mode: VizMode,
+    /// Last measured height of the player card, used to centre it vertically.
+    player_card_height: f32,
     pub left_open: bool,
     pub right_open: bool,
     /// Frameless compact player; the shell is hidden while it is active.
@@ -1026,6 +1028,7 @@ impl SidcraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             last_window_alpha: None,
             viz_mode: VizMode::from_config(&config.viz_mode),
+            player_card_height: 520.0,
             left_open: config.left_panel,
             right_open: config.right_panel,
             mini_mode: false,
