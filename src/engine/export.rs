@@ -229,7 +229,7 @@ fn find_ffmpeg() -> Option<PathBuf> {
 /// Builds a `Command` that suppresses the transient console window when a
 /// Windows GUI process spawns a console child (`ffmpeg.exe`, `reg.exe`, etc.).
 fn command_no_window(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let cmd = Command::new(program);
+    let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
