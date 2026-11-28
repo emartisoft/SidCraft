@@ -1605,15 +1605,22 @@ impl SidcraftApp {
                                     }
 
                                     // Keep the volume/mute/download/add group on
-                                    // this row. The volume bar takes whatever is
-                                    // left after the three fixed 40 px buttons,
-                                    // so the add button never wraps on its own.
+                                    // this row and end it at the same right edge
+                                    // as the total-time label above, whether or
+                                    // not the optional download button is visible.
                                     let spacing = ui.spacing().item_spacing.x;
                                     // `available_width` reports the whole row in a
                                     // wrapped layout, so use the cursor-relative
                                     // rect for the space left on this row.
                                     let remaining = ui.available_rect_before_wrap().width();
-                                    let fixed_width = 3.0 * 40.0 + 4.0 * spacing;
+                                    let show_download = self.can_download_current_sid();
+                                    let button_count = if show_download { 3.0 } else { 2.0 };
+                                    // `add_space` adds no item spacing of its own, so
+                                    // count only the gaps between the volume bar and
+                                    // the buttons. Counting one extra leaves the last
+                                    // button short of the total-time label's edge.
+                                    let fixed_width =
+                                        button_count * 40.0 + button_count * spacing;
                                     let volume_width =
                                         110.0_f32.min((remaining - fixed_width).max(44.0));
                                     ui.add_space(
@@ -1656,7 +1663,7 @@ impl SidcraftApp {
                                         self.muted
                                             .store(!muted, std::sync::atomic::Ordering::SeqCst);
                                     }
-                                    if self.can_download_current_sid()
+                                    if show_download
                                         && icon_button_glyph(
                                             ui,
                                             &t,
